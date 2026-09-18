@@ -93,7 +93,7 @@ Ví dụ:
 1. Trên `google.com`, nhấn hotkey để chuyển sang V.
 2. Trên `github.com`, nhấn hotkey để chuyển sang E.
 3. Chuyển tab Google → GitHub → Google: VKey tự đổi V → E → V trong phiên.
-4. Đặt `voz.vn` thành **Luôn gõ English (hard)** nếu muốn hostname đó luôn ở E
+4. Đặt `facebook.com` thành **Luôn gõ English (hard)** nếu muốn hostname đó luôn ở E
    và hotkey không thay đổi rule.
 
 ## Xử lý lỗi kết nối
