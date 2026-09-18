@@ -10,6 +10,7 @@ docs/images/ram-optimize.png	own — screenshot of this application
 docs/images/vkey-compact.png	own — screenshot of this application
 docs/images/vkey-expanded.png	own — screenshot of this application
 docs/images/vkey-full-UI.png	own — screenshot of this application
+docs/images/vkey-website.png	own — screenshot of the official website (www.vkey.qd.je)
 extern/sciter/bin/packfolder.exe	Sciter.JS SDK (BSD 3-Clause, (c) 2020 Terra Informatica Software) from gitlab.com/sciter-engine/sciter-js-sdk — notice in THIRD_PARTY_NOTICES.txt
 extern/sciter/bin/sciter.dll	Sciter.JS SDK (BSD 3-Clause, (c) 2020 Terra Informatica Software) from gitlab.com/sciter-engine/sciter-js-sdk, unmodified, ships in every release ZIP — notice in THIRD_PARTY_NOTICES.txt
 src/app/resources/icon.ico	own — owner-generated with an image model
