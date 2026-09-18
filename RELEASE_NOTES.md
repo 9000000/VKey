@@ -14,7 +14,7 @@ Bản cập nhật này mang đến cải tiến đột phá về khả năng t�
 
 * **🧪 VKey Browser — tự chuyển chế độ theo website (thử nghiệm)**
     * Thêm extension đồng hành [VKey-Browser](https://github.com/phatMT97/VKey-Browser) và `VKeyBrowserHost.exe` để áp dụng **Theo VKey**, **English** hoặc **TSF tương thích** theo từng tên miền.
-    * Chuyển tab hoặc chuyển cửa sổ sẽ tự cập nhật chế độ. Ví dụ có thể dùng V trên `google.com` và tự chuyển E trên `voz.vn` mà không làm thay đổi trạng thái V/E gốc.
+    * Chuyển tab hoặc chuyển cửa sổ sẽ tự cập nhật chế độ. Ví dụ có thể dùng V trên `google.com` và tự chuyển E trên `facebook.com` mà không làm thay đổi trạng thái V/E gốc.
     * Có công tắc bật/tắt toàn cục: tắt sẽ tạm dừng mọi rule nhưng vẫn giữ nguyên cấu hình để bật lại sau.
     * Popup hiển thị trạng thái kết nối native host và dùng icon VKey; gói Chromium/Firefox có manifest riêng để tương thích Manifest V3.
     * Chế độ TSF theo tên miền hỗ trợ các editor/forum Firefox bị dính chữ sau emoji/inline image; composition được đặt kiểu hiển thị không gạch chân.
