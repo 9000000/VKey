@@ -890,6 +890,56 @@ TEST_F(RustInputEngineTest, SetSpellExclusionsFromUtf16PlumbingAndDeduplication)
     EXPECT_TRUE(changed);
 }
 
+TEST_F(RustInputEngineTest, TestSoafUserDictionary) {
+    std::u16string dictText = u"# VKey User Dictionary\n# One word per line\nkh\u01b0m\nso\u00e0\n";
+    auto snapshot = RustInputEngine::CreateUserDictionaryFromUtf16(
+        reinterpret_cast<const uint16_t*>(dictText.data()), dictText.size());
+    ASSERT_NE(snapshot, nullptr);
+
+    TypingConfig config;
+    config.inputMethod = InputMethod::Telex;
+    config.spellCheckEnabled = true;
+    config.spellSuggestEnabled = true;
+
+    // Test without user dictionary: words get auto-corrected
+    {
+        RustInputEngine engine(config);
+        for (wchar_t c : std::wstring_view(L"soaf")) engine.PushChar(c);
+        EXPECT_EQ(engine.Peek(), L"so\u00e0");
+        EXPECT_EQ(engine.Commit(), L"s\u00e0o");
+        const bool correctedWithoutDict = engine.LastCommitWasCorrected();
+        EXPECT_TRUE(correctedWithoutDict);
+    }
+    {
+        RustInputEngine engine(config);
+        for (wchar_t c : std::wstring_view(L"khuwm")) engine.PushChar(c);
+        EXPECT_EQ(engine.Peek(), L"kh\u01b0m");
+        EXPECT_EQ(engine.Commit(), L"khum");
+        const bool correctedWithoutDict = engine.LastCommitWasCorrected();
+        EXPECT_TRUE(correctedWithoutDict);
+    }
+
+    // Test WITH user dictionary: words are protected and preserved!
+    {
+        RustInputEngine engine(config);
+        EXPECT_TRUE(engine.SetUserDictionary(snapshot));
+        for (wchar_t c : std::wstring_view(L"soaf")) engine.PushChar(c);
+        EXPECT_EQ(engine.Peek(), L"so\u00e0");
+        EXPECT_EQ(engine.Commit(), L"so\u00e0");
+        const bool correctedWithDict = engine.LastCommitWasCorrected();
+        EXPECT_FALSE(correctedWithDict);
+    }
+    {
+        RustInputEngine engine(config);
+        EXPECT_TRUE(engine.SetUserDictionary(snapshot));
+        for (wchar_t c : std::wstring_view(L"khuwm")) engine.PushChar(c);
+        EXPECT_EQ(engine.Peek(), L"kh\u01b0m");
+        EXPECT_EQ(engine.Commit(), L"kh\u01b0m");
+        const bool correctedWithDict = engine.LastCommitWasCorrected();
+        EXPECT_FALSE(correctedWithDict);
+    }
+}
+
 #endif
 
 }  // namespace

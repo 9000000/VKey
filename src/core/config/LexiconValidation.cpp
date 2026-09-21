@@ -224,7 +224,7 @@ LexiconImportResult LexiconValidator::ParseAndValidateUserDictText(
         }
 
         u32 = SpellExclusionCanonicalizer::TrimWhitespace(u32);
-        if (u32.empty() || u32[0] == U';') {
+        if (u32.empty() || u32[0] == U';' || u32[0] == U'#') {
             continue; // Ignore blank lines and comments
         }
 
@@ -336,7 +336,7 @@ LexiconImportResult LexiconValidator::ParseAndValidateSpellExclusionsText(
         }
 
         u32 = SpellExclusionCanonicalizer::TrimWhitespace(u32);
-        if (u32.empty() || u32[0] == U';') {
+        if (u32.empty() || u32[0] == U';' || u32[0] == U'#') {
             continue;
         }
 
@@ -397,7 +397,7 @@ LexiconImportResult LexiconValidator::ParseAndValidateSpellExclusionsText(
 std::string LexiconValidator::FormatUserDictText(
     const std::vector<std::wstring>& entries) {
     std::ostringstream ss;
-    ss << "; VKey User Dictionary\n; One word per line\n";
+    ss << "# VKey User Dictionary\n# One word per line\n";
     for (const auto& w : entries) {
         std::u32string u32;
         (void)SpellExclusionCanonicalizer::Utf16ToUtf32(w, u32);
@@ -411,7 +411,7 @@ std::string LexiconValidator::FormatUserDictText(
 std::string LexiconValidator::FormatSpellExclusionsText(
     const std::vector<std::wstring>& entries) {
     std::ostringstream ss;
-    ss << "; VKey Spell Exclusions\n; One exclusion prefix per line (max 8)\n";
+    ss << "# VKey Spell Exclusions\n# One exclusion prefix per line (max 8)\n";
     for (const auto& w : entries) {
         std::u32string u32;
         (void)SpellExclusionCanonicalizer::Utf16ToUtf32(w, u32);

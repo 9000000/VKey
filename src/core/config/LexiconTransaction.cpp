@@ -724,9 +724,93 @@ bool LexiconWriter::CommitTransaction(
     }
 #endif
 
+    // Pre-flight validation: validate TOML syntax, spell exclusions, and user dictionary content.
+    // Both files on disk MUST remain 100% untouched if any input payload is invalid.
+    bool spellSuggest = true;
+    std::vector<std::wstring> parsedExclusions;
+    uint64_t wireGen = 0;
+    try {
+        auto tbl = toml::parse(newConfigToml);
+        if (auto* features = tbl["features"].as_table()) {
+            if (auto* ss = (*features)["spell_suggest"].as_boolean()) {
+                spellSuggest = ss->get();
+            }
+            if (auto* arr = (*features)["spell_exclusions"].as_array()) {
+                std::vector<std::string> rawExcl;
+                rawExcl.reserve(arr->size());
+                for (auto&& item : *arr) {
+                    if (auto* s = item.as_string()) {
+                        rawExcl.push_back(s->get());
+                    } else {
+                        return false; // Non-string entry in spell_exclusions array
+                    }
+                }
+                if (!rawExcl.empty()) {
+                    auto canon = SpellExclusionCanonicalizer::Canonicalize(rawExcl);
+                    if (!canon.Succeeded()) {
+                        return false; // Exclusions out of bounds (> 8 entries or invalid scalar count)
+                    }
+                    parsedExclusions = std::move(canon.entries);
+                }
+            }
+        }
+        if (auto* internalTbl = tbl["internal"].as_table()) {
+            if (auto* wg = (*internalTbl)["wire_generation"].as_integer()) {
+                if (wg->get() > 0) {
+                    wireGen = static_cast<uint64_t>(wg->get());
+                }
+            }
+        }
+    } catch (...) {
+        return false; // Malformed TOML! Fail early without creating temp files or touching disk!
+    }
+
+    auto dictRes = LexiconValidator::ParseAndValidateUserDictText(newUserDictText);
+    if (!dictRes.validation.Succeeded()) {
+        return false; // Malformed user dictionary! Fail early without touching disk!
+    }
+
+    if (wireGen == 0) {
+        if (sWireManager && sWireManager->IsWritable()) {
+            wireGen = sWireManager->GetWireGeneration() + 1;
+        } else {
+            wireGen = static_cast<uint64_t>(newGeneration);
+        }
+    }
+
     std::error_code ec;
     bool configExisted = std::filesystem::exists(configPath, ec);
     bool dictExisted = std::filesystem::exists(dictPath, ec);
+
+    // Capture old config & dictionary metadata for wire rollback in case PublishGeneration fails
+    std::vector<std::wstring> oldExclusions;
+    std::vector<std::wstring> oldDictWords;
+    uint64_t oldWireGen = static_cast<uint64_t>(oldGeneration);
+    bool oldSpellSuggest = true;
+    if (configExisted) {
+        try {
+            auto oldTbl = toml::parse(ReadFileBytes(configPath));
+            if (auto* f = oldTbl["features"].as_table()) {
+                if (auto* ss = (*f)["spell_suggest"].as_boolean()) oldSpellSuggest = ss->get();
+                if (auto* arr = (*f)["spell_exclusions"].as_array()) {
+                    std::vector<std::string> raw;
+                    for (auto&& item : *arr) {
+                        if (auto* s = item.as_string()) raw.push_back(s->get());
+                    }
+                    auto c = SpellExclusionCanonicalizer::Canonicalize(raw);
+                    if (c.Succeeded()) oldExclusions = std::move(c.entries);
+                }
+            }
+            if (auto* i = oldTbl["internal"].as_table()) {
+                if (auto* wg = (*i)["wire_generation"].as_integer()) {
+                    if (wg->get() > 0) oldWireGen = static_cast<uint64_t>(wg->get());
+                }
+            }
+        } catch (...) {}
+    }
+    if (dictExisted) {
+        oldDictWords = LexiconValidator::ParseAndValidateUserDictText(ReadFileBytes(dictPath)).entries;
+    }
 
     // 1. Write temp files durably
     if (!DurableWrite(configTmp, newConfigToml)) {
@@ -788,11 +872,15 @@ bool LexiconWriter::CommitTransaction(
         return false;
     }
 
-    // 6. Publish Generation & Wire Mapping
-    if (notifySharedState) {
-        if (!PublishGeneration(newGeneration)) {
-            // Publishing failed! Transition journal to RollbackPending before rolling back.
-            // If durable journal transition fails, keep journal in current state and fail-stale.
+    // 6. Publish Wire Mapping FIRST (before publishing SharedState generation).
+    // TSF will only observe the new SharedState epoch AFTER the wire mapping
+    // already contains the new snapshot, preventing stale cache-hit races.
+    bool wirePublished = false;
+    if (notifySharedState && (sWireManager || sTestWirePublisher)) {
+        std::string wireErr;
+        if (!PublishWireMapping(parsedExclusions, dictRes.entries, wireGen, spellSuggest, &wireErr)) {
+            // Publishing wire mapping failed! Transition journal to RollbackPending.
+            // SharedState generation was NOT published, so SharedState remains clean at oldGeneration.
             if (!TransitionJournalState(configPath, record, LexiconJournalState::RollbackPending)) {
                 return false;
             }
@@ -806,84 +894,42 @@ bool LexiconWriter::CommitTransaction(
             }
             return false;
         }
+        wirePublished = true;
+    }
 
-        // Publish wire mapping if wire manager or test publisher is configured
-        if (sWireManager || sTestWirePublisher) {
-            bool spellSuggest = true;
-            std::vector<std::wstring> exclusions;
-            uint64_t wireGen = 0;
-
-            try {
-                auto tbl = toml::parse(newConfigToml);
-                if (auto* features = tbl["features"].as_table()) {
-                    if (auto* ss = (*features)["spell_suggest"].as_boolean()) {
-                        spellSuggest = ss->get();
-                    }
-                    if (auto* arr = (*features)["spell_exclusions"].as_array()) {
-                        for (auto&& item : *arr) {
-                            if (auto* s = item.as_string()) {
-                                std::string u8 = s->get();
-                                std::wstring u16;
-                                std::u32string u32;
-                                if (SpellExclusionCanonicalizer::Utf8ToUtf32(u8, u32) &&
-                                    SpellExclusionCanonicalizer::Utf32ToUtf16(u32, u16)) {
-                                    exclusions.push_back(u16);
-                                }
-                            }
-                        }
-                    }
-                }
-                if (auto* internalTbl = tbl["internal"].as_table()) {
-                    if (auto* wg = (*internalTbl)["wire_generation"].as_integer()) {
-                        if (wg->get() > 0) {
-                            wireGen = static_cast<uint64_t>(wg->get());
-                        }
-                    }
-                }
-            } catch (...) {
-            }
-
-            if (wireGen == 0) {
-                if (sWireManager && sWireManager->IsWritable()) {
-                    wireGen = sWireManager->GetWireGeneration() + 1;
-                } else {
-                    wireGen = static_cast<uint64_t>(newGeneration);
-                }
-            }
-
-            auto dictRes = LexiconValidator::ParseAndValidateUserDictText(newUserDictText);
-            std::string wireErr;
-            if (!PublishWireMapping(exclusions, dictRes.entries, wireGen, spellSuggest, &wireErr)) {
-                // SharedState generation was published at step 6; transition journal to RollbackPending
-                // BEFORE attempting rollback so crash recovery knows a rollback is underway.
-                // If durable journal transition fails, keep journal in current state and fail-stale.
-                if (!TransitionJournalState(configPath, record, LexiconJournalState::RollbackPending)) {
-                    return false;
-                }
-
-                // Attempt to restore old generation in SharedState
-                bool oldGenRestored = false;
-                for (int attempt = 0; attempt < 3; ++attempt) {
-                    if (PublishGeneration(oldGeneration)) {
-                        oldGenRestored = true;
-                        break;
-                    }
-                }
-
-                const bool rollbackOk = RollbackToBackup(record, configPath, dictPath, configBak, dictBak);
-                if (oldGenRestored && rollbackOk) {
-                    // Both generation and files cleanly rolled back
-                    std::filesystem::remove(configTmp, ec);
-                    std::filesystem::remove(dictTmp, ec);
-                    std::filesystem::remove(configBak, ec);
-                    std::filesystem::remove(dictBak, ec);
-                    std::filesystem::remove(journalPath, ec);
-                    std::filesystem::remove(journalTmp, ec);
-                }
-                // If oldGenRestored is false (or rollback failed), the journal remains in ROLLBACK_PENDING state
-                // on disk. Files are safely at old hashes and RecoverIfNeeded() can retry generation restoration.
+    // 7. Publish Generation to SharedState (bumping SharedState epoch)
+    if (notifySharedState) {
+        if (!PublishGeneration(newGeneration)) {
+            // Publishing generation failed! Transition journal to RollbackPending.
+            if (!TransitionJournalState(configPath, record, LexiconJournalState::RollbackPending)) {
                 return false;
             }
+            // Restore old wire mapping if wire was published
+            if (wirePublished) {
+                std::string restoreErr;
+                (void)PublishWireMapping(oldExclusions, oldDictWords, oldWireGen, oldSpellSuggest, &restoreErr);
+            }
+            // Attempt to restore old generation in SharedState to ensure clean state
+            bool oldGenRestored = false;
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                if (PublishGeneration(oldGeneration)) {
+                    oldGenRestored = true;
+                    break;
+                }
+            }
+
+            bool filesRestored = RollbackToBackup(record, configPath, dictPath, configBak, dictBak);
+            if (oldGenRestored && filesRestored) {
+                std::filesystem::remove(configTmp, ec);
+                std::filesystem::remove(dictTmp, ec);
+                std::filesystem::remove(configBak, ec);
+                std::filesystem::remove(dictBak, ec);
+                std::filesystem::remove(journalPath, ec);
+                std::filesystem::remove(journalTmp, ec);
+            }
+            // If oldGenRestored is false (or filesRestored is false), the journal remains
+            // in ROLLBACK_PENDING state on disk so RecoverIfNeeded() can retry generation restoration.
+            return false;
         }
     }
 

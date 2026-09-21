@@ -97,7 +97,7 @@ inline void ParseConfigLines(std::istream& input, Handler handler) {
                 line.erase(0, 3);
             }
         }
-        if (line.empty() || line[0] == ';') continue;
+        if (line.empty() || line[0] == ';' || line[0] == '#') continue;
         handler(line);
     }
 }

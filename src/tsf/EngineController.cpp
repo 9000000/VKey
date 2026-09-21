@@ -1162,6 +1162,11 @@ void EngineController::RefreshUserDictionarySnapshot(uint32_t epoch,
     if (wireReader_.ReadSnapshotFast(wireLocalBuffer_, wireView_, epoch, &wireUpdated, &wireErr)) {
         wireReaderActive_ = true;
         if (!wireUpdated) {
+            // If reload was requested due to generation change, but wire mapping has not
+            // caught up to the expected generation yet, keep reload pending to retry.
+            if (wireView_.header && wireView_.header->generation < generation) {
+                return;
+            }
             // Snapshot has not changed on the wire; cache hit.
             userDictionaryNeedsReload_ = false;
             return;

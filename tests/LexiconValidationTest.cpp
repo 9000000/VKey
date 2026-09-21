@@ -99,12 +99,28 @@ TEST(LexiconValidationTest, ParseSpellExclusionsMaxCapEnforced) {
 TEST(LexiconValidationTest, FormattingRoundTrip) {
     std::vector<std::wstring> words = {L"alo", L"in4", L"so\u00e0"};
     std::string formatted = LexiconValidator::FormatUserDictText(words);
-    EXPECT_NE(formatted.find("; VKey User Dictionary"), std::string::npos);
+    EXPECT_NE(formatted.find("# VKey User Dictionary"), std::string::npos);
     EXPECT_NE(formatted.find("so\xc3\xa0\n"), std::string::npos);
 
     auto parsed = LexiconValidator::ParseAndValidateUserDictText(formatted);
     EXPECT_TRUE(parsed.validation.Succeeded());
     EXPECT_EQ(parsed.entries, words);
+}
+
+TEST(LexiconValidationTest, ParsesBothHashAndSemicolonComments) {
+    std::string text =
+        "# Hash comment\n"
+        "; Semicolon comment\n"
+        "alo\n"
+        "# Another comment\n"
+        "kh\xc6\xb0m\n"
+        "; Legacy comment\n"
+        "so\xc3\xa0\n";
+
+    auto parsed = LexiconValidator::ParseAndValidateUserDictText(text);
+    EXPECT_TRUE(parsed.validation.Succeeded());
+    std::vector<std::wstring> expected = {L"alo", L"kh\u01b0m", L"so\u00e0"};
+    EXPECT_EQ(parsed.entries, expected);
 }
 
 }  // namespace

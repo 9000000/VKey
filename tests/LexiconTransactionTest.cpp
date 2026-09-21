@@ -20,9 +20,15 @@ protected:
         std::filesystem::create_directories(testDir_);
         configPath_ = testDir_ / "config.toml";
         dictPath_ = testDir_ / "user_dictionary.txt";
+        LexiconWriter::SetTestGenerationPublisher(nullptr);
+        LexiconWriter::SetTestWirePublisher(nullptr);
+        LexiconWriter::SetWireManager(nullptr);
     }
 
     void TearDown() override {
+        LexiconWriter::SetTestGenerationPublisher(nullptr);
+        LexiconWriter::SetTestWirePublisher(nullptr);
+        LexiconWriter::SetWireManager(nullptr);
         std::error_code ec;
         std::filesystem::remove_all(testDir_, ec);
     }
@@ -123,11 +129,11 @@ TEST_F(LexiconTransactionTest, CommitTransactionCreatesBothFilesAndCleansArtifac
 }
 
 TEST_F(LexiconTransactionTest, CommitTransactionReplacesExistingFilesAtomically) {
-    WriteFile(configPath_, "initial config");
-    WriteFile(dictPath_, "initial dict");
+    WriteFile(configPath_, "[general]\nmethod = 0\n");
+    WriteFile(dictPath_, "ban\n");
 
-    const std::string updatedToml = "updated config toml";
-    const std::string updatedDict = "updated dict text";
+    const std::string updatedToml = "[general]\nmethod = 1\n";
+    const std::string updatedDict = "moi\n";
 
     ASSERT_TRUE(LexiconWriter::CommitTransaction(
         configPath_.wstring(),
@@ -603,10 +609,9 @@ TEST_F(LexiconTransactionTest, CommitTransaction_RollsBackWhenWirePublishingFail
     bool ok = LexiconWriter::CommitTransaction(configPath_.wstring(), newConfigToml, newUserDict, 10, 11, true);
     EXPECT_FALSE(ok);
 
-    // Generation must have published newGen (11) then restored oldGen (10)
-    ASSERT_GE(publishedGens.size(), 2u);
-    EXPECT_EQ(publishedGens[0], 11u);
-    EXPECT_EQ(publishedGens[1], 10u);
+    // Wire mapping is published BEFORE generation. Because wire publishing failed,
+    // generation was never published to SharedState!
+    EXPECT_TRUE(publishedGens.empty());
 
     // Files must have rolled back to previous content
     std::string currentToml = ReadFile(configPath_);
@@ -632,21 +637,20 @@ TEST_F(LexiconTransactionTest, CommitTransaction_PreservesBackupsAndJournalWhenR
     std::string validDict = "ban\n";
     ASSERT_TRUE(LexiconWriter::CommitTransaction(configPath_.wstring(), validToml, validDict, 1, 2, true));
 
-    // 2. Setup mock wire publisher hook that fails
-    LexiconWriter::SetTestWirePublisher([](const auto&, const auto&, uint64_t, bool, std::string* outErr) {
-        if (outErr) *outErr = "Simulated wire publish failure";
-        return false;
+    // 2. Setup mock wire publisher hook that succeeds
+    LexiconWriter::SetTestWirePublisher([](const auto&, const auto&, uint64_t, bool, std::string*) {
+        return true;
     });
 
     // 3. Setup generation publisher fault-injection:
-    // Call 1 (publishing newGeneration 3): succeeds
+    // Call 1 (attempting to publish newGeneration 3): FAILS!
     // Call 2+ (attempting to restore oldGeneration 2): FAILS!
     int genCalls = 0;
     LexiconWriter::SetTestGenerationPublisher([&genCalls](uint8_t gen) {
         genCalls++;
         if (genCalls == 1) {
             EXPECT_EQ(gen, 3u); // newGeneration
-            return true;
+            return false;
         }
         EXPECT_EQ(gen, 2u); // oldGeneration
         return false; // Fault injection: restoring oldGeneration fails!
@@ -697,6 +701,43 @@ TEST_F(LexiconTransactionTest, CommitTransaction_PreservesBackupsAndJournalWhenR
     // Cleanup hooks
     LexiconWriter::SetTestGenerationPublisher(nullptr);
     LexiconWriter::SetTestWirePublisher(nullptr);
+}
+
+TEST_F(LexiconTransactionTest, CommitTransaction_InvalidInput_LeavesBothFilesUntouched) {
+    const std::string initialToml = "[input]\nmethod = \"telex\"\n";
+    const std::string initialDict = "ban\n";
+    ASSERT_TRUE(LexiconWriter::CommitTransaction(configPath_.wstring(), initialToml, initialDict, 1, 2, false));
+
+    // Verify initial state
+    EXPECT_EQ(ReadFile(configPath_), initialToml);
+    EXPECT_EQ(ReadFile(dictPath_), initialDict);
+
+    // Case 1: Invalid TOML syntax
+    const std::string invalidToml = "[input\nmethod = unclosed syntax";
+    EXPECT_FALSE(LexiconWriter::CommitTransaction(configPath_.wstring(), invalidToml, initialDict, 2, 3, false));
+    EXPECT_EQ(ReadFile(configPath_), initialToml);
+    EXPECT_EQ(ReadFile(dictPath_), initialDict);
+
+    // Case 2: Invalid spell exclusions in TOML (e.g. non-string item in array)
+    const std::string invalidExclusionToml = "[features]\nspell_exclusions = [12345]\n";
+    EXPECT_FALSE(LexiconWriter::CommitTransaction(configPath_.wstring(), invalidExclusionToml, initialDict, 2, 3, false));
+    EXPECT_EQ(ReadFile(configPath_), initialToml);
+    EXPECT_EQ(ReadFile(dictPath_), initialDict);
+
+    // Case 3: Invalid user dictionary text (whitespace inside word)
+    const std::string invalidDict = "ban nha\n";
+    const std::string newValidToml = "[input]\nmethod = \"vni\"\n";
+    EXPECT_FALSE(LexiconWriter::CommitTransaction(configPath_.wstring(), newValidToml, invalidDict, 2, 3, false));
+    EXPECT_EQ(ReadFile(configPath_), initialToml);
+    EXPECT_EQ(ReadFile(dictPath_), initialDict);
+
+    // Verify no temporary files, backup files, or journals were created
+    EXPECT_FALSE(std::filesystem::exists(testDir_ / "lexicon_txn.journal"));
+    EXPECT_FALSE(std::filesystem::exists(testDir_ / "lexicon_txn.journal.tmp"));
+    EXPECT_FALSE(std::filesystem::exists(testDir_ / "config.toml.tmp"));
+    EXPECT_FALSE(std::filesystem::exists(testDir_ / "user_dictionary.txt.tmp"));
+    EXPECT_FALSE(std::filesystem::exists(testDir_ / "config.toml.bak"));
+    EXPECT_FALSE(std::filesystem::exists(testDir_ / "user_dictionary.txt.bak"));
 }
 
 TEST_F(LexiconTransactionTest, RecoverIfNeeded_RollbackPendingDirectly) {
