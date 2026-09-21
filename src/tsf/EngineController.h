@@ -16,6 +16,7 @@
 #include "EditSession.h"
 #include "LanguageBarButton.h"
 #include "core/MacroContextMatch.h"
+#include "core/TsfPromotionDecision.h"
 #include "core/config/TypingConfig.h"
 #include "core/engine/IInputEngine.h"
 #include "core/engine/TypingAction.h"
@@ -85,12 +86,12 @@ public:
     /// Whether Esc-restore-raw is enabled in current config snapshot.
     /// Cheap getter — KeyEventSink uses this to gate the VK_ESCAPE branch.
     [[nodiscard]] bool IsEscRestoreRawEnabled() const noexcept {
-        return config_.escRestoreRawEnabled;
+        return activeConfig_.escRestoreRawEnabled;
     }
 
     /// Whether "BS keeps chars on suggest" is enabled in current config snapshot.
     [[nodiscard]] bool IsSuggestKeepCharsEnabled() const noexcept {
-        return config_.suggestKeepChars;
+        return activeConfig_.suggestKeepChars;
     }
 
     [[nodiscard]] bool HasNonEmptySelection(ITfContext* pContext);
@@ -141,9 +142,9 @@ public:
     /// full 0-9 range in those modes (unmapped digits fall through as
     /// ProcessChar literal). Telex/SimpleTelex don't claim digits.
     bool IsEngineDigitKey(UINT vkCode) const {
-        return (config_.inputMethod == InputMethod::VNI ||
-                config_.inputMethod == InputMethod::Combined ||
-                config_.inputMethod == InputMethod::UserDefined) &&
+        return (activeConfig_.inputMethod == InputMethod::VNI ||
+                activeConfig_.inputMethod == InputMethod::Combined ||
+                activeConfig_.inputMethod == InputMethod::UserDefined) &&
                vkCode >= 0x30 && vkCode <= 0x39 &&
                !(GetKeyState(VK_SHIFT) & 0x8000);
     }
@@ -172,10 +173,34 @@ public:
     void ToggleVietnameseMode();
 
     /// Get current code table
-    [[nodiscard]] CodeTable GetCodeTable() const noexcept { return config_.codeTable; }
+    [[nodiscard]] CodeTable GetCodeTable() const noexcept { return activeConfig_.codeTable; }
 
     /// Set code table (updates config, no persistence yet)
-    void SetCodeTable(CodeTable ct) noexcept { config_.codeTable = ct; }
+    void SetCodeTable(CodeTable ct) noexcept {
+        activeConfig_.codeTable = ct;
+        if (pendingConfig_.has_value()) {
+            pendingConfig_->codeTable = ct;
+        }
+    }
+
+    /// Promotion gate: check whether pendingConfig_ or pendingUserDictionary_ can be promoted
+    [[nodiscard]] bool CanPromotePendingConfig() const noexcept;
+
+    /// Attempt to promote pendingConfig_ to activeConfig_ and/or attach pendingUserDictionary_
+    bool TryPromotePendingConfig();
+
+    /// Const access to active config snapshot
+    [[nodiscard]] const TypingConfig& GetActiveConfig() const noexcept { return activeConfig_; }
+
+    /// Whether there is a staged configuration or engine recreation waiting for promotion gate
+    [[nodiscard]] bool HasPendingConfig() const noexcept {
+        return pendingConfig_.has_value() || engineNeedsRecreate_;
+    }
+
+    /// Combined serial of the latest pending configuration (epoch << 8 | configGeneration)
+    [[nodiscard]] uint64_t GetPendingSnapshotSerial() const noexcept {
+        return pendingSnapshotSerial_;
+    }
 
     /// Initialize language bar button (call after SetClientId)
     bool InitLanguageBar(ITfThreadMgr* pThreadMgr);
@@ -249,9 +274,12 @@ private:
 
     std::unique_ptr<IInputEngine> engine_;
     CompositionManager compositionMgr_;
-    TypingConfig config_;
+    TypingConfig activeConfig_;
+    std::optional<TypingConfig> pendingConfig_;
+    uint64_t pendingSnapshotSerial_ = 0;
+    bool engineNeedsRecreate_ = false;
     ConvertConfig convertConfig_;
-    InputMethod currentMethod_ = InputMethod::Telex;
+    InputMethod activeMethod_ = InputMethod::Telex;
     TfClientId clientId_ = TF_CLIENTID_NULL;
     SharedStateManager sharedState_; // For reading config from App
     uint32_t lastEpoch_ = 0;        // Last seen config epoch
@@ -291,7 +319,7 @@ private:
     // The TSF key path never reads/parses this file. A config generation seen
     // there only latches `needs reload`; focus/init performs disk work. A
     // compiled snapshot that arrives mid-word waits for an empty engine.
-    std::shared_ptr<const RustUserDictionarySnapshot> userDictionary_;
+    std::shared_ptr<const RustUserDictionarySnapshot> activeUserDictionary_;
     std::shared_ptr<const RustUserDictionarySnapshot> pendingUserDictionary_;
     uint8_t userDictionaryGeneration_ = 0;
     bool userDictionaryGenerationKnown_ = false;

@@ -878,6 +878,7 @@ set(NEXTKEY_TEST_SOURCES
     tests/AdaptiveTickBenchmark.cpp
     tests/AutoCapDecisionTest.cpp
     tests/TsfEditDecisionTest.cpp
+    tests/TsfPromotionDecisionTest.cpp
     tests/AutoCapStateTransitionTest.cpp
     tests/CjkSwitchDecisionTest.cpp
     tests/LeakedKeyDuringSendDecisionTest.cpp

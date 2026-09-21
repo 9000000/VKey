@@ -22,7 +22,9 @@
 #include "core/MacroPrefix.h"
 #include "core/MacroTableDecision.h"
 #include "core/TsfEditDecision.h"
+#include "core/TsfPromotionDecision.h"
 #include "core/config/ConfigManager.h"
+#include "core/config/LexiconTransaction.h"
 #include "core/engine/EngineFactory.h"
 #ifdef VKEY_USE_RUST_ENGINE
 #include "core/engine/RustInputEngine.h"
@@ -83,21 +85,21 @@ EngineController::EngineController(ITfThreadMgr* pThreadMgr) {
         if (abiResult == SharedStateManager::AbiCheckResult::Incompatible) {
             abiOk_ = false;
             sharedState_.SetOrClearFlag(SharedFlags::TSF_ABI_MISMATCH, true);
-            config_.inputMethod = InputMethod::Telex;
-            config_.spellCheckEnabled = false;
-            config_.optimizeLevel = 0;
-            currentMethod_ = InputMethod::Telex;
-            engine_ = EngineFactory::Create(config_);
+            activeConfig_.inputMethod = InputMethod::Telex;
+            activeConfig_.spellCheckEnabled = false;
+            activeConfig_.optimizeLevel = 0;
+            activeMethod_ = InputMethod::Telex;
+            engine_ = EngineFactory::Create(activeConfig_);
             TSF_LOG(L"EngineController: SharedState ABI mismatch — passthrough");
         } else if (abiResult == SharedStateManager::AbiCheckResult::Retry) {
             // Seqlock contention, not a confirmed mismatch — do NOT raise the
             // sticky TSF_ABI_MISMATCH banner for this. CheckConfigEvent retries.
             abiOk_ = false;
-            config_.inputMethod = InputMethod::Telex;
-            config_.spellCheckEnabled = false;
-            config_.optimizeLevel = 0;
-            currentMethod_ = InputMethod::Telex;
-            engine_ = EngineFactory::Create(config_);
+            activeConfig_.inputMethod = InputMethod::Telex;
+            activeConfig_.spellCheckEnabled = false;
+            activeConfig_.optimizeLevel = 0;
+            activeMethod_ = InputMethod::Telex;
+            engine_ = EngineFactory::Create(activeConfig_);
             TSF_LOG(L"EngineController: SharedState ABI check contention, using defaults");
         } else {
             // Step 2: ABI OK; try a seqlock Read for the full config.
@@ -112,21 +114,21 @@ EngineController::EngineController(ITfThreadMgr* pThreadMgr) {
                 // Seqlock exhausted under contention — use defaults for now.
                 // RefreshFlags / CheckConfigEvent will re-read on next focus.
                 // Do NOT flip TSF_ABI_MISMATCH — ABI is fine.
-                config_.inputMethod = InputMethod::Telex;
-                config_.spellCheckEnabled = false;
-                config_.optimizeLevel = 0;
-                currentMethod_ = InputMethod::Telex;
-                engine_ = EngineFactory::Create(config_);
+                activeConfig_.inputMethod = InputMethod::Telex;
+                activeConfig_.spellCheckEnabled = false;
+                activeConfig_.optimizeLevel = 0;
+                activeMethod_ = InputMethod::Telex;
+                engine_ = EngineFactory::Create(activeConfig_);
                 TSF_LOG(L"EngineController: SharedState read contention, using defaults");
             }
         }
     } else {
         // SharedState not available = EXE not running → disabled
-        config_.inputMethod = InputMethod::Telex;
-        config_.spellCheckEnabled = false;
-        config_.optimizeLevel = 0;
-        currentMethod_ = InputMethod::Telex;
-        engine_ = EngineFactory::Create(config_);
+        activeConfig_.inputMethod = InputMethod::Telex;
+        activeConfig_.spellCheckEnabled = false;
+        activeConfig_.optimizeLevel = 0;
+        activeMethod_ = InputMethod::Telex;
+        engine_ = EngineFactory::Create(activeConfig_);
         engineEnabled_ = false;
         TSF_LOG(L"EngineController: SharedState not available, engine disabled");
     }
@@ -178,7 +180,7 @@ bool EngineController::PrepareBackspaceRevive(ITfContext* pContext) {
 
     // Step 2: English-word gate via a throwaway engine (don't mutate engine_ —
     // safety resets at the top of each OnTestKeyDown would wipe it).
-    auto tempEngine = EngineFactory::Create(config_);
+    auto tempEngine = EngineFactory::Create(activeConfig_);
     if (!tempEngine || !tempEngine->SeedFromText(word) || tempEngine->IsEnglishWord()) {
         TSF_LOG(L"PrepareBackspaceRevive: '%ls' rejected (not Vietnamese)", word.c_str());
         return false;  // pRange auto-Released
@@ -311,7 +313,7 @@ bool EngineController::WantKey(UINT vkCode, bool /*isKeyDown*/) {
     // the early-return at line 192 above — never reach this state machine.
     {
         const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-        DigitLedInputs in{vkCode, shift, !engineHasComp, config_.inputMethod, digitLedWord_};
+        DigitLedInputs in{vkCode, shift, !engineHasComp, activeConfig_.inputMethod, digitLedWord_};
         switch (DecideDigitLed(in)) {
             case DigitLedDecision::Arm:    digitLedWord_ = true;  return false;
             case DigitLedDecision::Bypass:                        return false;
@@ -414,16 +416,16 @@ void EngineController::RequestEditSession(ITfContext* pContext, EditSession* pEd
 
 bool EngineController::IsEngineBracketKey(UINT vkCode) const {
     if (vkCode != VK_OEM_4 && vkCode != VK_OEM_6) return false;
-    if (config_.inputMethod == InputMethod::Telex) return true;
-    if (config_.inputMethod != InputMethod::UserDefined) return false;
+    if (activeConfig_.inputMethod == InputMethod::Telex) return true;
+    if (activeConfig_.inputMethod != InputMethod::UserDefined) return false;
 
     const wchar_t base = vkCode == VK_OEM_4 ? L'[' : L']';
     const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
     const bool capsLock = (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
     const wchar_t physical = ResolveBracketKey(base, shift, capsLock).character;
-    TypingAction action = config_.customKeyMap[static_cast<uint8_t>(physical)];
+    TypingAction action = activeConfig_.customKeyMap[static_cast<uint8_t>(physical)];
     if (action == TypingAction::None && physical != base) {
-        action = config_.customKeyMap[static_cast<uint8_t>(base)];
+        action = activeConfig_.customKeyMap[static_cast<uint8_t>(base)];
     }
     return action != TypingAction::None &&
            (engine_->Count() > 0 || IsInsertTypeAction(action));
@@ -533,7 +535,7 @@ bool EngineController::HandleKey(ITfContext* pContext, UINT vkCode) {
             // gate: reviving there is followed by Backspace(), which re-renders a
             // raw replay as Vietnamese ("tester" → "tết").
             if (!word.empty() && wordRange) {
-                auto tempEngine = EngineFactory::Create(config_);
+                auto tempEngine = EngineFactory::Create(activeConfig_);
                 if (tempEngine && tempEngine->SeedFromText(word)) {
                     // Raw replay over glyph-seeding: SeedFromText loses which key
                     // produced which diacritic, so a tone key pressed right after
@@ -560,7 +562,7 @@ bool EngineController::HandleKey(ITfContext* pContext, UINT vkCode) {
             }
 
             // Auto-cap if revive didn't happen
-            if (config_.autoCaps && shouldAutoCap) {
+            if (activeConfig_.autoCaps && shouldAutoCap) {
                 upper = true;
                 if (!isBracket) ch = towupper(ch);
                 wasFirstCharAutoCapped_ = true;
@@ -589,6 +591,9 @@ bool EngineController::HandleKey(ITfContext* pContext, UINT vkCode) {
         return true;
     }
 
+    if (engineNeedsRecreate_ || pendingUserDictionary_) {
+        TryPromotePendingConfig();
+    }
     return false;
 }
 
@@ -607,6 +612,7 @@ void EngineController::ProcessBackspace(ITfContext* pContext) {
         RequestEditSession(pContext, pSession);
         pSession->Release();
         TSF_LOG(L"Backspace: composition cleared");
+        TryPromotePendingConfig();
     }
 }
 
@@ -636,6 +642,7 @@ void EngineController::Commit(ITfContext* pContext) {
 
     // Plain Commit (no trailing char) → no undo window. Caller is Enter/arrow/F-key.
     RecordCommitSnapshot(std::move(committed), std::move(rawSnapshot), /*hasTrailingChar=*/false);
+    TryPromotePendingConfig();
 }
 
 void EngineController::CommitWithChar(ITfContext* pContext, wchar_t appendChar) {
@@ -669,6 +676,7 @@ void EngineController::CommitWithChar(ITfContext* pContext, wchar_t appendChar) 
     // `committed` already includes the appended char (set above).
     const bool hasTrailing = (appendChar != L'\0');
     RecordCommitSnapshot(std::move(committed), std::move(rawSnapshot), hasTrailing);
+    TryPromotePendingConfig();
 }
 
 bool EngineController::CommitRawAndEnd(ITfContext* pContext) {
@@ -684,6 +692,7 @@ bool EngineController::CommitRawAndEnd(ITfContext* pContext) {
     ClearMacroTracking();
 
     TSF_LOG(L"CommitRawAndEnd: raw='%ls'", raw.c_str());
+    TryPromotePendingConfig();
     return true;
 }
 
@@ -702,6 +711,7 @@ void EngineController::EndCompositionVerbatim(ITfContext* pContext) {
     ResetCommitUndo();
 
     TSF_LOG(L"EndCompositionVerbatim: verbatim='%ls'", verbatim.c_str());
+    TryPromotePendingConfig();
 }
 
 bool EngineController::HasNonEmptySelection(ITfContext* pContext) {
@@ -723,10 +733,11 @@ void EngineController::Reset() {
     engine_->Reset();
     compositionMgr_.TerminateComposition();
     digitLedWord_ = false;
+    TryPromotePendingConfig();
 }
 
 bool EngineController::IsMacroTrackingEnabled() const noexcept {
-    if (!abiOk_ || contextBlocked_ || !config_.macroEnabled || macroTable_.empty()
+    if (!abiOk_ || contextBlocked_ || !activeConfig_.macroEnabled || macroTable_.empty()
         || !sharedState_.IsConnected()) {
         return false;
     }
@@ -734,12 +745,12 @@ bool EngineController::IsMacroTrackingEnabled() const noexcept {
     const bool liveVietnameseMode = (flags & SharedFlags::VIETNAMESE_MODE) != 0;
     return (flags & SharedFlags::ENGINE_ENABLED) != 0
         && (flags & SharedFlags::TSF_ACTIVE) != 0
-        && (liveVietnameseMode || config_.macroInEnglish);
+        && (liveVietnameseMode || activeConfig_.macroInEnglish);
 }
 
 bool EngineController::IsEnglishMacroTrackingActive() const noexcept {
-    if (!abiOk_ || contextBlocked_ || !config_.macroInEnglish
-        || !config_.macroEnabled || macroTable_.empty()
+    if (!abiOk_ || contextBlocked_ || !activeConfig_.macroInEnglish
+        || !activeConfig_.macroEnabled || macroTable_.empty()
         || !sharedState_.IsConnected()) {
         return false;
     }
@@ -838,7 +849,7 @@ std::optional<Macro::ContextMatch> EngineController::LookupMacroInContext(
 
     const TsfCaseMapper caseMapper;
     return Macro::MatchInPrecedingText(text, triggerChar, macroTable_, maxMacroKeyLen_,
-                                       config_.autoCapsMacro, kMacroClipboardThreshold,
+                                       activeConfig_.autoCapsMacro, kMacroClipboardThreshold,
                                        caseMapper);
 }
 
@@ -857,7 +868,7 @@ Macro::MacroPlan EngineController::EvaluateMacroPlan(const std::wstring& rawBuff
         .macroCrossCommit = macroCrossCommit_,
         // TSF writes Unicode through ITfRange, so match document character counts.
         .currentCodeTable = CodeTable::Unicode,
-        .autoCapsEnabled = config_.autoCapsMacro,
+        .autoCapsEnabled = activeConfig_.autoCapsMacro,
         .wasFirstCharAutoCapped = wasFirstCharAutoCapped_,
         .triggerChar = triggerChar,
         .clipboardThreshold = kMacroClipboardThreshold,
@@ -869,8 +880,8 @@ bool EngineController::WouldExpandMacroTrigger(ITfContext* pContext,
                                                 UINT vkCode,
                                                 wchar_t triggerChar) const {
     if (!Macro::IsCommitTrigger(vkCode) || !IsMacroTrackingEnabled()) return false;
-    if (!Macro::ShouldTrigger(vkCode, config_.macroTriggerSpace, config_.macroTriggerEnter,
-                              config_.macroTriggerTab, config_.macroTriggerDir)) {
+    if (!Macro::ShouldTrigger(vkCode, activeConfig_.macroTriggerSpace, activeConfig_.macroTriggerEnter,
+                              activeConfig_.macroTriggerTab, activeConfig_.macroTriggerDir)) {
         return false;
     }
 
@@ -892,8 +903,8 @@ EngineController::MacroResult EngineController::HandleMacroTrigger(
         return MacroResult::NoMatch;
     }
 
-    if (!Macro::ShouldTrigger(vkCode, config_.macroTriggerSpace, config_.macroTriggerEnter,
-                              config_.macroTriggerTab, config_.macroTriggerDir)) {
+    if (!Macro::ShouldTrigger(vkCode, activeConfig_.macroTriggerSpace, activeConfig_.macroTriggerEnter,
+                              activeConfig_.macroTriggerTab, activeConfig_.macroTriggerDir)) {
         if (vkCode == VK_SPACE && !rawMacroBuffer_.empty()) {
             rawMacroBuffer_.push_back(L' ');
             const bool keep = IsSpaceMacroPrefix(rawMacroBuffer_, spaceMacroKeys_);
@@ -1023,6 +1034,8 @@ void EngineController::DetectScintillaApp() {
 }
 
 bool EngineController::CheckConfigEvent(bool allowMacroDiskRead) {
+    TryPromotePendingConfig();
+
     if (!sharedState_.IsConnected()) {
         // Try to open SharedState if not connected
         if (!sharedState_.OpenReadWrite()) {
@@ -1075,11 +1088,12 @@ bool EngineController::CheckConfigEvent(bool allowMacroDiskRead) {
 #else
         constexpr bool dictionaryAttached = false;
 #endif
+        const bool promoted = TryPromotePendingConfig();
         if (allowMacroDiskRead && !macroConfigLoaded_) {
             ReloadMacros(macroGeneration_);
             return true;
         }
-        return dictionaryAttached;
+        return dictionaryAttached || promoted;
     }
 
     SharedState state = sharedState_.Read();
@@ -1121,36 +1135,37 @@ void EngineController::RefreshUserDictionarySnapshot(uint8_t generation,
         userDictionaryNeedsReload_ = true;
         pendingUserDictionary_.reset();
     }
-    if (!config_.spellSuggestEnabled || !userDictionaryNeedsReload_ || !allowDiskRead) {
+    const bool spellSuggest = pendingConfig_ ? pendingConfig_->spellSuggestEnabled
+                                             : activeConfig_.spellSuggestEnabled;
+    if (!spellSuggest || !userDictionaryNeedsReload_ || !allowDiskRead) {
         return;
     }
 
-    auto loaded = RustInputEngine::LoadUserDictionary(
-        ConfigManager::GetConfigPath(g_hInstance));
+    const std::wstring configPath = ConfigManager::GetConfigPath(g_hInstance);
+    std::shared_ptr<const RustUserDictionarySnapshot> lockedSnapshot;
+    const bool ok = LexiconReader::LoadUserDictionaryLocked(configPath, lockedSnapshot);
     userDictionaryNeedsReload_ = false;
-    if (loaded.Succeeded()) {
-        pendingUserDictionary_ = std::move(loaded.snapshot);
-        TSF_LOG(L"UserDictionary: %s path='%s' generation=%u",
-                loaded.created ? L"created and loaded" : L"loaded",
-                loaded.path.c_str(), static_cast<unsigned>(generation));
+    if (ok) {
+        pendingUserDictionary_ = std::move(lockedSnapshot);
+        TSF_LOG(L"UserDictionary: locked reload succeeded path='%ls' generation=%u",
+                configPath.c_str(), static_cast<unsigned>(generation));
     } else {
         // Fail-stale: malformed or unreadable edits never clear a previously
         // valid dictionary. A later config-generation bump retries.
-        TSF_LOG(L"UserDictionary: reload rejected; retaining prior snapshot (status=%d, engineStatus=%u, line=%zu, path='%s')",
-                static_cast<int>(loaded.status), loaded.engineStatus,
-                loaded.errorLine, loaded.path.c_str());
+        TSF_LOG(L"UserDictionary: locked reload rejected or timed out; retaining prior snapshot path='%ls'",
+                configPath.c_str());
     }
 }
 
 bool EngineController::TryAttachUserDictionary() {
-    if (!engine_ || engine_->Count() != 0 || !pendingUserDictionary_
-        || !EngineFactory::WillUseRustEngine(config_)) {
+    if (!engine_ || !CanPromotePendingConfig() || !pendingUserDictionary_
+        || !EngineFactory::WillUseRustEngine(activeConfig_)) {
         return false;
     }
     const bool attached = static_cast<RustInputEngine*>(engine_.get())
                               ->SetUserDictionary(pendingUserDictionary_);
     if (attached) {
-        userDictionary_ = std::move(pendingUserDictionary_);
+        activeUserDictionary_ = std::move(pendingUserDictionary_);
         TSF_LOG(L"UserDictionary: attached at word boundary");
     }
     return attached;
@@ -1193,13 +1208,19 @@ void EngineController::ReloadMacros(uint8_t generation) {
     macroTable_.clear();
     spaceMacroKeys_.clear();
     maxMacroKeyLen_ = 0;
-    if (!config_.macroEnabled) return;
+    if (!activeConfig_.macroEnabled && (!pendingConfig_ || !pendingConfig_->macroEnabled)) return;
 
     // Trigger choices live only in TOML; SharedState carries feature bits.
-    config_.macroTriggerSpace = diskConfig->macroTriggerSpace;
-    config_.macroTriggerEnter = diskConfig->macroTriggerEnter;
-    config_.macroTriggerTab = diskConfig->macroTriggerTab;
-    config_.macroTriggerDir = diskConfig->macroTriggerDir;
+    activeConfig_.macroTriggerSpace = diskConfig->macroTriggerSpace;
+    activeConfig_.macroTriggerEnter = diskConfig->macroTriggerEnter;
+    activeConfig_.macroTriggerTab = diskConfig->macroTriggerTab;
+    activeConfig_.macroTriggerDir = diskConfig->macroTriggerDir;
+    if (pendingConfig_.has_value()) {
+        pendingConfig_->macroTriggerSpace = diskConfig->macroTriggerSpace;
+        pendingConfig_->macroTriggerEnter = diskConfig->macroTriggerEnter;
+        pendingConfig_->macroTriggerTab = diskConfig->macroTriggerTab;
+        pendingConfig_->macroTriggerDir = diskConfig->macroTriggerDir;
+    }
 
     macroTable_ = ConfigManager::LoadMacros(configPath);
     for (const auto& [key, value] : macroTable_) {
@@ -1273,7 +1294,7 @@ void EngineController::SetTsfNativeConvertReady(bool ready) {
 void EngineController::ApplySharedState(const SharedState& state,
                                         bool allowMacroDiskRead) {
     const bool wasVietnameseMode = vietnameseMode_;
-    const bool wasMacroEnabled = config_.macroEnabled;
+    const bool wasMacroEnabled = activeConfig_.macroEnabled;
     // Update runtime flags
     engineEnabled_ = (state.flags & SharedFlags::ENGINE_ENABLED) != 0;
     vietnameseMode_ = (state.flags & SharedFlags::VIETNAMESE_MODE) != 0;
@@ -1294,23 +1315,27 @@ void EngineController::ApplySharedState(const SharedState& state,
         optimizeLevel = state.optimizeLevel;
     }
 
-    config_.inputMethod = newMethod;
-    config_.SetSpellCheckLevel(static_cast<SpellCheckLevel>(state.spellCheck));
-    config_.optimizeLevel = optimizeLevel;
-    DecodeFeatureFlags(state.GetFeatureFlags(), config_);
-    compositionMgr_.SetHidePreeditUnderline(config_.hidePreeditUnderline);
+    TypingConfig newConfig = activeConfig_;
+    newConfig.inputMethod = newMethod;
+    newConfig.SetSpellCheckLevel(static_cast<SpellCheckLevel>(state.spellCheck));
+    newConfig.optimizeLevel = optimizeLevel;
+    DecodeFeatureFlags(state.GetFeatureFlags(), newConfig);
+
+    pendingConfig_ = newConfig;
+    engineNeedsRecreate_ = true;
+    pendingSnapshotSerial_ = (static_cast<uint64_t>(state.epoch) << 8) | state.configGeneration;
+
 #ifdef VKEY_USE_RUST_ENGINE
     RefreshUserDictionarySnapshot(state.configGeneration, allowMacroDiskRead);
 #endif
+
     if (wasVietnameseMode != vietnameseMode_) ClearMacroTracking();
-    if (wasMacroEnabled != config_.macroEnabled) macroConfigLoaded_ = false;
-    // v3 cleanup: legacy `state.tempOffMethod` no longer decoded — TSF never
-    // consumed this field (V/E toggle path is in HookEngine/main app).
+    if (wasMacroEnabled != newConfig.macroEnabled) macroConfigLoaded_ = false;
 
     // Runtime file-logger gate. SettingsDialog persists the bit into the
     // feature-flag bitmask via SharedState, so flipping the toggle in the
     // EXE reaches every TSF DLL instance on the next CheckConfigEvent tick.
-    ::NextKey::Logger::SetEnabled(config_.debugLogEnabled);
+    ::NextKey::Logger::SetEnabled(newConfig.debugLogEnabled);
     switch (DecideMacroTable({.loaded = macroConfigLoaded_,
                               .loadedGen = macroGeneration_,
                               .stateGen = state.configGeneration,
@@ -1330,52 +1355,76 @@ void EngineController::ApplySharedState(const SharedState& state,
             break;
     }
 
-    // Recreate engine with updated config (engine stores a copy of TypingConfig,
-    // so we must recreate it whenever any config field changes)
-    // Commit any pending composition before recreating
-    if (engine_ && engine_->Count() > 0) {
-        (void)engine_->Commit();
+    // Promotion gate: if the engine is completely idle, promote immediately;
+    // otherwise, defer promotion until the engine returns to word boundary.
+    TryPromotePendingConfig();
+}
+
+bool EngineController::CanPromotePendingConfig() const noexcept {
+    if (!engine_) return true;
+    return CanPromoteTsfConfig({
+        .engineBufferCount = engine_->Count(),
+        .isComposing = compositionMgr_.IsComposing(),
+        .rawMacroBufferEmpty = rawMacroBuffer_.empty(),
+        .pendingReviveEmpty = pendingReviveWord_.empty()
+    });
+}
+
+bool EngineController::TryPromotePendingConfig() {
+    if (!engineNeedsRecreate_ && !pendingUserDictionary_) {
+        return false;
+    }
+    if (!CanPromotePendingConfig()) {
+        return false;
     }
 
-    currentMethod_ = newMethod;
-    engine_ = EngineFactory::Create(config_);
+    if (pendingConfig_.has_value()) {
+        activeConfig_ = *pendingConfig_;
+        activeMethod_ = activeConfig_.inputMethod;
+        pendingConfig_.reset();
+        compositionMgr_.SetHidePreeditUnderline(activeConfig_.hidePreeditUnderline);
+    }
+
+    if (engineNeedsRecreate_ || !engine_) {
+        engine_ = EngineFactory::Create(activeConfig_);
+        engineNeedsRecreate_ = false;
+
 #ifdef VKEY_USE_RUST_ENGINE
-    if (EngineFactory::WillUseRustEngine(config_)) {
-        const auto& snapshot = pendingUserDictionary_ ? pendingUserDictionary_
-                                                       : userDictionary_;
-        if (snapshot) {
-            const bool attached = static_cast<RustInputEngine*>(engine_.get())
-                                      ->SetUserDictionary(snapshot);
-            if (attached && pendingUserDictionary_) {
-                userDictionary_ = std::move(pendingUserDictionary_);
+        if (EngineFactory::WillUseRustEngine(activeConfig_)) {
+            const auto& snapshot = pendingUserDictionary_ ? pendingUserDictionary_
+                                                          : activeUserDictionary_;
+            if (snapshot) {
+                const bool attached = static_cast<RustInputEngine*>(engine_.get())
+                                          ->SetUserDictionary(snapshot);
+                if (attached && pendingUserDictionary_) {
+                    activeUserDictionary_ = std::move(pendingUserDictionary_);
+                }
+                TSF_LOG(L"UserDictionary: engine-recreate attach %s",
+                        attached ? L"ok" : L"failed");
             }
-            TSF_LOG(L"UserDictionary: engine-recreate attach %s",
-                    attached ? L"ok" : L"failed");
+        } else {
+            if (pendingUserDictionary_) {
+                activeUserDictionary_ = std::move(pendingUserDictionary_);
+            }
         }
+#endif
+
+        if (EngineFactory::RustEngineExpectedButUnavailable(activeConfig_)) {
+            sharedState_.SetOrClearFlag(SharedFlags::TSF_ENGINE_UNTRUSTED, true);
+        } else if (!activeConfig_.spellSuggestEnabled) {
+            sharedState_.SetOrClearFlag(SharedFlags::TSF_ENGINE_UNTRUSTED, false);
+        }
+        TSF_LOG(L"Engine promoted & recreated (%s, modernOrtho=%d, allowZwjf=%d)",
+                activeMethod_ == InputMethod::VNI ? L"VNI" : L"Telex",
+                activeConfig_.modernOrtho ? 1 : 0, activeConfig_.allowZwjf ? 1 : 0);
+    }
+#ifdef VKEY_USE_RUST_ENGINE
+    else if (pendingUserDictionary_) {
+        TryAttachUserDictionary();
     }
 #endif
-    // This DLL can be a different build than VKey.exe (update deferred because a
-    // host process held the old DLL), so it may bake a different engine.lock hash
-    // than the installed vkey_engine.dll and lose the Rust engine while the EXE
-    // keeps it. Publish it — otherwise the user only sees features quietly missing
-    // in TSF apps.
-    //
-    // Set-only while the feature is on, for the reason spelled out at the
-    // TSF_ABI_MISMATCH recovery above: every TSF host has its own copy of this DLL
-    // and they can be different builds mid-update, so a host that loaded the engine
-    // fine must not clear a bit another host raised for real. The bit clears when
-    // VKeyApp.exe recreates SharedState — the restart the banner asks for. Turning
-    // Advanced spell-check off does clear it: nothing is degraded any more, and
-    // leaving a restart banner up after the user disabled the feature is a false
-    // alarm.
-    if (EngineFactory::RustEngineExpectedButUnavailable(config_)) {
-        sharedState_.SetOrClearFlag(SharedFlags::TSF_ENGINE_UNTRUSTED, true);
-    } else if (!config_.spellSuggestEnabled) {
-        sharedState_.SetOrClearFlag(SharedFlags::TSF_ENGINE_UNTRUSTED, false);
-    }
-    TSF_LOG(L"Engine recreated (%s, modernOrtho=%d, allowZwjf=%d)",
-            newMethod == InputMethod::VNI ? L"VNI" : L"Telex",
-            config_.modernOrtho ? 1 : 0, config_.allowZwjf ? 1 : 0);
+
+    return true;
 }
 
 void EngineController::ToggleVietnameseMode() {
