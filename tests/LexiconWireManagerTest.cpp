@@ -378,5 +378,43 @@ TEST(LexiconWireManagerTest, ReaderReadOnlyAndWriteDenied) {
     manager.Close();
 }
 
+TEST(LexiconWireManagerTest, ManagerRestartWhileReaderAlive) {
+    // 1. First Core manager instance creates mapping and publishes generation 100
+    auto manager1 = std::make_unique<LexiconWireManager>();
+    ASSERT_TRUE(manager1->Create());
+    EXPECT_TRUE(manager1->IsWritable());
+    ASSERT_TRUE(manager1->Publish({ L"msword" }, { L"viet" }, 100, true));
+
+    // 2. Reader (e.g. TSF client) attaches and reads generation 100
+    LexiconWireReader reader;
+    ASSERT_TRUE(reader.Open());
+    EXPECT_TRUE(reader.IsOpen());
+    std::vector<uint8_t> localBuf;
+    LexiconWireView view;
+    ASSERT_TRUE(reader.ReadSnapshot(localBuf, view));
+    EXPECT_EQ(view.header->generation, 100u);
+
+    // 3. Core manager exits or restarts (manager1 destroyed), but reader remains ALIVE!
+    manager1.reset();
+
+    // 4. Restarting Core creates a new manager instance
+    // Must successfully acquire writer role and re-attach to the surviving section
+    LexiconWireManager manager2;
+    ASSERT_TRUE(manager2.Create());
+    EXPECT_TRUE(manager2.IsWritable());
+
+    // 5. Manager2 publishes generation 200 to the surviving section
+    ASSERT_TRUE(manager2.Publish({ L"excel" }, { L"nam" }, 200, true));
+
+    // 6. The surviving reader immediately observes generation 200 from the same section
+    ASSERT_TRUE(reader.ReadSnapshot(localBuf, view));
+    EXPECT_EQ(view.header->generation, 200u);
+    EXPECT_EQ(view.exclusionsRowCount, 1u);
+    EXPECT_EQ(view.wordCount, 1u);
+
+    reader.Close();
+    manager2.Close();
+}
+
 } // namespace
 } // namespace NextKey::Wire

@@ -801,6 +801,8 @@ bool LexiconWriter::CommitTransaction(
             auto dictRes = LexiconValidator::ParseAndValidateUserDictText(newUserDictText);
             std::string wireErr;
             if (!PublishWireMapping(exclusions, dictRes.entries, wireGen, spellSuggest, &wireErr)) {
+                // SharedState generation was published at step 6; restore old generation on wire failure
+                (void)PublishGeneration(oldGeneration);
                 if (RollbackToBackup(record, configPath, dictPath, configBak, dictBak)) {
                     std::filesystem::remove(configTmp, ec);
                     std::filesystem::remove(dictTmp, ec);

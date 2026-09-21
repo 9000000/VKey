@@ -24,7 +24,7 @@ namespace {
 // Thread-safe in-process named shared memory registry for POSIX / Linux CI testing
 struct PosixNamedSharedMemoryRegistry {
     std::mutex mutex;
-    std::unordered_map<std::string, std::shared_ptr<std::vector<uint8_t>>> mappings;
+    std::unordered_map<std::string, std::weak_ptr<std::vector<uint8_t>>> mappings;
     std::unordered_set<std::string> activeWriters;
 
     std::shared_ptr<std::vector<uint8_t>> CreateForWriter(const std::string& name, size_t size) {
@@ -35,7 +35,9 @@ struct PosixNamedSharedMemoryRegistry {
         activeWriters.insert(name);
         auto it = mappings.find(name);
         if (it != mappings.end()) {
-            return it->second;
+            if (auto existing = it->second.lock()) {
+                return existing;
+            }
         }
         auto block = std::make_shared<std::vector<uint8_t>>(size, 0);
         mappings[name] = block;
@@ -46,7 +48,7 @@ struct PosixNamedSharedMemoryRegistry {
         std::lock_guard<std::mutex> lock(mutex);
         auto it = mappings.find(name);
         if (it != mappings.end()) {
-            return it->second;
+            return it->second.lock();
         }
         return nullptr;
     }
@@ -60,6 +62,12 @@ struct PosixNamedSharedMemoryRegistry {
         std::lock_guard<std::mutex> lock(mutex);
         activeWriters.erase(name);
         mappings.erase(name);
+    }
+
+    void Reset() {
+        std::lock_guard<std::mutex> lock(mutex);
+        activeWriters.clear();
+        mappings.clear();
     }
 };
 
@@ -130,19 +138,30 @@ bool LexiconWireManager::Create() {
         LocalFree(sa.lpSecurityDescriptor);
     }
 
+    if (!pImpl_->hMapping && GetLastError() == ERROR_ACCESS_DENIED) {
+        // The mapping was left alive by surviving readers with a read-only DACL.
+        // As the kernel object owner holding the exclusive writer mutex, re-apply creator write DACL.
+        HANDLE hOwner = OpenFileMappingW(WRITE_DAC | READ_CONTROL, FALSE, LEXICON_WIRE_MAPPING_NAME);
+        if (hOwner) {
+            SECURITY_ATTRIBUTES saWrite = MakeCreatorWriteSecurityAttributes();
+            if (saWrite.lpSecurityDescriptor) {
+                SetKernelObjectSecurity(hOwner, DACL_SECURITY_INFORMATION, saWrite.lpSecurityDescriptor);
+                LocalFree(saWrite.lpSecurityDescriptor);
+            }
+            CloseHandle(hOwner);
+
+            pImpl_->hMapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, LEXICON_WIRE_MAPPING_NAME);
+        }
+    }
+
     if (!pImpl_->hMapping) {
         CloseHandle(pImpl_->hWriterMutex);
         pImpl_->hWriterMutex = nullptr;
         return false;
     }
 
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        CloseHandle(pImpl_->hMapping);
-        pImpl_->hMapping = nullptr;
-        CloseHandle(pImpl_->hWriterMutex);
-        pImpl_->hWriterMutex = nullptr;
-        return false;
-    }
+    // Surviving readers keep the section object alive (GetLastError() == ERROR_ALREADY_EXISTS).
+    // As the sole holder of Local\VKeyLexiconWireWriterMutex, we safely attach and map the view.
 
     void* pView = MapViewOfFile(pImpl_->hMapping, FILE_MAP_ALL_ACCESS, 0, 0, WIRE_TOTAL_SIZE);
     if (!pView) {
@@ -151,6 +170,13 @@ bool LexiconWireManager::Create() {
         CloseHandle(pImpl_->hWriterMutex);
         pImpl_->hWriterMutex = nullptr;
         return false;
+    }
+
+    // Lock down DACL to read-only for interactive users and AppContainers
+    SECURITY_ATTRIBUTES saLock = MakeAppContainerReadableSecurityAttributes();
+    if (saLock.lpSecurityDescriptor) {
+        SetKernelObjectSecurity(pImpl_->hMapping, DACL_SECURITY_INFORMATION, saLock.lpSecurityDescriptor);
+        LocalFree(saLock.lpSecurityDescriptor);
     }
 
     pImpl_->pMapping = static_cast<volatile LexiconWireHeader*>(pView);
@@ -192,7 +218,7 @@ void LexiconWireManager::Close() noexcept {
     }
 #else
     if (pImpl_->posixBlock) {
-        GetPosixRegistry().Remove(LEXICON_WIRE_MAPPING_NAME);
+        GetPosixRegistry().ReleaseWriter(LEXICON_WIRE_MAPPING_NAME);
         pImpl_->posixBlock.reset();
         pImpl_->pMapping = nullptr;
     }

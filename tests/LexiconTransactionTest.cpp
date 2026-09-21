@@ -590,12 +590,23 @@ TEST_F(LexiconTransactionTest, CommitTransaction_RollsBackWhenWirePublishingFail
         return false;
     });
 
+    std::vector<uint8_t> publishedGens;
+    LexiconWriter::SetTestGenerationPublisher([&publishedGens](uint8_t gen) {
+        publishedGens.push_back(gen);
+        return true;
+    });
+
     std::string newConfigToml = "[input]\nmethod = \"vni\"\n[internal]\nwire_generation = 5000\n";
     std::string newUserDict = "moi\n";
 
-    // Transaction must fail
-    bool ok = LexiconWriter::CommitTransaction(configPath_.wstring(), newConfigToml, newUserDict);
+    // Transaction must fail (explicit oldGen=10, newGen=11)
+    bool ok = LexiconWriter::CommitTransaction(configPath_.wstring(), newConfigToml, newUserDict, 10, 11, true);
     EXPECT_FALSE(ok);
+
+    // Generation must have published newGen (11) then restored oldGen (10)
+    ASSERT_GE(publishedGens.size(), 2u);
+    EXPECT_EQ(publishedGens[0], 11u);
+    EXPECT_EQ(publishedGens[1], 10u);
 
     // Files must have rolled back to previous content
     std::string currentToml = ReadFile(configPath_);
@@ -611,6 +622,7 @@ TEST_F(LexiconTransactionTest, CommitTransaction_RollsBackWhenWirePublishingFail
     EXPECT_FALSE(std::filesystem::exists(configPath_.string() + ".bak"));
     EXPECT_FALSE(std::filesystem::exists(dictPath_.string() + ".bak"));
 
+    LexiconWriter::SetTestGenerationPublisher(nullptr);
     LexiconWriter::SetTestWirePublisher(nullptr);
 }
 
