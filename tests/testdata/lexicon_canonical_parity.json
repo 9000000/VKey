@@ -1,0 +1,99 @@
+[
+  {
+    "name": "rust_spec_trim_nfc_lowercase_dedup",
+    "input": [" ZÔ ", "rose", "zo\u0302"],
+    "expected_ok": true,
+    "expected_entries": ["rose", "zô"]
+  },
+  {
+    "name": "vietnamese_shorthand_prefixes",
+    "input": ["HĐ", "ĐCĐT", "KHTN", "ALÔ", "so\u0300a", "SOÀ"],
+    "expected_ok": true,
+    "expected_entries": ["alô", "hđ", "khtn", "soà", "sòa", "đcđt"]
+  },
+  {
+    "name": "unicode_whitespace_trimming_at_both_ends",
+    "input": ["\t  hđ\u00A0 \r\n", "\u3000đcđt\u2000"],
+    "expected_ok": true,
+    "expected_entries": ["hđ", "đcđt"]
+  },
+  {
+    "name": "non_bmp_ordering",
+    "input": ["\uFFFD\uFFFD", "\U00010400\U00010400"],
+    "expected_ok": true,
+    "expected_entries": ["\uFFFD\uFFFD", "\U00010428\U00010428"]
+  },
+  {
+    "name": "case_decomposition_nfc_pass2",
+    "input": ["A\u0302\u0301B", "a\u0302\u0301b"],
+    "expected_ok": true,
+    "expected_entries": ["ấb"]
+  },
+  {
+    "name": "exactly_8_entries_boundary",
+    "input": ["entry0", "entry1", "entry2", "entry3", "entry4", "entry5", "entry6", "entry7"],
+    "expected_ok": true,
+    "expected_entries": ["entry0", "entry1", "entry2", "entry3", "entry4", "entry5", "entry6", "entry7"]
+  },
+  {
+    "name": "duplicate_entries_deduplicated_under_8_cap",
+    "input": ["entry0", "ENTRY0", "entry1", "entry2", "entry3", "entry4", "entry5", "entry6", "entry7"],
+    "expected_ok": true,
+    "expected_entries": ["entry0", "entry1", "entry2", "entry3", "entry4", "entry5", "entry6", "entry7"]
+  },
+  {
+    "name": "error_too_short_single_char",
+    "input": ["valid", "a"],
+    "expected_ok": false,
+    "expected_error": {
+      "kind": "TooShort",
+      "row": 2
+    }
+  },
+  {
+    "name": "error_too_short_whitespace_only",
+    "input": ["   "],
+    "expected_ok": false,
+    "expected_error": {
+      "kind": "TooShort",
+      "row": 1
+    }
+  },
+  {
+    "name": "error_too_long_129_scalars",
+    "input": ["valid", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+    "expected_ok": false,
+    "expected_error": {
+      "kind": "TooLong",
+      "row": 2,
+      "scalars": 129
+    }
+  },
+  {
+    "name": "error_invalid_entry_internal_whitespace",
+    "input": ["h đ"],
+    "expected_ok": false,
+    "expected_error": {
+      "kind": "InvalidEntry",
+      "row": 1
+    }
+  },
+  {
+    "name": "error_invalid_entry_control_char",
+    "input": ["ab\u0007cd"],
+    "expected_ok": false,
+    "expected_error": {
+      "kind": "InvalidEntry",
+      "row": 1
+    }
+  },
+  {
+    "name": "error_too_many_entries_9_distinct",
+    "input": ["entry0", "entry1", "entry2", "entry3", "entry4", "entry5", "entry6", "entry7", "entry8"],
+    "expected_ok": false,
+    "expected_error": {
+      "kind": "TooManyEntries",
+      "count": 9
+    }
+  }
+]

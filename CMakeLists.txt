@@ -342,6 +342,8 @@ set(NEXTKEY_CORE_SOURCES
     src/core/pipeline/Coordinator.cpp
     src/core/pipeline/OutputChannel.h
     src/core/pipeline/OutputChannel.cpp
+    src/core/config/SpellExclusionCanonicalizer.h
+    src/core/config/SpellExclusionCanonicalizer.cpp
 )
 
 # Windows-only sources (require Windows.h)
@@ -370,6 +372,15 @@ target_include_directories(VKeyCore PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/extern/tomlplusplus
 )
 target_link_libraries(VKeyCore PUBLIC VKeyEngine)
+if(NOT WIN32)
+    find_package(ICU COMPONENTS uc)
+    if(ICU_FOUND)
+        target_link_libraries(VKeyCore PUBLIC ICU::uc)
+        target_compile_definitions(VKeyCore PUBLIC VKEY_HAS_ICU=1)
+    endif()
+else()
+    target_link_libraries(VKeyCore PUBLIC normaliz)
+endif()
 
 # TSF DLL (TIP)
 add_library(VKeyTSF SHARED
@@ -858,6 +869,7 @@ set(NEXTKEY_TEST_SOURCES
     tests/MacroTableDecisionTest.cpp
     tests/HookEngineAtomicTests.cpp
     tests/TypingConfigRCUTests.cpp
+    tests/SpellExclusionCanonicalizerTest.cpp
     tests/MainThreadWorkerTests.cpp
     tests/AdaptiveTickTest.cpp
     tests/AdaptiveTickBenchmark.cpp
