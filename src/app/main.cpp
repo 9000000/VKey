@@ -85,25 +85,15 @@ static void PublishCurrentLexiconToWire() {
     }
     g_wireManager.SetWireGeneration(wireGen);
 
-    std::vector<std::wstring> exclusions;
-    for (const auto& excl : diskConfig->spellExclusions) {
-        std::wstring u16;
-        std::u32string u32;
-        if (SpellExclusionCanonicalizer::Utf8ToUtf32(excl, u32) &&
-            SpellExclusionCanonicalizer::Utf32ToUtf16(u32, u16)) {
-            exclusions.push_back(u16);
-        }
-    }
-
     std::vector<std::wstring> dictWords;
     LexiconReader::LoadUserDictionaryWordsLocked(configPath, dictWords);
 
     std::string err;
-    if (!g_wireManager.Publish(exclusions, dictWords, wireGen, diskConfig->spellSuggestEnabled, &err)) {
+    if (!g_wireManager.Publish(diskConfig->spellExclusions, dictWords, wireGen, diskConfig->spellSuggestEnabled, &err)) {
         NEXTKEY_LOG(L"PublishCurrentLexiconToWire failed: %hs", err.c_str());
     } else {
         NEXTKEY_LOG(L"PublishCurrentLexiconToWire: published gen=%llu dictWords=%zu exclusions=%zu",
-                    static_cast<unsigned long long>(wireGen), dictWords.size(), exclusions.size());
+                    static_cast<unsigned long long>(wireGen), dictWords.size(), diskConfig->spellExclusions.size());
     }
 }
 
@@ -114,24 +104,14 @@ static void InitLexiconWireMapping(const TypingConfig& config) {
         uint64_t wireGen = ConfigManager::LoadWireGeneration(configPath);
         g_wireManager.SetWireGeneration(wireGen);
 
-        std::vector<std::wstring> initialExclusions;
-        for (const auto& excl : config.spellExclusions) {
-            std::wstring u16;
-            std::u32string u32;
-            if (SpellExclusionCanonicalizer::Utf8ToUtf32(excl, u32) &&
-                SpellExclusionCanonicalizer::Utf32ToUtf16(u32, u16)) {
-                initialExclusions.push_back(u16);
-            }
-        }
-
         std::vector<std::wstring> initialDict;
         LexiconReader::LoadUserDictionaryWordsLocked(configPath, initialDict);
         std::string err;
-        if (!g_wireManager.Publish(initialExclusions, initialDict, wireGen, config.spellSuggestEnabled, &err)) {
+        if (!g_wireManager.Publish(config.spellExclusions, initialDict, wireGen, config.spellSuggestEnabled, &err)) {
             NEXTKEY_LOG(L"InitLexiconWireMapping: failed to publish initial wire snapshot: %hs", err.c_str());
         } else {
             NEXTKEY_LOG(L"InitLexiconWireMapping: published wire snapshot gen=%llu dictWords=%zu exclusions=%zu",
-                        static_cast<unsigned long long>(wireGen), initialDict.size(), initialExclusions.size());
+                        static_cast<unsigned long long>(wireGen), initialDict.size(), config.spellExclusions.size());
         }
     } else {
         NEXTKEY_LOG(L"InitLexiconWireMapping: failed to create wire manager");

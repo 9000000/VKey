@@ -1481,7 +1481,7 @@ bool EngineController::TryPromotePendingConfig() {
     }
 #ifdef VKEY_USE_RUST_ENGINE
     else if (pendingUserDictionary_) {
-        TryAttachUserDictionary();
+        static_cast<void>(TryAttachUserDictionary());
     }
 #endif
 
