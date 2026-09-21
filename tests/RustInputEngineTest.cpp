@@ -856,6 +856,40 @@ TEST_F(RustInputEngineTest, SerializedCreationAndSpellExclusionCanonicalization)
     EXPECT_EQ(engine2.Count(), 0u);
 }
 
+TEST_F(RustInputEngineTest, CreateUserDictionaryFromUtf16DirectCompileAndAttach) {
+    std::u16string dictText = u"alo\nban\n";
+    auto snapshot = RustInputEngine::CreateUserDictionaryFromUtf16(
+        reinterpret_cast<const uint16_t*>(dictText.data()), dictText.size());
+    ASSERT_NE(snapshot, nullptr);
+
+    TypingConfig config;
+    config.inputMethod = InputMethod::Telex;
+    config.spellCheckEnabled = true;
+    RustInputEngine engine(config);
+
+    EXPECT_TRUE(engine.SetUserDictionary(snapshot));
+    // Clear protection with null snapshot
+    EXPECT_TRUE(engine.SetUserDictionary(nullptr));
+}
+
+TEST_F(RustInputEngineTest, SetSpellExclusionsFromUtf16PlumbingAndDeduplication) {
+    std::u16string exclText = u"msword\nchrome\n";
+    bool changed = false;
+    EXPECT_TRUE(RustInputEngine::SetSpellExclusionsFromUtf16(
+        reinterpret_cast<const uint16_t*>(exclText.data()), exclText.size(), &changed));
+    EXPECT_TRUE(changed);
+
+    // Call again with same text: no change
+    changed = true;
+    EXPECT_TRUE(RustInputEngine::SetSpellExclusionsFromUtf16(
+        reinterpret_cast<const uint16_t*>(exclText.data()), exclText.size(), &changed));
+    EXPECT_FALSE(changed);
+
+    // Clear
+    EXPECT_TRUE(RustInputEngine::SetSpellExclusionsFromUtf16(nullptr, 0, &changed));
+    EXPECT_TRUE(changed);
+}
+
 #endif
 
 }  // namespace

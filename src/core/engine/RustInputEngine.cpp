@@ -518,6 +518,29 @@ bool RustInputEngine::SetUserDictionary(
 #endif
 }
 
+std::shared_ptr<const RustUserDictionarySnapshot>
+RustInputEngine::CreateUserDictionaryFromUtf16(const uint16_t* utf16Units, size_t count) {
+#if VKEY_ENGINE_ABI_VERSION >= 8u
+    const EngineApi& api = Api();
+    if (!api.ok || !api.user_dictionary_create_utf16) {
+        return nullptr;
+    }
+    uint32_t status = VKEY_USER_DICTIONARY_INVALID_ARGUMENT;
+    size_t errorLine = 0;
+    VKeyUserDictionary* dictionary = api.user_dictionary_create_utf16(
+        utf16Units, count, &status, &errorLine);
+    if (!dictionary) {
+        return nullptr;
+    }
+    return std::shared_ptr<const RustUserDictionarySnapshot>(
+        new RustUserDictionarySnapshot(dictionary));
+#else
+    (void)utf16Units;
+    (void)count;
+    return nullptr;
+#endif
+}
+
 namespace {
 
 std::mutex s_engineCreationMutex;
@@ -525,6 +548,39 @@ std::wstring s_activeCanonicalExclusionsText;
 bool s_activeCanonicalExclusionsInitialized = false;
 
 } // namespace
+
+bool RustInputEngine::SetSpellExclusionsFromUtf16(
+    const uint16_t* utf16Units, size_t count, bool* outChanged) {
+#if VKEY_ENGINE_ABI_VERSION >= 5u
+    const EngineApi& api = Api();
+    if (!api.ok || !api.set_spell_exclusions_utf16) {
+        if (outChanged) *outChanged = false;
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(s_engineCreationMutex);
+    std::wstring newText;
+    if (utf16Units && count > 0) {
+        newText.assign(reinterpret_cast<const wchar_t*>(utf16Units), count);
+    }
+    const bool changed = !s_activeCanonicalExclusionsInitialized ||
+                         (newText != s_activeCanonicalExclusionsText);
+    if (outChanged) *outChanged = changed;
+    if (!changed) {
+        return true;
+    }
+    const bool ok = api.set_spell_exclusions_utf16(utf16Units, count);
+    if (ok) {
+        s_activeCanonicalExclusionsText = std::move(newText);
+        s_activeCanonicalExclusionsInitialized = true;
+    }
+    return ok;
+#else
+    (void)utf16Units;
+    (void)count;
+    if (outChanged) *outChanged = false;
+    return false;
+#endif
+}
 
 RustInputEngine::RustInputEngine(const TypingConfig& config) {
     const EngineApi& api = Api();

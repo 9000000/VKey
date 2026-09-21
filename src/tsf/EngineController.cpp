@@ -134,9 +134,19 @@ EngineController::EngineController(ITfThreadMgr* pThreadMgr) {
     }
 
     compositionMgr_.SetEngineController(this);
+#ifdef VKEY_USE_RUST_ENGINE
+    wireReaderActive_ = wireReader_.Open();
+    if (wireReaderActive_) {
+        TSF_LOG(L"EngineController: LexiconWireReader opened");
+    }
+#endif
 }
 
 EngineController::~EngineController() {
+#ifdef VKEY_USE_RUST_ENGINE
+    wireReader_.Close();
+    wireReaderActive_ = false;
+#endif
     if (lastContext_) {
         lastContext_->Release();
         lastContext_ = nullptr;
@@ -1081,8 +1091,8 @@ bool EngineController::CheckConfigEvent(bool allowMacroDiskRead) {
     uint32_t currentEpoch = sharedState_.ReadEpoch();
     if (!recoveredAbi && currentEpoch == lastEpoch_) {
 #ifdef VKEY_USE_RUST_ENGINE
-        if (userDictionaryNeedsReload_ && allowMacroDiskRead) {
-            RefreshUserDictionarySnapshot(userDictionaryGeneration_, true);
+        if (userDictionaryNeedsReload_) {
+            RefreshUserDictionarySnapshot(currentEpoch, userDictionaryGeneration_, allowMacroDiskRead);
         }
         const bool dictionaryAttached = TryAttachUserDictionary();
 #else
@@ -1127,7 +1137,8 @@ bool EngineController::CheckConfigEvent(bool allowMacroDiskRead) {
 }
 
 #ifdef VKEY_USE_RUST_ENGINE
-void EngineController::RefreshUserDictionarySnapshot(uint8_t generation,
+void EngineController::RefreshUserDictionarySnapshot(uint32_t epoch,
+                                                     uint8_t generation,
                                                      bool allowDiskRead) {
     if (!userDictionaryGenerationKnown_ || userDictionaryGeneration_ != generation) {
         userDictionaryGenerationKnown_ = true;
@@ -1137,7 +1148,47 @@ void EngineController::RefreshUserDictionarySnapshot(uint8_t generation,
     }
     const bool spellSuggest = pendingConfig_ ? pendingConfig_->spellSuggestEnabled
                                              : activeConfig_.spellSuggestEnabled;
-    if (!spellSuggest || !userDictionaryNeedsReload_ || !allowDiskRead) {
+    if (!spellSuggest || !userDictionaryNeedsReload_) {
+        return;
+    }
+
+    // Step 1: Zero-disk-I/O fast path via shared memory wire mapping (lock-free seqlock).
+    bool wireUpdated = false;
+    std::string wireErr;
+    if (wireReader_.ReadSnapshotFast(wireLocalBuffer_, wireView_, epoch, &wireUpdated, &wireErr)) {
+        wireReaderActive_ = true;
+        if (!wireUpdated) {
+            // Snapshot has not changed on the wire; cache hit.
+            userDictionaryNeedsReload_ = false;
+            return;
+        }
+
+        // Apply process-global spell exclusions from UTF-16 buffer.
+        bool exclusionsChanged = false;
+        RustInputEngine::SetSpellExclusionsFromUtf16(
+            wireView_.exclusionsBuf,
+            wireView_.exclusionsUnits,
+            &exclusionsChanged);
+        if (exclusionsChanged) {
+            engineNeedsRecreate_ = true;
+        }
+
+        // Compile user dictionary snapshot directly from UTF-16 buffer without disk I/O.
+        pendingUserDictionary_ = RustInputEngine::CreateUserDictionaryFromUtf16(
+            wireView_.userDictBuf,
+            wireView_.userDictUnits);
+
+        userDictionaryNeedsReload_ = false;
+        TSF_LOG(L"UserDictionary: wire reload succeeded gen=%llu entries=%u units=%u",
+                static_cast<unsigned long long>(wireView_.header->generation),
+                static_cast<unsigned>(wireView_.header->userDictWordCount),
+                static_cast<unsigned>(wireView_.header->userDictUtf16Units));
+        return;
+    }
+
+    // Step 2: Legacy fallback to disk-based locked reading (Phase 1).
+    // Invariant: NEVER touch disk on the typing hot path (!allowDiskRead).
+    if (!allowDiskRead) {
         return;
     }
 
@@ -1147,13 +1198,13 @@ void EngineController::RefreshUserDictionarySnapshot(uint8_t generation,
     userDictionaryNeedsReload_ = false;
     if (ok) {
         pendingUserDictionary_ = std::move(lockedSnapshot);
-        TSF_LOG(L"UserDictionary: locked reload succeeded path='%ls' generation=%u",
+        TSF_LOG(L"UserDictionary: disk locked reload succeeded path='%ls' generation=%u",
                 configPath.c_str(), static_cast<unsigned>(generation));
     } else {
         // Fail-stale: malformed or unreadable edits never clear a previously
         // valid dictionary. A later config-generation bump retries.
-        TSF_LOG(L"UserDictionary: locked reload rejected or timed out; retaining prior snapshot path='%ls'",
-                configPath.c_str());
+        TSF_LOG(L"UserDictionary: wire failed ('%ls') and disk reload rejected; retaining prior snapshot path='%ls'",
+                std::wstring(wireErr.begin(), wireErr.end()).c_str(), configPath.c_str());
     }
 }
 
@@ -1326,7 +1377,7 @@ void EngineController::ApplySharedState(const SharedState& state,
     pendingSnapshotSerial_ = (static_cast<uint64_t>(state.epoch) << 8) | state.configGeneration;
 
 #ifdef VKEY_USE_RUST_ENGINE
-    RefreshUserDictionarySnapshot(state.configGeneration, allowMacroDiskRead);
+    RefreshUserDictionarySnapshot(state.epoch, state.configGeneration, allowMacroDiskRead);
 #endif
 
     if (wasVietnameseMode != vietnameseMode_) ClearMacroTracking();

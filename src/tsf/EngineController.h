@@ -20,6 +20,7 @@
 #include "core/config/TypingConfig.h"
 #include "core/engine/IInputEngine.h"
 #include "core/engine/TypingAction.h"
+#include "core/ipc/LexiconWireManager.h"
 #include "core/ipc/SharedStateManager.h"
 
 namespace NextKey {
@@ -248,7 +249,7 @@ private:
 
     void ReloadMacros(uint8_t generation);
 #ifdef VKEY_USE_RUST_ENGINE
-    void RefreshUserDictionarySnapshot(uint8_t generation, bool allowDiskRead);
+    void RefreshUserDictionarySnapshot(uint32_t epoch, uint8_t generation, bool allowDiskRead);
     [[nodiscard]] bool TryAttachUserDictionary();
 #endif
     void ClearMacroTrackingAfterCommit() noexcept;
@@ -316,14 +317,19 @@ private:
     bool macroConfigLoaded_ = false;
     bool macroCrossCommit_ = false;
 #ifdef VKEY_USE_RUST_ENGINE
-    // The TSF key path never reads/parses this file. A config generation seen
-    // there only latches `needs reload`; focus/init performs disk work. A
-    // compiled snapshot that arrives mid-word waits for an empty engine.
+    // The TSF key path reads dictionary snapshots directly from the wire mapping
+    // without disk I/O. If wire mapping is unmapped or unavailable, focus/init
+    // can fall back to disk-based locked reading.
     std::shared_ptr<const RustUserDictionarySnapshot> activeUserDictionary_;
     std::shared_ptr<const RustUserDictionarySnapshot> pendingUserDictionary_;
     uint8_t userDictionaryGeneration_ = 0;
     bool userDictionaryGenerationKnown_ = false;
     bool userDictionaryNeedsReload_ = false;
+
+    Wire::LexiconWireReader wireReader_;
+    std::vector<uint8_t> wireLocalBuffer_;
+    Wire::LexiconWireView wireView_{};
+    bool wireReaderActive_ = false;
 #endif
 
     // Pending Backspace revive — set by PrepareBackspaceRevive (called from OnTestKeyDown),

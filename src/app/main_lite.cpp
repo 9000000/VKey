@@ -40,6 +40,10 @@
 #include "classic/ClassicSettingsDialog.h"
 #include "classic/ClassicMacroTableDialog.h"
 #include "classic/ClassicConvertToolDialog.h"
+#include "core/config/LexiconTransaction.h"
+#include "core/config/LexiconValidation.h"
+#include "core/ipc/LexiconWireManager.h"
+#include "core/ipc/SharedStateManager.h"
 
 #include <Windows.h>
 #include <commctrl.h>
@@ -71,7 +75,80 @@ static HotkeyManager g_hotkeyManager;
 static HookEngine g_hookEngine;
 static MainThreadWorker g_mainThreadWorker;  // Sprint 1 D9: drain config-change work off main thread
 static SharedStateManager g_sharedState;
+static Wire::LexiconWireManager g_wireManager;
 static std::unique_ptr<QuickConvert> g_quickConvert;
+
+static void PublishCurrentLexiconToWire() {
+    if (!g_wireManager.IsWritable()) return;
+    const std::wstring configPath = ConfigManager::GetConfigPath();
+    auto diskConfig = ConfigManager::LoadFromFile(configPath);
+    if (!diskConfig) return;
+
+    uint64_t wireGen = ConfigManager::LoadWireGeneration(configPath);
+    if (wireGen <= g_wireManager.GetWireGeneration()) {
+        wireGen = g_wireManager.GetWireGeneration() + 1;
+        ConfigManager::SaveWireGeneration(configPath, wireGen);
+    }
+    g_wireManager.SetWireGeneration(wireGen);
+
+    std::vector<std::wstring> exclusions;
+    for (const auto& excl : diskConfig->spellExclusions) {
+        std::wstring u16;
+        std::u32string u32;
+        if (SpellExclusionCanonicalizer::Utf8ToUtf32(excl, u32) &&
+            SpellExclusionCanonicalizer::Utf32ToUtf16(u32, u16)) {
+            exclusions.push_back(u16);
+        }
+    }
+
+    std::vector<std::wstring> dictWords;
+    LexiconReader::LoadUserDictionaryWordsLocked(configPath, dictWords);
+
+    std::string err;
+    if (!g_wireManager.Publish(exclusions, dictWords, wireGen, diskConfig->spellSuggestEnabled, &err)) {
+        NEXTKEY_LOG(L"PublishCurrentLexiconToWire failed: %hs", err.c_str());
+    } else {
+        NEXTKEY_LOG(L"PublishCurrentLexiconToWire: published gen=%llu dictWords=%zu exclusions=%zu",
+                    static_cast<unsigned long long>(wireGen), dictWords.size(), exclusions.size());
+    }
+}
+
+static void InitLexiconWireMapping(const TypingConfig& config) {
+    if (g_wireManager.Create()) {
+        LexiconWriter::SetWireManager(&g_wireManager);
+        const std::wstring configPath = ConfigManager::GetConfigPath();
+        uint64_t wireGen = ConfigManager::LoadWireGeneration(configPath);
+        g_wireManager.SetWireGeneration(wireGen);
+
+        std::vector<std::wstring> initialExclusions;
+        for (const auto& excl : config.spellExclusions) {
+            std::wstring u16;
+            std::u32string u32;
+            if (SpellExclusionCanonicalizer::Utf8ToUtf32(excl, u32) &&
+                SpellExclusionCanonicalizer::Utf32ToUtf16(u32, u16)) {
+                initialExclusions.push_back(u16);
+            }
+        }
+
+        std::vector<std::wstring> initialDict;
+        LexiconReader::LoadUserDictionaryWordsLocked(configPath, initialDict);
+        std::string err;
+        if (!g_wireManager.Publish(initialExclusions, initialDict, wireGen, config.spellSuggestEnabled, &err)) {
+            NEXTKEY_LOG(L"InitLexiconWireMapping: failed to publish initial wire snapshot: %hs", err.c_str());
+        } else {
+            NEXTKEY_LOG(L"InitLexiconWireMapping: published wire snapshot gen=%llu dictWords=%zu exclusions=%zu",
+                        static_cast<unsigned long long>(wireGen), initialDict.size(), initialExclusions.size());
+        }
+    } else {
+        NEXTKEY_LOG(L"InitLexiconWireMapping: failed to create wire manager");
+    }
+}
+
+static void ShutdownLexiconWireMapping() noexcept {
+    LexiconWriter::SetWireManager(nullptr);
+    g_wireManager.Close();
+    NEXTKEY_LOG(L"LexiconWireMapping closed");
+}
 static HotkeyManager::SlotId g_toggleHotkeySlot = 0;
 static HotkeyManager::SlotId g_convertHotkeySlot = 0;
 static WatchdogController g_watchdog;  // Owns heartbeat + Task Scheduler entry + VKeyWatchdog.exe lifecycle
@@ -216,6 +293,9 @@ static void ApplyConfigChange(const TypingConfig& config) {
     if (HWND settingsWnd = FindWindowW(L"VKeyClassicSettings", nullptr)) {
         PostMessageW(settingsWnd, WM_VKEY_CONFIG_CHANGED, 0, 0);
     }
+
+    // Update lexicon shared memory wire mapping
+    PublishCurrentLexiconToWire();
 }
 
 /// Applies a spell-check level chosen from the tray menu. Entering Advanced
@@ -364,6 +444,7 @@ static void OnMenuCommand(TrayMenuId id) {
         }
 
         case TrayMenuId::Exit:
+            ShutdownLexiconWireMapping();
             // Tell watchdog this is a user-initiated quit — skip respawn.
             g_watchdog.SignalGracefulShutdown();
             g_running.store(false, std::memory_order_relaxed);
@@ -621,6 +702,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
             tsfInUse && pendingDllState == PendingDllState::SwapFailed);
         g_sharedState.SetOrClearFlag(SharedFlags::TSF_POST_UPDATE_REBOOT,
             tsfInUse && pendingDllState == PendingDllState::SwapDoneNeedsReboot);
+
+        InitLexiconWireMapping(config);
     }
 
     // ── Tray Icon ──
@@ -758,6 +841,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
         g_hookEngine.DrainGameModeToggleOnWorker();
         g_hookEngine.SyncConfigFromSharedState();
         g_hookEngine.DrainClassifyOnWorker();
+        PublishCurrentLexiconToWire();
         // Adaptive-tick (plan 2026-05-27): retune cadence after Signal-driven
         // wake. Same wiring as main.cpp.
         g_hookEngine.RetuneCadenceIfNeeded();
@@ -874,6 +958,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     CleanupFloatingIcon();
     timeEndPeriod(1);
     g_trayIcon.Destroy();
+    ShutdownLexiconWireMapping();
 
     NEXTKEY_LOG(L"Exiting (Lite mode)");
 

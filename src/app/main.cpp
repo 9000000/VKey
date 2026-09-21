@@ -30,6 +30,9 @@
 #include "system/HotkeyManager.h"
 #include "system/HotkeyWiring.h"
 #include "system/WatchdogController.h"
+#include "core/config/LexiconTransaction.h"
+#include "core/config/LexiconValidation.h"
+#include "core/ipc/LexiconWireManager.h"
 #include "core/ipc/SharedStateManager.h"
 #ifdef VKEY_HOOK_ENGINE
 #include "system/HookEngine.h"
@@ -64,8 +67,81 @@ static FloatingIcon g_floatingIcon;
 static HINSTANCE g_hInstance = nullptr;
 
 static SharedStateManager g_sharedState;  // Shared memory for Settings subprocess IPC
+static Wire::LexiconWireManager g_wireManager;  // Shared memory wire manager for lexicon
 static HotkeyManager g_hotkeyManager;
 static WatchdogController g_watchdog;  // Owns heartbeat + Task Scheduler entry + VKeyWatchdog.exe lifecycle
+
+static void PublishCurrentLexiconToWire() {
+    if (!g_wireManager.IsWritable()) return;
+    const std::wstring configPath = ConfigManager::GetConfigPath();
+    auto diskConfig = ConfigManager::LoadFromFile(configPath);
+    if (!diskConfig) return;
+
+    uint64_t wireGen = ConfigManager::LoadWireGeneration(configPath);
+    if (wireGen <= g_wireManager.GetWireGeneration()) {
+        wireGen = g_wireManager.GetWireGeneration() + 1;
+        ConfigManager::SaveWireGeneration(configPath, wireGen);
+    }
+    g_wireManager.SetWireGeneration(wireGen);
+
+    std::vector<std::wstring> exclusions;
+    for (const auto& excl : diskConfig->spellExclusions) {
+        std::wstring u16;
+        std::u32string u32;
+        if (SpellExclusionCanonicalizer::Utf8ToUtf32(excl, u32) &&
+            SpellExclusionCanonicalizer::Utf32ToUtf16(u32, u16)) {
+            exclusions.push_back(u16);
+        }
+    }
+
+    std::vector<std::wstring> dictWords;
+    LexiconReader::LoadUserDictionaryWordsLocked(configPath, dictWords);
+
+    std::string err;
+    if (!g_wireManager.Publish(exclusions, dictWords, wireGen, diskConfig->spellSuggestEnabled, &err)) {
+        NEXTKEY_LOG(L"PublishCurrentLexiconToWire failed: %hs", err.c_str());
+    } else {
+        NEXTKEY_LOG(L"PublishCurrentLexiconToWire: published gen=%llu dictWords=%zu exclusions=%zu",
+                    static_cast<unsigned long long>(wireGen), dictWords.size(), exclusions.size());
+    }
+}
+
+static void InitLexiconWireMapping(const TypingConfig& config) {
+    if (g_wireManager.Create()) {
+        LexiconWriter::SetWireManager(&g_wireManager);
+        const std::wstring configPath = ConfigManager::GetConfigPath();
+        uint64_t wireGen = ConfigManager::LoadWireGeneration(configPath);
+        g_wireManager.SetWireGeneration(wireGen);
+
+        std::vector<std::wstring> initialExclusions;
+        for (const auto& excl : config.spellExclusions) {
+            std::wstring u16;
+            std::u32string u32;
+            if (SpellExclusionCanonicalizer::Utf8ToUtf32(excl, u32) &&
+                SpellExclusionCanonicalizer::Utf32ToUtf16(u32, u16)) {
+                initialExclusions.push_back(u16);
+            }
+        }
+
+        std::vector<std::wstring> initialDict;
+        LexiconReader::LoadUserDictionaryWordsLocked(configPath, initialDict);
+        std::string err;
+        if (!g_wireManager.Publish(initialExclusions, initialDict, wireGen, config.spellSuggestEnabled, &err)) {
+            NEXTKEY_LOG(L"InitLexiconWireMapping: failed to publish initial wire snapshot: %hs", err.c_str());
+        } else {
+            NEXTKEY_LOG(L"InitLexiconWireMapping: published wire snapshot gen=%llu dictWords=%zu exclusions=%zu",
+                        static_cast<unsigned long long>(wireGen), initialDict.size(), initialExclusions.size());
+        }
+    } else {
+        NEXTKEY_LOG(L"InitLexiconWireMapping: failed to create wire manager");
+    }
+}
+
+static void ShutdownLexiconWireMapping() noexcept {
+    LexiconWriter::SetWireManager(nullptr);
+    g_wireManager.Close();
+    NEXTKEY_LOG(L"LexiconWireMapping closed");
+}
 
 #ifdef VKEY_HOOK_ENGINE
 static HookEngine g_hookEngine;
@@ -452,6 +528,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
         // TSF_ABI_MISMATCH is set cross-process by the DLL itself and only if
         // a host process loaded our DLL. DLL can't load without registration,
         // so this flag implicitly requires TSF-in-use. No gate needed.
+
+        InitLexiconWireMapping(config);
     }
 
     // Tray Icon
@@ -640,6 +718,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
         g_hookEngine.DrainGameModeToggleOnWorker();
         g_hookEngine.SyncConfigFromSharedState();
         g_hookEngine.DrainClassifyOnWorker();
+        PublishCurrentLexiconToWire();
         // Adaptive-tick (plan 2026-05-27): when MarkActivity wakes the worker
         // via Signal, this is where the cadence gets retuned back to active.
         // The Signal path doesn't run the tick handler — it runs this work
@@ -751,6 +830,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     g_quickConvert.reset();
     CleanupFloatingIcon();
     g_trayIcon.Destroy();
+    ShutdownLexiconWireMapping();
     timeEndPeriod(1);
 
 #else
@@ -818,6 +898,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
             pendingDllState == PendingDllState::SwapFailed);
         g_sharedState.SetOrClearFlag(SharedFlags::TSF_POST_UPDATE_REBOOT,
             pendingDllState == PendingDllState::SwapDoneNeedsReboot);
+
+        InitLexiconWireMapping(config);
     }
 
     // Tray Icon
@@ -831,6 +913,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     }
     g_trayIcon.SetMenuCallback(OnMenuCommand);
     g_trayIcon.SetSharedState(&g_sharedState);  // for TSF-update restart menu item
+    g_trayIcon.SetHookReloadCallback([]() {
+        PublishCurrentLexiconToWire();
+    });
 
     // Wire settings dialog → TSF mode set (cross-process)
     g_trayIcon.SetModeRequestCallback([](bool vietnamese) {
@@ -972,6 +1057,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
 
     TerminateAllSubprocesses();
     g_trayIcon.Destroy();
+    ShutdownLexiconWireMapping();
     CoUninitialize();
 #endif
 
@@ -979,6 +1065,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     // WM_CLOSE from the updater handover) so the watchdog skips respawn.
     // Idempotent — safe even if SignalGracefulShutdown was already called.
     // Heartbeat thread is stopped by ~WatchdogController via ~HeartbeatPublisher.
+    ShutdownLexiconWireMapping();
     g_watchdog.SignalGracefulShutdown();
 
     NEXTKEY_LOG(L"Exiting");
@@ -1017,6 +1104,9 @@ static void ApplyConfigChange(const TypingConfig& config) {
     if (HWND settingsWnd = GetSettingsHwnd()) {
         PostMessageW(settingsWnd, WM_VKEY_CONFIG_CHANGED, 0, 0);
     }
+
+    // 5. Update lexicon shared memory wire mapping
+    PublishCurrentLexiconToWire();
 }
 
 /// Applies a spell-check level chosen from the tray menu. Entering Advanced
@@ -1149,6 +1239,7 @@ void OnMenuCommand(TrayMenuId id) {
         }
 
         case TrayMenuId::Exit:
+            ShutdownLexiconWireMapping();
             TerminateAllSubprocesses();
             // Tell watchdog this is a user-initiated quit — skip respawn.
             g_watchdog.SignalGracefulShutdown();

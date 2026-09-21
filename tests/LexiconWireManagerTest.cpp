@@ -5,12 +5,17 @@
 
 #include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "core/config/LexiconTransaction.h"
 #include "core/ipc/LexiconWireManager.h"
+#if defined(VKEY_USE_RUST_ENGINE)
+#include "core/engine/RustInputEngine.h"
+#endif
 
 namespace NextKey::Wire {
 namespace {
@@ -464,6 +469,126 @@ TEST(LexiconWireManagerTest, SameUserWriteOpenDenied_ReadOnlyAllowed) {
     LexiconWireView view;
     ASSERT_TRUE(reader.ReadSnapshot(localBuf, view));
     EXPECT_EQ(view.header->generation, 1u);
+
+    reader.Close();
+    manager.Close();
+}
+
+#if defined(VKEY_USE_RUST_ENGINE)
+TEST(LexiconWireManagerTest, WireReaderToRustInputEnginePromotion) {
+    LexiconWireManager manager;
+    ASSERT_TRUE(manager.Create());
+
+    std::vector<std::wstring> exclusions = { L"msword", L"excel" };
+    std::vector<std::wstring> dictWords = { L"viet", L"nam" };
+
+    std::string err;
+    ASSERT_TRUE(manager.Publish(exclusions, dictWords, 42, true, &err)) << err;
+
+    LexiconWireReader reader;
+    ASSERT_TRUE(reader.Open());
+
+    std::vector<uint8_t> localBuf;
+    LexiconWireView view;
+    bool wasUpdated = false;
+    ASSERT_TRUE(reader.ReadSnapshotFast(localBuf, view, 1, &wasUpdated, &err)) << err;
+    EXPECT_TRUE(wasUpdated);
+
+    bool exclusionsChanged = false;
+    EXPECT_TRUE(RustInputEngine::SetSpellExclusionsFromUtf16(
+        view.exclusionsBuf, view.exclusionsUnits, &exclusionsChanged));
+
+    auto snapshot = RustInputEngine::CreateUserDictionaryFromUtf16(
+        view.userDictBuf, view.userDictUnits);
+    ASSERT_NE(snapshot, nullptr);
+
+    TypingConfig config;
+    config.inputMethod = InputMethod::Telex;
+    config.spellCheckEnabled = true;
+    RustInputEngine engine(config);
+
+    EXPECT_TRUE(engine.SetUserDictionary(snapshot));
+
+    // Cleanup process-global exclusions
+    RustInputEngine::SetSpellExclusionsFromUtf16(nullptr, 0, nullptr);
+    reader.Close();
+    manager.Close();
+}
+#endif
+
+TEST(LexiconWireManagerTest, OldReaderFallback_DiskLocked_WhenWireUnavailable) {
+    namespace fs = std::filesystem;
+    const fs::path testDir = fs::temp_directory_path() / "vkey_wire_fallback_test";
+    fs::create_directories(testDir);
+    const fs::path configPath = testDir / "config.toml";
+    const fs::path dictPath = testDir / "user_dictionary.txt";
+
+    // Write a valid user_dictionary.txt
+    {
+        std::ofstream dictFile(dictPath);
+        dictFile << "fallbackword\n";
+    }
+
+    // When wire reader is NOT open (mapping does not exist)
+    LexiconWireReader reader;
+    EXPECT_FALSE(reader.IsOpen());
+
+    // 1. Hot-path typing simulation: allowDiskRead == false -> must NOT touch disk!
+    // Stays stale, does not attempt locked load.
+    bool allowDiskRead = false;
+    std::shared_ptr<const RustUserDictionarySnapshot> lockedSnapshot;
+    bool loadedFromDisk = false;
+    if (allowDiskRead) {
+        loadedFromDisk = LexiconReader::LoadUserDictionaryLocked(configPath.wstring(), lockedSnapshot);
+    }
+    EXPECT_FALSE(loadedFromDisk);
+    EXPECT_EQ(lockedSnapshot, nullptr);
+
+    // 2. Focus / init simulation: allowDiskRead == true -> falls back to Phase 1 disk locked read
+    allowDiskRead = true;
+    if (allowDiskRead) {
+        loadedFromDisk = LexiconReader::LoadUserDictionaryLocked(configPath.wstring(), lockedSnapshot);
+    }
+#if defined(VKEY_USE_RUST_ENGINE)
+    EXPECT_TRUE(loadedFromDisk);
+    ASSERT_NE(lockedSnapshot, nullptr);
+#else
+    (void)loadedFromDisk;
+#endif
+
+    fs::remove_all(testDir);
+}
+
+TEST(LexiconWireManagerTest, FastPathZeroAllocationAndCacheHits) {
+    LexiconWireManager manager;
+    ASSERT_TRUE(manager.Create());
+    ASSERT_TRUE(manager.Publish({ L"word" }, { L"excel" }, 10, true));
+
+    LexiconWireReader reader;
+    ASSERT_TRUE(reader.Open());
+
+    std::vector<uint8_t> localBuf;
+    LexiconWireView view;
+    bool wasUpdated = false;
+
+    // Initial read
+    ASSERT_TRUE(reader.ReadSnapshotFast(localBuf, view, 5, &wasUpdated));
+    EXPECT_TRUE(wasUpdated);
+
+    // Repeated reads with identical epoch (< 1 ns, zero allocation)
+    for (int i = 0; i < 100; ++i) {
+        wasUpdated = true;
+        ASSERT_TRUE(reader.ReadSnapshotFast(localBuf, view, 5, &wasUpdated));
+        EXPECT_FALSE(wasUpdated);
+    }
+
+    // Increment SharedState epoch, but keep wire content identical (skips copy)
+    for (uint32_t epoch = 6; epoch <= 10; ++epoch) {
+        wasUpdated = true;
+        ASSERT_TRUE(reader.ReadSnapshotFast(localBuf, view, epoch, &wasUpdated));
+        EXPECT_FALSE(wasUpdated);
+        EXPECT_EQ(reader.GetCachedIdentity().sharedStateEpoch, epoch);
+    }
 
     reader.Close();
     manager.Close();

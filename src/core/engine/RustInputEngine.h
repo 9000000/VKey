@@ -98,6 +98,16 @@ public:
     static bool CreateUserDictionaryTemplate(
         const std::wstring& configPath, bool* created = nullptr);
 
+    /// Directly compile a dictionary snapshot from a UTF-16 newline-delimited buffer (e.g. from LexiconWireView).
+    /// Zero disk I/O, zero conversions, zero file locks.
+    [[nodiscard]] static std::shared_ptr<const RustUserDictionarySnapshot>
+    CreateUserDictionaryFromUtf16(const uint16_t* utf16Units, size_t count);
+
+    /// Install process-global spell-check exclusions from a UTF-16 newline-delimited buffer (e.g. from LexiconWireView).
+    /// Returns true on success. Sets outChanged to true if the exclusions differed from previously installed.
+    static bool SetSpellExclusionsFromUtf16(
+        const uint16_t* utf16Units, size_t count, bool* outChanged = nullptr);
+
     /// Attach a precompiled immutable snapshot. Null clears protection. Returns
     /// false without changing the engine if composition is active.
     [[nodiscard]] bool SetUserDictionary(
