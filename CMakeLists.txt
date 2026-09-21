@@ -425,6 +425,9 @@ target_link_libraries(VKeyTSF PRIVATE VKeyCore)
 set_target_properties(VKeyTSF PROPERTIES 
     LINK_FLAGS "/DEF:\"${CMAKE_CURRENT_SOURCE_DIR}/src/tsf/VKeyTSF.def\""
 )
+if(VKEY_USE_RUST_ENGINE)
+    target_compile_definitions(VKeyTSF PRIVATE VKEY_USE_RUST_ENGINE)
+endif()
 
 if(WIN32 AND NOT VKEY_FOUNDATION_BUILD)
     add_executable(VKeyBrowserHost

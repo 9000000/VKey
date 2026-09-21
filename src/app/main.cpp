@@ -32,6 +32,7 @@
 #include "system/WatchdogController.h"
 #include "core/config/LexiconTransaction.h"
 #include "core/config/LexiconValidation.h"
+#include "core/config/SpellExclusionCanonicalizer.h"
 #include "core/ipc/LexiconWireManager.h"
 #include "core/ipc/SharedStateManager.h"
 #ifdef VKEY_HOOK_ENGINE
@@ -80,7 +81,7 @@ static void PublishCurrentLexiconToWire() {
     uint64_t wireGen = ConfigManager::LoadWireGeneration(configPath);
     if (wireGen <= g_wireManager.GetWireGeneration()) {
         wireGen = g_wireManager.GetWireGeneration() + 1;
-        ConfigManager::SaveWireGeneration(configPath, wireGen);
+        static_cast<void>(ConfigManager::SaveWireGeneration(configPath, wireGen));
     }
     g_wireManager.SetWireGeneration(wireGen);
 

@@ -195,7 +195,11 @@ public:
 
     /// Whether there is a staged configuration or engine recreation waiting for promotion gate
     [[nodiscard]] bool HasPendingConfig() const noexcept {
+#ifdef VKEY_USE_RUST_ENGINE
+        return pendingConfig_.has_value() || engineNeedsRecreate_ || (pendingUserDictionary_ != nullptr);
+#else
         return pendingConfig_.has_value() || engineNeedsRecreate_;
+#endif
     }
 
     /// Combined serial of the latest pending configuration (epoch << 8 | configGeneration)

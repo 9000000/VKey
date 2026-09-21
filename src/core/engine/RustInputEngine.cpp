@@ -544,7 +544,7 @@ RustInputEngine::CreateUserDictionaryFromUtf16(const uint16_t* utf16Units, size_
 namespace {
 
 std::mutex s_engineCreationMutex;
-std::wstring s_activeCanonicalExclusionsText;
+std::vector<uint16_t> s_activeCanonicalExclusionsUnits;
 bool s_activeCanonicalExclusionsInitialized = false;
 
 } // namespace
@@ -558,19 +558,19 @@ bool RustInputEngine::SetSpellExclusionsFromUtf16(
         return false;
     }
     std::lock_guard<std::mutex> lock(s_engineCreationMutex);
-    std::wstring newText;
+    std::vector<uint16_t> newUnits;
     if (utf16Units && count > 0) {
-        newText.assign(reinterpret_cast<const wchar_t*>(utf16Units), count);
+        newUnits.assign(utf16Units, utf16Units + count);
     }
     const bool changed = !s_activeCanonicalExclusionsInitialized ||
-                         (newText != s_activeCanonicalExclusionsText);
+                         (newUnits != s_activeCanonicalExclusionsUnits);
     if (outChanged) *outChanged = changed;
     if (!changed) {
         return true;
     }
     const bool ok = api.set_spell_exclusions_utf16(utf16Units, count);
     if (ok) {
-        s_activeCanonicalExclusionsText = std::move(newText);
+        s_activeCanonicalExclusionsUnits = std::move(newUnits);
         s_activeCanonicalExclusionsInitialized = true;
     }
     return ok;
@@ -590,33 +590,46 @@ RustInputEngine::RustInputEngine(const TypingConfig& config) {
         // threads never interleave exclusions, and roll back if create() fails.
         std::lock_guard<std::mutex> lock(s_engineCreationMutex);
 
-        std::wstring newExclusionsText;
+        std::vector<uint16_t> newExclusionsUnits;
         if (!config.spellExclusions.empty()) {
             auto canonical = SpellExclusionCanonicalizer::Canonicalize(config.spellExclusions);
-            if (canonical.Succeeded()) {
-                for (size_t i = 0; i < canonical.entries.size(); ++i) {
-                    if (i > 0) newExclusionsText += L'\n';
-                    newExclusionsText += canonical.entries[i];
+            const auto& srcList = canonical.Succeeded() ? canonical.entries : config.spellExclusions;
+            for (size_t i = 0; i < srcList.size(); ++i) {
+                if (i > 0) newExclusionsUnits.push_back(static_cast<uint16_t>('\n'));
+                const auto& w = srcList[i];
+#if defined(_WIN32)
+                newExclusionsUnits.insert(
+                    newExclusionsUnits.end(),
+                    reinterpret_cast<const uint16_t*>(w.data()),
+                    reinterpret_cast<const uint16_t*>(w.data() + w.size()));
+#else
+                std::u32string u32;
+                if (SpellExclusionCanonicalizer::Utf16ToUtf32(w, u32)) {
+                    for (uint32_t cp : u32) {
+                        if (cp <= 0xFFFF) {
+                            newExclusionsUnits.push_back(static_cast<uint16_t>(cp));
+                        } else if (cp <= 0x10FFFF) {
+                            uint32_t v = cp - 0x10000;
+                            newExclusionsUnits.push_back(static_cast<uint16_t>(0xD800 + (v >> 10)));
+                            newExclusionsUnits.push_back(static_cast<uint16_t>(0xDC00 + (v & 0x3FF)));
+                        }
+                    }
                 }
-            } else {
-                for (size_t i = 0; i < config.spellExclusions.size(); ++i) {
-                    if (i > 0) newExclusionsText += L'\n';
-                    newExclusionsText += config.spellExclusions[i];
-                }
+#endif
             }
         }
 
         const bool exclusionsChanged = !s_activeCanonicalExclusionsInitialized ||
-                                       (newExclusionsText != s_activeCanonicalExclusionsText);
+                                       (newExclusionsUnits != s_activeCanonicalExclusionsUnits);
 
         if (exclusionsChanged) {
             bool setOk = false;
-            if (newExclusionsText.empty()) {
+            if (newExclusionsUnits.empty()) {
                 setOk = api.set_spell_exclusions_utf16(nullptr, 0);
             } else {
                 setOk = api.set_spell_exclusions_utf16(
-                    reinterpret_cast<const uint16_t*>(newExclusionsText.data()),
-                    newExclusionsText.size());
+                    newExclusionsUnits.data(),
+                    newExclusionsUnits.size());
             }
             if (!setOk) {
                 // Setter failed: fail-stale, do not proceed with create()
@@ -628,19 +641,19 @@ RustInputEngine::RustInputEngine(const TypingConfig& config) {
         if (!handle_) {
             // Creation failed: roll back process-global Rust state if changed
             if (exclusionsChanged && s_activeCanonicalExclusionsInitialized) {
-                if (s_activeCanonicalExclusionsText.empty()) {
+                if (s_activeCanonicalExclusionsUnits.empty()) {
                     api.set_spell_exclusions_utf16(nullptr, 0);
                 } else {
                     api.set_spell_exclusions_utf16(
-                        reinterpret_cast<const uint16_t*>(s_activeCanonicalExclusionsText.data()),
-                        s_activeCanonicalExclusionsText.size());
+                        s_activeCanonicalExclusionsUnits.data(),
+                        s_activeCanonicalExclusionsUnits.size());
                 }
             }
             return;
         }
 
         if (exclusionsChanged) {
-            s_activeCanonicalExclusionsText = std::move(newExclusionsText);
+            s_activeCanonicalExclusionsUnits = std::move(newExclusionsUnits);
             s_activeCanonicalExclusionsInitialized = true;
         }
 

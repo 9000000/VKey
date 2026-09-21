@@ -601,7 +601,11 @@ bool EngineController::HandleKey(ITfContext* pContext, UINT vkCode) {
         return true;
     }
 
+#ifdef VKEY_USE_RUST_ENGINE
     if (engineNeedsRecreate_ || pendingUserDictionary_) {
+#else
+    if (engineNeedsRecreate_) {
+#endif
         TryPromotePendingConfig();
     }
     return false;
@@ -1422,9 +1426,15 @@ bool EngineController::CanPromotePendingConfig() const noexcept {
 }
 
 bool EngineController::TryPromotePendingConfig() {
+#ifdef VKEY_USE_RUST_ENGINE
     if (!engineNeedsRecreate_ && !pendingUserDictionary_) {
         return false;
     }
+#else
+    if (!engineNeedsRecreate_) {
+        return false;
+    }
+#endif
     if (!CanPromotePendingConfig()) {
         return false;
     }
