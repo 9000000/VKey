@@ -60,24 +60,31 @@ inline bool GetCurrentProcessUserSidString(std::wstring& outSid) noexcept {
     return true;
 }
 
-// Returns a SECURITY_ATTRIBUTES that grants full access (write) strictly to SYSTEM, Admins,
-// and Creator Owner (CO).
-// Interactive User (IU) and AppContainer sandbox packages (AC, RA) receive ONLY read access (GENERIC_READ).
-// This enforces the single-writer invariant and prevents rogue interactive processes from tampering with the wire mapping.
+// Returns a SECURITY_ATTRIBUTES that grants full access (write) strictly to SYSTEM and Admins.
+// Interactive User (IU), current user, and AppContainer sandbox packages (AC, RA) receive ONLY read access (GENERIC_READ).
+// This enforces the single-writer invariant and prevents any other process of the same user from opening the mapping for write.
 // Call LocalFree(sa.lpSecurityDescriptor) after the handle is created.
 //
 // SDDL breakdown:
 //   D:PAI              — DACL, protected, auto-inherited
 //   (A;;GA;;;SY)       — Allow GENERIC_ALL to SYSTEM
 //   (A;;GA;;;BA)       — Allow GENERIC_ALL to Built-in Administrators
-//   (A;;GA;;;CO)       — Allow GENERIC_ALL strictly to Creator Owner (writer process at creation)
+//   (A;;GR;;;<UserSID>)— Allow GENERIC_READ to Current User SID (read-only)
 //   (A;;GR;;;IU)       — Allow GENERIC_READ to Interactively logged-on User (read-only)
 //   (A;;GR;;;AC)       — Allow GENERIC_READ to ALL APPLICATION PACKAGES (S-1-15-2-1)
 //   (A;;GR;;;RA)       — Allow GENERIC_READ to ALL RESTRICTED APPLICATION PACKAGES (S-1-15-2-2)
 inline SECURITY_ATTRIBUTES MakeAppContainerReadableSecurityAttributes() noexcept {
+    std::wstring userSid;
+    std::wstring sddl;
+    if (GetCurrentProcessUserSidString(userSid) && !userSid.empty()) {
+        sddl = L"D:PAI(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;" + userSid + L")(A;;GR;;;IU)(A;;GR;;;AC)(A;;GR;;;RA)";
+    } else {
+        sddl = L"D:PAI(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;IU)(A;;GR;;;AC)(A;;GR;;;RA)";
+    }
+
     PSECURITY_DESCRIPTOR pSD = nullptr;
     ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        L"D:PAI(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;CO)(A;;GR;;;IU)(A;;GR;;;AC)(A;;GR;;;RA)",
+        sddl.c_str(),
         SDDL_REVISION_1,
         &pSD,
         nullptr);

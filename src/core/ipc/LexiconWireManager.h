@@ -72,6 +72,9 @@ public:
     /// Test helper: inject in-memory storage for deterministic mock testing.
     void SetMockStorage(uint8_t* storage, size_t size) noexcept;
 
+    /// Test helper: inject fault for security descriptor / ACL application failure.
+    static void SetTestSecurityFailure(bool fail) noexcept;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> pImpl_;

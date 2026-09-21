@@ -626,5 +626,58 @@ TEST_F(LexiconTransactionTest, CommitTransaction_RollsBackWhenWirePublishingFail
     LexiconWriter::SetTestWirePublisher(nullptr);
 }
 
+TEST_F(LexiconTransactionTest, CommitTransaction_PreservesBackupsAndJournalWhenRestoringOldGenerationFails) {
+    // 1. Initial valid commit
+    std::string validToml = "[input]\nmethod = \"telex\"\n";
+    std::string validDict = "ban\n";
+    ASSERT_TRUE(LexiconWriter::CommitTransaction(configPath_.wstring(), validToml, validDict, 1, 2, true));
+
+    // 2. Setup mock wire publisher hook that fails
+    LexiconWriter::SetTestWirePublisher([](const auto&, const auto&, uint64_t, bool, std::string* outErr) {
+        if (outErr) *outErr = "Simulated wire publish failure";
+        return false;
+    });
+
+    // 3. Setup generation publisher fault-injection:
+    // Call 1 (publishing newGeneration 3): succeeds
+    // Call 2+ (attempting to restore oldGeneration 2): FAILS!
+    int genCalls = 0;
+    LexiconWriter::SetTestGenerationPublisher([&genCalls](uint8_t gen) {
+        genCalls++;
+        if (genCalls == 1) {
+            EXPECT_EQ(gen, 3u); // newGeneration
+            return true;
+        }
+        EXPECT_EQ(gen, 2u); // oldGeneration
+        return false; // Fault injection: restoring oldGeneration fails!
+    });
+
+    std::string newConfigToml = "[input]\nmethod = \"vni\"\n[internal]\nwire_generation = 6000\n";
+    std::string newUserDict = "moi\n";
+
+    // Transaction must fail
+    bool ok = LexiconWriter::CommitTransaction(configPath_.wstring(), newConfigToml, newUserDict, 2, 3, true);
+    EXPECT_FALSE(ok);
+    EXPECT_GE(genCalls, 2);
+
+    // CRITICAL: Because restoring oldGeneration failed, the journal MUST BE PRESERVED on disk!
+    // It must NOT be deleted so that crash recovery / forensics can detect the unfinalized transaction.
+    const auto journalPath = testDir_ / "lexicon_txn.journal";
+    EXPECT_TRUE(std::filesystem::exists(journalPath));
+
+    // Verify journal record is preserved at FilesReplaced state
+    std::string journalContent = ReadFile(journalPath);
+    EXPECT_NE(journalContent.find("state=FILES_REPLACED"), std::string::npos);
+
+    // Disk files were rolled back to original content
+    std::string currentToml = ReadFile(configPath_);
+    EXPECT_NE(currentToml.find("telex"), std::string::npos);
+    EXPECT_EQ(currentToml.find("vni"), std::string::npos);
+
+    // Cleanup hooks
+    LexiconWriter::SetTestGenerationPublisher(nullptr);
+    LexiconWriter::SetTestWirePublisher(nullptr);
+}
+
 } // namespace NextKey
 

@@ -416,5 +416,58 @@ TEST(LexiconWireManagerTest, ManagerRestartWhileReaderAlive) {
     manager2.Close();
 }
 
+TEST(LexiconWireManagerTest, SetKernelObjectSecurityFailure_AbortsCreationAndCleansUp) {
+    // Inject fault simulating SetKernelObjectSecurity or ACL lockdown failure
+    LexiconWireManager::SetTestSecurityFailure(true);
+
+    LexiconWireManager manager;
+    EXPECT_FALSE(manager.Create());
+    EXPECT_FALSE(manager.IsWritable());
+    EXPECT_EQ(manager.GetHeader(), nullptr);
+
+    // Reset fault injection: manager creation now succeeds cleanly
+    LexiconWireManager::SetTestSecurityFailure(false);
+    EXPECT_TRUE(manager.Create());
+    EXPECT_TRUE(manager.IsWritable());
+    EXPECT_NE(manager.GetHeader(), nullptr);
+
+    manager.Close();
+}
+
+TEST(LexiconWireManagerTest, SameUserWriteOpenDenied_ReadOnlyAllowed) {
+    LexiconWireManager manager;
+    ASSERT_TRUE(manager.Create());
+    EXPECT_TRUE(manager.IsWritable());
+    ASSERT_TRUE(manager.Publish({ L"msword" }, { L"viet" }, 1, true));
+
+#if defined(_WIN32)
+    // On Windows: Any subsequent open with FILE_MAP_WRITE (even within the exact same process
+    // and user security token) MUST be rejected by the kernel with ERROR_ACCESS_DENIED.
+    HANDLE hWrite = OpenFileMappingW(FILE_MAP_WRITE, FALSE, LEXICON_WIRE_MAPPING_NAME);
+    EXPECT_EQ(hWrite, nullptr);
+    EXPECT_EQ(GetLastError(), ERROR_ACCESS_DENIED);
+
+    // Opening with FILE_MAP_READ MUST succeed for interactive users and AppContainers
+    HANDLE hRead = OpenFileMappingW(FILE_MAP_READ, FALSE, LEXICON_WIRE_MAPPING_NAME);
+    EXPECT_NE(hRead, nullptr);
+    if (hRead) {
+        CloseHandle(hRead);
+    }
+#endif
+
+    // Reader opening in read-only mode succeeds
+    LexiconWireReader reader;
+    ASSERT_TRUE(reader.Open());
+    EXPECT_TRUE(reader.IsOpen());
+
+    std::vector<uint8_t> localBuf;
+    LexiconWireView view;
+    ASSERT_TRUE(reader.ReadSnapshot(localBuf, view));
+    EXPECT_EQ(view.header->generation, 1u);
+
+    reader.Close();
+    manager.Close();
+}
+
 } // namespace
 } // namespace NextKey::Wire

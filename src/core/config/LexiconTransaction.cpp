@@ -506,6 +506,9 @@ bool LexiconRecovery::RecoverIfNeeded(const std::filesystem::path& configPath) {
                 if (!RollbackToBackup(record, configPath, dictPath, configBak, dictBak)) {
                     return false;
                 }
+                if (!LexiconWriter::PublishGeneration(record.oldGeneration)) {
+                    return false;
+                }
                 std::filesystem::remove(configTmp, ec);
                 std::filesystem::remove(dictTmp, ec);
                 std::filesystem::remove(configBak, ec);
@@ -802,8 +805,17 @@ bool LexiconWriter::CommitTransaction(
             std::string wireErr;
             if (!PublishWireMapping(exclusions, dictRes.entries, wireGen, spellSuggest, &wireErr)) {
                 // SharedState generation was published at step 6; restore old generation on wire failure
-                (void)PublishGeneration(oldGeneration);
-                if (RollbackToBackup(record, configPath, dictPath, configBak, dictBak)) {
+                bool oldGenRestored = false;
+                for (int attempt = 0; attempt < 3; ++attempt) {
+                    if (PublishGeneration(oldGeneration)) {
+                        oldGenRestored = true;
+                        break;
+                    }
+                }
+
+                const bool rollbackOk = RollbackToBackup(record, configPath, dictPath, configBak, dictBak);
+                if (oldGenRestored && rollbackOk) {
+                    // Both generation and files cleanly rolled back
                     std::filesystem::remove(configTmp, ec);
                     std::filesystem::remove(dictTmp, ec);
                     std::filesystem::remove(configBak, ec);
@@ -811,6 +823,8 @@ bool LexiconWriter::CommitTransaction(
                     std::filesystem::remove(journalPath, ec);
                     std::filesystem::remove(journalTmp, ec);
                 }
+                // If oldGenRestored is false (or rollback failed), preserve backups and journal on disk
+                // so the transaction state is not falsely considered clean!
                 return false;
             }
         }

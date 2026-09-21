@@ -20,12 +20,15 @@ namespace NextKey::Wire {
 
 namespace {
 
+static bool sTestSecurityFailure = false;
+
 #if !defined(_WIN32)
 // Thread-safe in-process named shared memory registry for POSIX / Linux CI testing
 struct PosixNamedSharedMemoryRegistry {
     std::mutex mutex;
     std::unordered_map<std::string, std::weak_ptr<std::vector<uint8_t>>> mappings;
     std::unordered_set<std::string> activeWriters;
+    std::unordered_set<std::string> readOnlyLocked;
 
     std::shared_ptr<std::vector<uint8_t>> CreateForWriter(const std::string& name, size_t size) {
         std::lock_guard<std::mutex> lock(mutex);
@@ -42,6 +45,23 @@ struct PosixNamedSharedMemoryRegistry {
         auto block = std::make_shared<std::vector<uint8_t>>(size, 0);
         mappings[name] = block;
         return block;
+    }
+
+    void LockReadOnly(const std::string& name) {
+        std::lock_guard<std::mutex> lock(mutex);
+        readOnlyLocked.insert(name);
+    }
+
+    std::shared_ptr<std::vector<uint8_t>> OpenForWrite(const std::string& name) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (readOnlyLocked.find(name) != readOnlyLocked.end()) {
+            return nullptr; // Access denied by read-only DACL!
+        }
+        auto it = mappings.find(name);
+        if (it != mappings.end()) {
+            return it->second.lock();
+        }
+        return nullptr;
     }
 
     std::shared_ptr<std::vector<uint8_t>> Find(const std::string& name) {
@@ -62,12 +82,14 @@ struct PosixNamedSharedMemoryRegistry {
         std::lock_guard<std::mutex> lock(mutex);
         activeWriters.erase(name);
         mappings.erase(name);
+        readOnlyLocked.erase(name);
     }
 
     void Reset() {
         std::lock_guard<std::mutex> lock(mutex);
         activeWriters.clear();
         mappings.clear();
+        readOnlyLocked.clear();
     }
 };
 
@@ -124,7 +146,7 @@ bool LexiconWireManager::Create() {
         return false;
     }
 
-    SECURITY_ATTRIBUTES sa = MakeAppContainerReadableSecurityAttributes();
+    SECURITY_ATTRIBUTES sa = MakeCreatorWriteSecurityAttributes();
 
     pImpl_->hMapping = CreateFileMappingW(
         INVALID_HANDLE_VALUE,
@@ -144,11 +166,18 @@ bool LexiconWireManager::Create() {
         HANDLE hOwner = OpenFileMappingW(WRITE_DAC | READ_CONTROL, FALSE, LEXICON_WIRE_MAPPING_NAME);
         if (hOwner) {
             SECURITY_ATTRIBUTES saWrite = MakeCreatorWriteSecurityAttributes();
+            BOOL setOk = FALSE;
             if (saWrite.lpSecurityDescriptor) {
-                SetKernelObjectSecurity(hOwner, DACL_SECURITY_INFORMATION, saWrite.lpSecurityDescriptor);
+                setOk = SetKernelObjectSecurity(hOwner, DACL_SECURITY_INFORMATION, saWrite.lpSecurityDescriptor);
                 LocalFree(saWrite.lpSecurityDescriptor);
             }
             CloseHandle(hOwner);
+
+            if (!setOk) {
+                CloseHandle(pImpl_->hWriterMutex);
+                pImpl_->hWriterMutex = nullptr;
+                return false;
+            }
 
             pImpl_->hMapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, LEXICON_WIRE_MAPPING_NAME);
         }
@@ -172,21 +201,46 @@ bool LexiconWireManager::Create() {
         return false;
     }
 
-    // Lock down DACL to read-only for interactive users and AppContainers
+    // Lock down DACL to read-only for interactive users, current user SID, and AppContainers
     SECURITY_ATTRIBUTES saLock = MakeAppContainerReadableSecurityAttributes();
-    if (saLock.lpSecurityDescriptor) {
-        SetKernelObjectSecurity(pImpl_->hMapping, DACL_SECURITY_INFORMATION, saLock.lpSecurityDescriptor);
-        LocalFree(saLock.lpSecurityDescriptor);
+    if (!saLock.lpSecurityDescriptor) {
+        UnmapViewOfFile(pView);
+        CloseHandle(pImpl_->hMapping);
+        pImpl_->hMapping = nullptr;
+        CloseHandle(pImpl_->hWriterMutex);
+        pImpl_->hWriterMutex = nullptr;
+        return false;
+    }
+
+    BOOL lockOk = FALSE;
+    if (sTestSecurityFailure) {
+        lockOk = FALSE; // Simulated SetKernelObjectSecurity failure
+    } else {
+        lockOk = SetKernelObjectSecurity(pImpl_->hMapping, DACL_SECURITY_INFORMATION, saLock.lpSecurityDescriptor);
+    }
+    LocalFree(saLock.lpSecurityDescriptor);
+
+    if (!lockOk) {
+        UnmapViewOfFile(pView);
+        CloseHandle(pImpl_->hMapping);
+        pImpl_->hMapping = nullptr;
+        CloseHandle(pImpl_->hWriterMutex);
+        pImpl_->hWriterMutex = nullptr;
+        return false;
     }
 
     pImpl_->pMapping = static_cast<volatile LexiconWireHeader*>(pView);
     pImpl_->isWritable = true;
     return true;
 #else
+    if (sTestSecurityFailure) {
+        return false;
+    }
     pImpl_->posixBlock = GetPosixRegistry().CreateForWriter(LEXICON_WIRE_MAPPING_NAME, WIRE_TOTAL_SIZE);
     if (!pImpl_->posixBlock) {
         return false;
     }
+    GetPosixRegistry().LockReadOnly(LEXICON_WIRE_MAPPING_NAME);
     pImpl_->pMapping = reinterpret_cast<volatile LexiconWireHeader*>(pImpl_->posixBlock->data());
     pImpl_->isWritable = true;
     return true;
@@ -335,6 +389,10 @@ void LexiconWireManager::SetMockStorage(uint8_t* storage, size_t size) noexcept 
         pImpl_->pMapping = reinterpret_cast<volatile LexiconWireHeader*>(storage);
         pImpl_->isWritable = true;
     }
+}
+
+void LexiconWireManager::SetTestSecurityFailure(bool fail) noexcept {
+    sTestSecurityFailure = fail;
 }
 
 // ─── LexiconWireReader::Impl ────────────────────────────────────────────────
