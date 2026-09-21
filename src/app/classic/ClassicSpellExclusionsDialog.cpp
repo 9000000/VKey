@@ -1,25 +1,35 @@
-// VKey Classic — Spell Check Exclusions Dialog Implementation
+// VKey Classic — Lexicon & Spell Check Exclusions Dialog Implementation
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "ClassicSpellExclusionsDialog.h"
 #include "core/config/ConfigManager.h"
+#include "core/config/LexiconTransaction.h"
+#include "core/config/LexiconValidation.h"
+#include "core/config/SpellExclusionCanonicalizer.h"
 #include "core/CrashLog.h"
 #include "app/helpers/AppHelpers.h"
 
 #include <windowsx.h>
 #include <algorithm>
 #include <exception>
+#include <fstream>
 
 namespace NextKey::Classic {
 
 // Control IDs
 enum {
-    IDC_SPELL_LIST = 3101,
-    IDC_SPELL_EDIT,
-    IDC_SPELL_BTN_ADD,
-    IDC_SPELL_BTN_DELETE,
-    IDC_SPELL_BTN_IMPORT,
-    IDC_SPELL_BTN_EXPORT,
+    IDC_SPELL_CHK_SUGGEST = 3100,
+    IDC_SPELL_TAB = 3101,
+    IDC_SPELL_LIST = 3102,
+    IDC_SPELL_EDIT = 3103,
+    IDC_SPELL_BTN_ADD = 3104,
+    IDC_SPELL_BTN_EDIT = 3105,
+    IDC_SPELL_BTN_DELETE = 3106,
+    IDC_SPELL_BTN_IMPORT = 3107,
+    IDC_SPELL_BTN_EXPORT = 3108,
+    IDC_SPELL_BTN_RELOAD = 3109,
+    IDC_SPELL_BTN_SAVE = 3110,
+    IDC_SPELL_BTN_CLOSE = 3111,
 };
 
 // ════════════════════════════════════════════════════════════
@@ -62,8 +72,8 @@ bool ClassicSpellExclusionsDialog::Init(HINSTANCE hInstance, HWND parent, bool f
 
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     hwnd_ = CreateWindowExW(WS_EX_TOPMOST, kClassName,
-        L"Loại trừ kiểm tra chính tả",
-        style, CW_USEDEFAULT, CW_USEDEFAULT, 300, 250,
+        L"VKey - Từ điển & Loại trừ chính tả",
+        style, CW_USEDEFAULT, CW_USEDEFAULT, 350, 300,
         parent, nullptr, hInstance, this);
     if (!hwnd_) return false;
 
@@ -83,6 +93,7 @@ bool ClassicSpellExclusionsDialog::Init(HINSTANCE hInstance, HWND parent, bool f
     LoadData();
     CreateControls();
     PopulateList();
+    UpdateDimmedState();
 
     // Apply theme + font
     EnumChildWindows(hwnd_, [](HWND h, LPARAM lp) -> BOOL {
@@ -107,8 +118,32 @@ void ClassicSpellExclusionsDialog::CreateControls() {
     int btnH = Dpi(kBtnHeight);
     int gap = Dpi(kBtnGap);
 
-    // ListView
-    int listH = Dpi(180);
+    // 1. Checkbox: Kiểm tra chính tả nâng cao
+    int chkH = Dpi(22);
+    chkSuggest_ = CreateWindowExW(0, L"BUTTON",
+        L"Kiểm tra chính tả nâng cao (chống sửa sai từ hoàn chỉnh)",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+        x, y, cw, chkH, hwnd_, reinterpret_cast<HMENU>(IDC_SPELL_CHK_SUGGEST), hInstance_, nullptr);
+    SendMessageW(chkSuggest_, BM_SETCHECK, spellSuggestEnabled_ ? BST_CHECKED : BST_UNCHECKED, 0);
+    y += chkH + gap;
+
+    // 2. Tab Control
+    int tabH = Dpi(28);
+    tabControl_ = CreateWindowExW(0, WC_TABCONTROLW, L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        x, y, cw, tabH, hwnd_, reinterpret_cast<HMENU>(IDC_SPELL_TAB), hInstance_, nullptr);
+
+    TCITEMW tie{};
+    tie.mask = TCIF_TEXT;
+    tie.pszText = const_cast<wchar_t*>(L"Từ điển cá nhân");
+    TabCtrl_InsertItem(tabControl_, 0, &tie);
+    tie.pszText = const_cast<wchar_t*>(L"Ngoại lệ viết tắt");
+    TabCtrl_InsertItem(tabControl_, 1, &tie);
+    TabCtrl_SetCurSel(tabControl_, activeTab_);
+    y += tabH + gap;
+
+    // 3. ListView
+    int listH = Dpi(200);
     listView_ = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
         WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
         x, y, cw, listH, hwnd_, reinterpret_cast<HMENU>(IDC_SPELL_LIST), hInstance_, nullptr);
@@ -116,52 +151,121 @@ void ClassicSpellExclusionsDialog::CreateControls() {
 
     LVCOLUMNW col{};
     col.mask = LVCF_TEXT | LVCF_WIDTH;
-    col.pszText = const_cast<wchar_t*>(L"Viết tắt (tối thiểu 2 ký tự)");
+    col.pszText = const_cast<wchar_t*>(L"Từ khóa");
     col.cx = cw - Dpi(24);
     ListView_InsertColumn(listView_, 0, &col);
     y += listH + gap;
 
-    // Row: edit + add button
+    // 4. Row: Edit + Thêm + Sửa
     int editH = theme_.ModernHeight();
-    int editW = cw - Dpi(60) - gap;
+    int btnW = Dpi(55);
+    int editW = cw - (btnW * 2) - (gap * 2);
+
     editEntry_ = CreateWindowExW(0, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
         x, y, editW, editH, hwnd_, reinterpret_cast<HMENU>(IDC_SPELL_EDIT), hInstance_, nullptr);
-    SendMessageW(editEntry_, EM_SETCUEBANNER, FALSE, reinterpret_cast<LPARAM>(L"hđ"));
+    SendMessageW(editEntry_, EM_SETCUEBANNER, FALSE, reinterpret_cast<LPARAM>(L"Nhập từ..."));
     theme_.ApplyModernEntryStyle(editEntry_);
 
     btnAdd_ = CreateWindowExW(0, L"BUTTON", L"Thêm",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        x + editW + gap, y, Dpi(60), editH,
+        x + editW + gap, y, btnW, editH,
         hwnd_, reinterpret_cast<HMENU>(IDC_SPELL_BTN_ADD), hInstance_, nullptr);
-    y += editH + gap * 2;
 
-    // Delete button
+    btnEdit_ = CreateWindowExW(0, L"BUTTON", L"Sửa",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        x + editW + gap + btnW + gap, y, btnW, editH,
+        hwnd_, reinterpret_cast<HMENU>(IDC_SPELL_BTN_EDIT), hInstance_, nullptr);
+    y += editH + gap;
+
+    // 5. Row: Xóa, Nhập, Xuất
+    int subBtnW = Dpi(75);
     btnDelete_ = CreateWindowExW(0, L"BUTTON", L"Xoá",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        x, y, Dpi(80), btnH,
+        x, y, subBtnW, btnH,
         hwnd_, reinterpret_cast<HMENU>(IDC_SPELL_BTN_DELETE), hInstance_, nullptr);
 
-    int btnW2 = Dpi(75);
-    btnImport_ = CreateWindowExW(0, L"BUTTON", L"Nhập",
+    btnImport_ = CreateWindowExW(0, L"BUTTON", L"Nhập...",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        x + cw - btnW2 * 2 - gap, y, btnW2, btnH,
+        x + cw - subBtnW * 2 - gap, y, subBtnW, btnH,
         hwnd_, reinterpret_cast<HMENU>(IDC_SPELL_BTN_IMPORT), hInstance_, nullptr);
 
-    btnExport_ = CreateWindowExW(0, L"BUTTON", L"Xuất",
+    btnExport_ = CreateWindowExW(0, L"BUTTON", L"Xuất...",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        x + cw - btnW2, y, btnW2, btnH,
+        x + cw - subBtnW, y, subBtnW, btnH,
         hwnd_, reinterpret_cast<HMENU>(IDC_SPELL_BTN_EXPORT), hInstance_, nullptr);
+    y += btnH + gap * 2;
+
+    // 6. Footer: Nạp lại (trái), Lưu & Áp dụng, Đóng (phải)
+    int reloadW = Dpi(80);
+    btnReload_ = CreateWindowExW(0, L"BUTTON", L"Nạp lại",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        x, y, reloadW, btnH,
+        hwnd_, reinterpret_cast<HMENU>(IDC_SPELL_BTN_RELOAD), hInstance_, nullptr);
+
+    int saveW = Dpi(115);
+    int closeW = Dpi(70);
+    btnSave_ = CreateWindowExW(0, L"BUTTON", L"Lưu & Áp dụng",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+        x + cw - saveW - closeW - gap, y, saveW, btnH,
+        hwnd_, reinterpret_cast<HMENU>(IDC_SPELL_BTN_SAVE), hInstance_, nullptr);
+
+    btnClose_ = CreateWindowExW(0, L"BUTTON", L"Đóng",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        x + cw - closeW, y, closeW, btnH,
+        hwnd_, reinterpret_cast<HMENU>(IDCANCEL), hInstance_, nullptr);
+}
+
+void ClassicSpellExclusionsDialog::SwitchTab(int tabIndex) {
+    activeTab_ = tabIndex;
+    SetWindowTextW(editEntry_, L"");
+    UpdateDimmedState();
+    PopulateList();
+}
+
+void ClassicSpellExclusionsDialog::UpdateDimmedState() {
+    bool enableList = (activeTab_ != 0 || spellSuggestEnabled_);
+    EnableWindow(listView_, enableList);
+    EnableWindow(editEntry_, enableList);
+    EnableWindow(btnAdd_, enableList);
+    EnableWindow(btnEdit_, enableList);
+    EnableWindow(btnDelete_, enableList);
+    EnableWindow(btnImport_, enableList);
+    EnableWindow(btnExport_, enableList);
 }
 
 void ClassicSpellExclusionsDialog::PopulateList() {
     ListView_DeleteAllItems(listView_);
-    for (size_t i = 0; i < entries_.size(); ++i) {
-        LVITEMW item{};
-        item.mask = LVIF_TEXT;
-        item.iItem = static_cast<int>(i);
-        item.pszText = const_cast<wchar_t*>(entries_[i].c_str());
-        ListView_InsertItem(listView_, &item);
+
+    int cw = Dpi(kWidth - kPadding * 2);
+    LVCOLUMNW col{};
+    col.mask = LVCF_TEXT | LVCF_WIDTH;
+    col.cx = cw - Dpi(24);
+
+    if (activeTab_ == 0) {
+        std::wstring title = L"Từ cá nhân (" + std::to_wstring(userDictWords_.size()) + L"/1024)";
+        col.pszText = const_cast<wchar_t*>(title.c_str());
+        ListView_SetColumn(listView_, 0, &col);
+
+        for (size_t i = 0; i < userDictWords_.size(); ++i) {
+            LVITEMW item{};
+            item.mask = LVIF_TEXT;
+            item.iItem = static_cast<int>(i);
+            item.pszText = const_cast<wchar_t*>(userDictWords_[i].c_str());
+            ListView_InsertItem(listView_, &item);
+        }
+    } else {
+        std::wstring title = L"Ngoại lệ viết tắt (" + std::to_wstring(spellExclusions_.size()) + L"/8)";
+        col.pszText = const_cast<wchar_t*>(title.c_str());
+        ListView_SetColumn(listView_, 0, &col);
+
+        for (size_t i = 0; i < spellExclusions_.size(); ++i) {
+            LVITEMW item{};
+            item.mask = LVIF_TEXT;
+            item.iItem = static_cast<int>(i);
+            item.pszText = const_cast<wchar_t*>(spellExclusions_[i].c_str());
+            ListView_InsertItem(listView_, &item);
+        }
     }
 }
 
@@ -170,115 +274,238 @@ void ClassicSpellExclusionsDialog::PopulateList() {
 // ════════════════════════════════════════════════════════════
 
 void ClassicSpellExclusionsDialog::AddEntry(const std::wstring& text) {
-    // Trim whitespace
-    size_t s = 0, e = text.size();
-    while (s < e && text[s] == L' ') ++s;
-    while (e > s && text[e - 1] == L' ') --e;
-    if (e - s < 2) {
-        MessageBoxW(hwnd_, L"Viết tắt phải có ít nhất 2 ký tự.",
-            L"Lỗi", MB_ICONWARNING);
-        return;
+    if (activeTab_ == 0) {
+        std::wstring normalized;
+        auto valRes = LexiconValidator::ValidateUserDictWord(text, userDictWords_.size() + 1, &normalized);
+        if (!valRes.Succeeded()) {
+            MessageBoxW(hwnd_, valRes.errorMessage.c_str(), L"Lỗi", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        if (userDictWords_.size() >= kMaxUserDictEntries) {
+            MessageBoxW(hwnd_, L"Từ điển cá nhân đã đạt giới hạn 1.024 từ.", L"Giới hạn", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        if (std::find(userDictWords_.begin(), userDictWords_.end(), normalized) != userDictWords_.end()) {
+            MessageBoxW(hwnd_, L"Từ này đã có trong từ điển cá nhân.", L"Trùng lặp", MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+        userDictWords_.push_back(normalized);
+        std::sort(userDictWords_.begin(), userDictWords_.end());
+        modified_ = true;
+        PopulateList();
+    } else {
+        std::wstring normalized;
+        auto valRes = LexiconValidator::ValidateSpellExclusionWord(text, spellExclusions_.size() + 1, &normalized);
+        if (!valRes.Succeeded()) {
+            MessageBoxW(hwnd_, valRes.errorMessage.c_str(), L"Lỗi", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        if (spellExclusions_.size() >= 8) {
+            MessageBoxW(hwnd_, L"Ngoại lệ đã đạt giới hạn tối đa 8 từ.", L"Giới hạn", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        if (std::find(spellExclusions_.begin(), spellExclusions_.end(), normalized) != spellExclusions_.end()) {
+            MessageBoxW(hwnd_, L"Từ viết tắt này đã có trong danh sách ngoại lệ.", L"Trùng lặp", MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+        spellExclusions_.push_back(normalized);
+        auto canon = SpellExclusionCanonicalizer::Canonicalize(spellExclusions_);
+        if (canon.Succeeded()) {
+            spellExclusions_ = std::move(canon.entries);
+        }
+        modified_ = true;
+        PopulateList();
     }
-
-    std::wstring entry = text.substr(s, e - s);
-    for (auto& ch : entry) ch = towlower(ch);  // Store pre-lowercased
-
-    // Dedup
-    for (auto& existing : entries_) {
-        if (existing == entry) return;
-    }
-
-    entries_.push_back(entry);
-    std::sort(entries_.begin(), entries_.end());
-    PopulateList();
-    SaveData();
 }
+
+void ClassicSpellExclusionsDialog::EditSelected(const std::wstring& text) {
+    int sel = ListView_GetNextItem(listView_, -1, LVNI_SELECTED);
+    if (sel < 0) return;
+
+    if (activeTab_ == 0) {
+        if (sel >= static_cast<int>(userDictWords_.size())) return;
+        std::wstring normalized;
+        auto valRes = LexiconValidator::ValidateUserDictWord(text, sel + 1, &normalized);
+        if (!valRes.Succeeded()) {
+            MessageBoxW(hwnd_, valRes.errorMessage.c_str(), L"Lỗi", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        userDictWords_[sel] = normalized;
+        std::sort(userDictWords_.begin(), userDictWords_.end());
+        userDictWords_.erase(std::unique(userDictWords_.begin(), userDictWords_.end()), userDictWords_.end());
+        modified_ = true;
+        PopulateList();
+    } else {
+        if (sel >= static_cast<int>(spellExclusions_.size())) return;
+        std::wstring normalized;
+        auto valRes = LexiconValidator::ValidateSpellExclusionWord(text, sel + 1, &normalized);
+        if (!valRes.Succeeded()) {
+            MessageBoxW(hwnd_, valRes.errorMessage.c_str(), L"Lỗi", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        spellExclusions_[sel] = normalized;
+        auto canon = SpellExclusionCanonicalizer::Canonicalize(spellExclusions_);
+        if (canon.Succeeded()) {
+            spellExclusions_ = std::move(canon.entries);
+        }
+        modified_ = true;
+        PopulateList();
+    }
+}
+
 
 void ClassicSpellExclusionsDialog::DeleteSelected() {
     int sel = ListView_GetNextItem(listView_, -1, LVNI_SELECTED);
-    if (sel < 0 || sel >= static_cast<int>(entries_.size())) return;
+    if (sel < 0) return;
 
-    entries_.erase(entries_.begin() + sel);
-    PopulateList();
-    SaveData();
+    if (activeTab_ == 0) {
+        if (sel < static_cast<int>(userDictWords_.size())) {
+            userDictWords_.erase(userDictWords_.begin() + sel);
+            modified_ = true;
+            PopulateList();
+            SetWindowTextW(editEntry_, L"");
+        }
+    } else {
+        if (sel < static_cast<int>(spellExclusions_.size())) {
+            spellExclusions_.erase(spellExclusions_.begin() + sel);
+            modified_ = true;
+            PopulateList();
+            SetWindowTextW(editEntry_, L"");
+        }
+    }
 }
 
 void ClassicSpellExclusionsDialog::ImportFromFile() {
-    std::wstring path = OpenFileDialog(hwnd_, L"Text Files (*.txt)\0*.txt\0All Files\0*.*\0", L"Nhập danh sách loại trừ");
-    if (path.empty()) return;
+    wchar_t filename[MAX_PATH] = {};
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwnd_;
+    ofn.lpstrFilter = L"Text files (*.txt)\0*.txt\0All files (*.*)\0*.*\0";
+    ofn.lpstrFile = filename;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
 
-    // Ask replace or append
-    int choice = MessageBoxW(hwnd_,
-        L"Thay thế danh sách hiện tại hay thêm vào?",
-        L"Nhập file",
-        MB_YESNOCANCEL | MB_ICONQUESTION);
-    if (choice == IDCANCEL) return;
+    if (!GetOpenFileNameW(&ofn)) return;
 
-    std::ifstream file(path);
+    std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
-        MessageBoxW(hwnd_, L"Không thể mở file.", L"Lỗi", MB_ICONERROR);
+        MessageBoxW(hwnd_, L"Không thể mở file được chọn.", L"Lỗi", MB_OK | MB_ICONERROR);
         return;
     }
+    std::string content((std::istreambuf_iterator<char>(file)),
+                         std::istreambuf_iterator<char>());
+    file.close();
 
-    if (choice == IDYES) entries_.clear();  // Replace
+    int choice = MessageBoxW(
+        hwnd_,
+        L"Bạn có muốn thêm tiếp vào danh sách hiện tại (Chọn YES) hay thay thế toàn bộ (Chọn NO)?",
+        L"Chế độ nhập dữ liệu",
+        MB_YESNOCANCEL | MB_ICONQUESTION
+    );
+    if (choice == IDCANCEL) return;
+    bool append = (choice == IDYES);
 
-    int added = 0;
-    ParseConfigLines(file, [&](const std::string& line) {
-        std::wstring wline = Utf8ToWide(line);
-
-        // Trim + min-length validate (entries < 2 chars are noise).
-        size_t s = 0, e = wline.size();
-        while (s < e && wline[s] == L' ') ++s;
-        while (e > s && wline[e - 1] == L' ') --e;
-        if (e - s < 2) return;
-
-        std::wstring entry = wline.substr(s, e - s);
-        for (auto& ch : entry) ch = towlower(ch);
-
-        bool exists = false;
-        for (const auto& existing : entries_) {
-            if (existing == entry) { exists = true; break; }
+    if (activeTab_ == 0) {
+        auto res = LexiconValidator::ParseAndValidateUserDictText(content, append ? &userDictWords_ : nullptr, append);
+        if (!res.validation.Succeeded()) {
+            MessageBoxW(hwnd_, res.validation.errorMessage.c_str(), L"Lỗi dữ liệu", MB_OK | MB_ICONERROR);
+            return;
         }
-        if (!exists) {
-            entries_.push_back(entry);
-            added++;
+        userDictWords_ = std::move(res.entries);
+        modified_ = true;
+        PopulateList();
+        MessageBoxW(hwnd_, L"Nhập từ điển thành công!", L"Thành công", MB_OK | MB_ICONINFORMATION);
+    } else {
+        auto res = LexiconValidator::ParseAndValidateSpellExclusionsText(content, append ? &spellExclusions_ : nullptr, append);
+        if (!res.validation.Succeeded()) {
+            MessageBoxW(hwnd_, res.validation.errorMessage.c_str(), L"Lỗi dữ liệu", MB_OK | MB_ICONERROR);
+            return;
         }
-    });
-
-    std::sort(entries_.begin(), entries_.end());
-    PopulateList();
-    if (added > 0 || choice == IDYES) SaveData();
-
-    MessageBoxW(hwnd_,
-        (L"Đã nhập " + std::to_wstring(added) + L" từ mới.").c_str(),
-        L"Kết quả", MB_OK);
+        spellExclusions_ = std::move(res.entries);
+        modified_ = true;
+        PopulateList();
+        MessageBoxW(hwnd_, L"Nhập ngoại lệ thành công!", L"Thành công", MB_OK | MB_ICONINFORMATION);
+    }
 }
 
 void ClassicSpellExclusionsDialog::ExportToFile() {
-    if (entries_.empty()) {
-        MessageBoxW(hwnd_, L"Danh sách trống.", L"Thông báo", MB_ICONINFORMATION);
-        return;
+    std::wstring defaultName = (activeTab_ == 0) ? L"user_dictionary.txt" : L"spell_exclusions.txt";
+    wchar_t filename[MAX_PATH] = {};
+    wcsncpy_s(filename, defaultName.c_str(), _TRUNCATE);
+
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwnd_;
+    ofn.lpstrFilter = L"Text files (*.txt)\0*.txt\0All files (*.*)\0*.*\0";
+    ofn.lpstrFile = filename;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrDefExt = L"txt";
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+
+    if (!GetSaveFileNameW(&ofn)) return;
+
+    std::string content;
+    if (activeTab_ == 0) {
+        content = LexiconValidator::FormatUserDictText(userDictWords_);
+    } else {
+        content = LexiconValidator::FormatSpellExclusionsText(spellExclusions_);
     }
 
-    std::wstring path = SaveFileDialog(hwnd_, L"Text Files (*.txt)\0*.txt\0", L"Xuất danh sách loại trừ", L"txt");
-    if (path.empty()) return;
-
-    std::ofstream file(path, std::ios::binary);
+    std::ofstream file(filename, std::ios::binary);
     if (!file.is_open()) {
-        MessageBoxW(hwnd_, L"Không thể tạo file.", L"Lỗi", MB_ICONERROR);
+        MessageBoxW(hwnd_, L"Không thể tạo file xuất dữ liệu.", L"Lỗi", MB_OK | MB_ICONERROR);
         return;
     }
+    file.write(content.data(), content.size());
+    file.close();
 
-    // Write UTF-8 BOM
-    file.write("\xEF\xBB\xBF", 3);
+    MessageBoxW(hwnd_, L"Đã xuất danh sách thành công.", L"Thành công", MB_OK | MB_ICONINFORMATION);
+}
 
-    for (const auto& entry : entries_) {
-        std::string utf8 = WideToUtf8(entry);
-        file.write(utf8.c_str(), utf8.size());
-        file.write("\r\n", 2);
+void ClassicSpellExclusionsDialog::ReloadData() {
+    if (modified_) {
+        int choice = MessageBoxW(
+            hwnd_,
+            L"Các thay đổi chưa lưu sẽ bị hủy bỏ. Bạn có chắc chắn muốn nạp lại từ đĩa?",
+            L"Nạp lại",
+            MB_YESNO | MB_ICONQUESTION
+        );
+        if (choice != IDYES) return;
+    }
+    LoadData();
+    PopulateList();
+    UpdateDimmedState();
+    SendMessageW(chkSuggest_, BM_SETCHECK, spellSuggestEnabled_ ? BST_CHECKED : BST_UNCHECKED, 0);
+    SetWindowTextW(editEntry_, L"");
+}
+
+bool ClassicSpellExclusionsDialog::SaveAndApply() {
+    auto configPath = ConfigManager::GetConfigPath();
+
+    auto canon = SpellExclusionCanonicalizer::Canonicalize(spellExclusions_);
+    if (!canon.Succeeded()) {
+        std::wstring err = L"Ngoại lệ viết tắt không hợp lệ: " + canon.error.message;
+        MessageBoxW(hwnd_, err.c_str(), L"Lỗi", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    spellExclusions_ = std::move(canon.entries);
+
+    std::string newConfigToml = ConfigManager::FormatConfigTomlForLexicon(
+        configPath, spellSuggestEnabled_, spellExclusions_);
+    std::string newUserDictText = LexiconValidator::FormatUserDictText(userDictWords_);
+
+    bool ok = LexiconWriter::CommitTransaction(configPath, newConfigToml, newUserDictText);
+    if (!ok) {
+        MessageBoxW(hwnd_, L"Lỗi khi thực hiện giao dịch lưu từ điển và cấu hình.", L"Lỗi giao dịch", MB_OK | MB_ICONERROR);
+        return false;
     }
 
-    MessageBoxW(hwnd_, L"Đã xuất danh sách thành công.", L"Thành công", MB_OK);
+    modified_ = false;
+    SignalConfigChange();
+
+    PopulateList();
+    MessageBoxW(hwnd_, L"Đã lưu & áp dụng thành công!", L"Thành công", MB_OK | MB_ICONINFORMATION);
+    return true;
 }
 
 // ════════════════════════════════════════════════════════════
@@ -286,20 +513,14 @@ void ClassicSpellExclusionsDialog::ExportToFile() {
 // ════════════════════════════════════════════════════════════
 
 void ClassicSpellExclusionsDialog::LoadData() {
-    auto config = ConfigManager::LoadOrDefault();
-    entries_ = std::move(config.spellExclusions);
-}
+    auto configPath = ConfigManager::GetConfigPath();
+    auto config = ConfigManager::LoadFromFile(configPath).value_or(TypingConfig{});
+    spellSuggestEnabled_ = config.spellSuggestEnabled;
+    spellExclusions_ = std::move(config.spellExclusions);
 
-void ClassicSpellExclusionsDialog::SaveData() {
-    modified_ = true;
-
-    // Load full config, update just spellExclusions, save back
-    auto path = ConfigManager::GetConfigPath();
-    auto config = ConfigManager::LoadFromFile(path).value_or(TypingConfig{});
-    config.spellExclusions = entries_;
-    (void)ConfigManager::SaveToFile(path, config);
-
-    SignalConfigChange();
+    userDictWords_.clear();
+    (void)LexiconReader::LoadUserDictionaryWordsLocked(configPath, userDictWords_);
+    modified_ = false;
 }
 
 // ════════════════════════════════════════════════════════════
@@ -333,11 +554,24 @@ LRESULT CALLBACK ClassicSpellExclusionsDialog::WndProc(HWND hwnd, UINT msg, WPAR
             UINT id = LOWORD(wParam);
 
             switch (id) {
+                case IDC_SPELL_CHK_SUGGEST: {
+                    self->spellSuggestEnabled_ = (SendMessageW(self->chkSuggest_, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    self->modified_ = true;
+                    self->UpdateDimmedState();
+                    return 0;
+                }
                 case IDC_SPELL_BTN_ADD: {
                     wchar_t buf[256] = {};
                     GetWindowTextW(self->editEntry_, buf, 256);
                     self->AddEntry(buf);
                     SetWindowTextW(self->editEntry_, L"");
+                    SetFocus(self->editEntry_);
+                    return 0;
+                }
+                case IDC_SPELL_BTN_EDIT: {
+                    wchar_t buf[256] = {};
+                    GetWindowTextW(self->editEntry_, buf, 256);
+                    self->EditSelected(buf);
                     SetFocus(self->editEntry_);
                     return 0;
                 }
@@ -350,6 +584,34 @@ LRESULT CALLBACK ClassicSpellExclusionsDialog::WndProc(HWND hwnd, UINT msg, WPAR
                 case IDC_SPELL_BTN_EXPORT:
                     self->ExportToFile();
                     return 0;
+                case IDC_SPELL_BTN_RELOAD:
+                    self->ReloadData();
+                    return 0;
+                case IDC_SPELL_BTN_SAVE:
+                    (void)self->SaveAndApply();
+                    return 0;
+                case IDCANCEL:
+                    // ESC key or Cancel button - immediate dismiss without saving
+                    DestroyWindow(hwnd);
+                    return 0;
+            }
+            break;
+        }
+
+        case WM_NOTIFY: {
+            auto* hdr = reinterpret_cast<NMHDR*>(lParam);
+            if (hdr->idFrom == IDC_SPELL_TAB && hdr->code == TCN_SELCHANGE) {
+                self->SwitchTab(TabCtrl_GetCurSel(self->tabControl_));
+                return 0;
+            }
+            if (hdr->idFrom == IDC_SPELL_LIST && (hdr->code == NM_CLICK || hdr->code == LVN_ITEMCHANGED)) {
+                int sel = ListView_GetNextItem(self->listView_, -1, LVNI_SELECTED);
+                if (sel >= 0) {
+                    wchar_t buf[256] = {};
+                    ListView_GetItemText(self->listView_, sel, 0, buf, 256);
+                    SetWindowTextW(self->editEntry_, buf);
+                }
+                return 0;
             }
             break;
         }

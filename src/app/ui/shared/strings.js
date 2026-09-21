@@ -56,8 +56,8 @@ var STRINGS = {
         "s.allow_english_bypass_tooltip": "Allow applying Vietnamese tone marks on English words or exceptions",
         "s.suggest_keep_chars": "BS keeps chars on suggest",
         "s.suggest_keep_chars_tooltip": "When dismissing a browser suggestion via Backspace, preserve typed chars. Warning: tone placement may be wrong if you keep typing right after BS.",
-        "s.spell_exclusions": "Spell exclusions",
-        "s.spell_exclusions_tooltip": "Abbreviation prefixes that bypass spell check (e.g. h\u0111, \u0111p). Prefix match, min 2 chars.",
+        "s.spell_exclusions": "Lexicon & Exclusions",
+        "s.spell_exclusions_tooltip": "Manage personal dictionary (protect words) and abbreviation exclusions (bypass spell check).",
         "s.app_encoding": "Per-app / Clipboard",
         "s.config": "Configure",
 
@@ -148,10 +148,17 @@ var STRINGS = {
         "m.trigger_keys": "Trigger keys:",
         "m.trigger_arrows": "Arrows",
 
-        // ── Spell Exclusions dialog ──
+        // ── Spell Exclusions & Lexicon dialog ──
         "se.info": "Abbreviation prefixes that bypass spell check. Prefix match, min 2 chars. E.g.: h\u0111 covers h\u0111, h\u0111t, h\u0111qt...",
         "se.exclusion_list": "Exclusion list",
         "se.word": "Word",
+        "lex.title": "Lexicon & Spell Exclusions",
+        "lex.advanced_correction": "Advanced spell correction (protect words)",
+        "lex.advanced_hint": "Prevents personal words from being mangled upon word completion.",
+        "lex.tab_user_dict": "User Dictionary",
+        "lex.tab_spell_excl": "Spell Exclusions",
+        "lex.save_apply": "Save & Apply",
+        "lex.reload": "Reload",
 
         // ── Excluded Apps dialog ──
         "ea.app_ph": "e.g.: notepad.exe",

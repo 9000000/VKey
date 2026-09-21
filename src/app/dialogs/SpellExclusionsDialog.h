@@ -1,4 +1,4 @@
-// VKey - Spell Check Exclusions Dialog Header
+// VKey - Lexicon & Spell Check Exclusions Dialog Header
 // SPDX-License-Identifier: GPL-3.0-only
 
 #pragma once
@@ -9,22 +9,35 @@
 
 namespace NextKey {
 
-/// Dialog for managing spell check exclusion prefixes (Sciter subdialog)
+/// Dialog for managing User Dictionary and Spell Check Exclusions (Sciter subdialog).
+/// Implements N7 Lexicon contract with 8 functional groups.
 class SpellExclusionsDialog : public SciterSubDialog {
 public:
-    SpellExclusionsDialog(HWND parent);
+    explicit SpellExclusionsDialog(HWND parent);
 
     bool handle_event(HELEMENT he, BEHAVIOR_EVENT_PARAMS& params) override;
 
-private:
-    void populateList();
-    void addEntry(const std::wstring& text);
-    void removeEntry(const std::wstring& text);
-    void importExclusions();
-    void exportExclusions();
-    void persistAndSignal();
+protected:
+    LRESULT onCustomMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) override;
 
-    std::vector<std::wstring> entries_;
+private:
+    void loadData();
+    void populateUI();
+    void populateList(int listIndex);
+
+    void addEntry(int targetList, const std::wstring& text);
+    void editEntry(int targetList, int index, const std::wstring& text);
+    void deleteEntry(int targetList, int index);
+    void importEntries(int targetList);
+    void exportEntries(int targetList);
+    void reloadData();
+    bool saveAndApply();
+
+    bool spellSuggestEnabled_ = true;
+    std::vector<std::wstring> userDictWords_;
+    std::vector<std::wstring> spellExclusions_;
+    bool modified_ = false;
 };
 
 }  // namespace NextKey
+

@@ -89,12 +89,11 @@ public:
     /// Decodes a UTF-8 string to UTF-32 scalar values, validating bytes and ranges.
     [[nodiscard]] static bool Utf8ToUtf32(std::string_view input, std::u32string& output);
 
-private:
     /// Normalizes UTF-16 string to NFC form.
-    static bool NormalizeNfcUtf16(const std::vector<uint16_t>& input, std::vector<uint16_t>& output);
+    [[nodiscard]] static bool NormalizeNfcUtf16(const std::vector<uint16_t>& input, std::vector<uint16_t>& output);
 
     /// Converts UTF-16 string to lowercase (invariant locale).
-    static bool ToLowercaseUtf16(const std::vector<uint16_t>& input, std::vector<uint16_t>& output);
+    [[nodiscard]] static bool ToLowercaseUtf16(const std::vector<uint16_t>& input, std::vector<uint16_t>& output);
 };
 
 } // namespace NextKey

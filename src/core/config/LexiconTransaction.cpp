@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "LexiconTransaction.h"
+#include "LexiconValidation.h"
 #include "core/engine/RustInputEngine.h"
 
 #if defined(_WIN32)
@@ -408,7 +409,35 @@ bool LexiconReader::LoadUserDictionaryLocked(
     return false;
 }
 
+bool LexiconReader::LoadUserDictionaryWordsLocked(
+    const std::wstring& configPathStr,
+    std::vector<std::wstring>& outWords) {
+    LexiconSyncLock lock(kLexiconMutexTimeoutMs);
+    if (!lock.IsLocked()) {
+        return false;
+    }
+
+    const std::filesystem::path configPath(configPathStr);
+    LexiconRecovery::RecoverIfNeeded(configPath);
+
+    const std::filesystem::path dictPath = configPath.parent_path() / "user_dictionary.txt";
+    std::error_code ec;
+    if (!std::filesystem::exists(dictPath, ec)) {
+        outWords.clear();
+        return true;
+    }
+
+    std::string content = ReadFileBytes(dictPath);
+    auto res = LexiconValidator::ParseAndValidateUserDictText(content);
+    if (!res.validation.Succeeded()) {
+        return false;
+    }
+    outWords = std::move(res.entries);
+    return true;
+}
+
 // ─── LexiconWriter Implementation ───────────────────────────────────────────
+
 
 bool LexiconWriter::CommitTransaction(
     const std::wstring& configPathStr,
@@ -516,4 +545,24 @@ bool LexiconWriter::CommitTransaction(
     return true;
 }
 
+bool LexiconWriter::CommitTransaction(
+    const std::wstring& configPath,
+    const std::string& newConfigToml,
+    const std::string& newUserDictText,
+    bool notifySharedState) {
+    uint8_t oldGen = 0;
+#if defined(_WIN32)
+    SharedStateManager sm;
+    if (sm.Open()) {
+        auto* state = sm.GetState();
+        if (state) {
+            oldGen = state->configGeneration;
+        }
+    }
+#endif
+    uint8_t newGen = static_cast<uint8_t>(oldGen + 1);
+    return CommitTransaction(configPath, newConfigToml, newUserDictText, oldGen, newGen, notifySharedState);
+}
+
 } // namespace NextKey
+

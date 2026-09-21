@@ -1431,4 +1431,36 @@ bool ConfigManager::ExportCustomKeyMap(const std::wstring& path, const TypingCon
     return false;
 }
 
+std::string ConfigManager::FormatConfigTomlForLexicon(
+    const std::wstring& configPath,
+    bool spellSuggestEnabled,
+    const std::vector<std::wstring>& spellExclusions) {
+    try {
+        std::string utf8Path = WideToUtf8(configPath);
+        auto tbl = LoadExistingToml(utf8Path);
+
+        toml::array exclArr;
+        for (const auto& excl : spellExclusions) {
+            exclArr.push_back(WideToUtf8(excl));
+        }
+
+        if (auto* features = tbl["features"].as_table()) {
+            features->insert_or_assign("spell_suggest", spellSuggestEnabled);
+            features->insert_or_assign("spell_exclusions", std::move(exclArr));
+        } else {
+            toml::table newFeatures;
+            newFeatures.insert_or_assign("spell_suggest", spellSuggestEnabled);
+            newFeatures.insert_or_assign("spell_exclusions", std::move(exclArr));
+            tbl.insert_or_assign("features", std::move(newFeatures));
+        }
+
+        std::stringstream ss;
+        ss << tbl;
+        return ss.str();
+    } catch (...) {
+        return "";
+    }
+}
+
 }  // namespace NextKey
+

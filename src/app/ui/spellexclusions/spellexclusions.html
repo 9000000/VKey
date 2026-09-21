@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Loại trừ chính tả</title>
+    <title>Bảng từ điển & Loại trừ chính tả</title>
     <link rel="stylesheet" href="../shared/theme.css">
     <link rel="stylesheet" href="../shared/base.css">
     <link rel="stylesheet" href="../shared/subdialog.css">
@@ -20,7 +20,7 @@
     <div class="container" id="main-container">
         <!-- Title Bar -->
         <div class="title-bar">
-            <span class="title-text" data-i18n="s.spell_exclusions">Loại trừ chính tả</span>
+            <span class="title-text" id="dlg-title">Từ điển & Loại trừ chính tả</span>
             <button class="btn-close" id="btn-close" title="Đóng">
                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24"
                     fill="rgba(240,23,23,1)">
@@ -33,45 +33,79 @@
 
         <!-- Main Content Section -->
         <div class="content-section">
-            <!-- Info text -->
-            <div class="info-text" data-i18n="se.info">Viết tắt bỏ qua kiểm tra chính tả. Khớp từ đầu, tối thiểu 2 ký tự. VD: hđ sẽ bỏ qua hđ, hđt, hđqt...</div>
+            <!-- Advanced Correction Toggle Card -->
+            <div class="settings-card advanced-toggle-card">
+                <label class="trigger-checkbox-item">
+                    <input type="checkbox" id="cfg-spell-suggest" checked>
+                    <span class="checkbox-label font-bold" id="lbl-advanced-correction">Kiểm tra chính tả nâng cao</span>
+                </label>
+                <div class="hint-text" id="lbl-advanced-hint">Chống tự động sửa sai từ cá nhân (User Dictionary) khi dứt từ.</div>
+            </div>
 
-            <!-- Input Card -->
-            <div class="settings-card">
+            <!-- Segmented Tabs -->
+            <div class="segmented-tabs">
+                <button type="button" class="tab-btn active" id="tab-user-dict">Từ điển cá nhân</button>
+                <button type="button" class="tab-btn" id="tab-spell-excl">Ngoại lệ viết tắt</button>
+            </div>
+
+            <!-- Description Text -->
+            <div class="info-text" id="tab-info-text">
+                Từ hoàn chỉnh (vd: soà, alo, in4, tên riêng). So khớp chính xác khi dứt từ (tối đa 1.024 từ).
+            </div>
+
+            <!-- Input & Actions Card -->
+            <div class="settings-card input-card" id="editor-card">
                 <div class="setting-row">
-                    <span class="setting-label" data-i18n="se.word">Từ khóa</span>
+                    <span class="setting-label" id="lbl-word">Từ khóa</span>
                     <div class="input-container">
-                        <input type="text" class="setting-input" id="entry-name" placeholder="vd: hđ"
+                        <input type="text" class="setting-input" id="entry-name" placeholder="vd: soà"
                             autocomplete="off">
                     </div>
                 </div>
-                <div class="button-row">
-                    <button class="btn-action btn-primary" id="btn-add" data-i18n="add">+ Thêm</button>
+                <div class="field-error-text" id="input-error-msg" style="display: none;"></div>
+                <div class="button-row editor-btn-row">
+                    <button type="button" class="btn-action btn-primary" id="btn-add">+ Thêm</button>
+                    <button type="button" class="btn-action btn-secondary" id="btn-edit" style="display:none;">✎ Sửa</button>
+                    <button type="button" class="btn-action btn-danger" id="btn-delete" style="display:none;">- Xóa</button>
+                    <button type="button" class="btn-action btn-secondary" id="btn-deselect" style="display:none;">Hủy chọn</button>
                 </div>
             </div>
 
             <!-- List Card -->
-            <div class="settings-card list-card">
+            <div class="settings-card list-card" id="list-card-container">
                 <div class="list-header">
-                    <span class="list-col-name" data-i18n="se.exclusion_list">Danh sách loại trừ</span>
-                    <span class="list-col-action"></span>
+                    <span class="list-col-name" id="list-header-title">Danh sách từ cá nhân</span>
+                    <span class="list-col-counter" id="list-counter">0 từ</span>
                 </div>
                 <div class="app-list" id="entry-list">
-                    <!-- Items inserted by C++ -->
+                    <!-- Items inserted by JavaScript -->
                 </div>
+            </div>
+
+            <!-- Sub-actions (Import/Export) -->
+            <div class="button-row sub-actions-row">
+                <button type="button" class="btn-action btn-secondary" id="btn-import">Nạp từ file...</button>
+                <button type="button" class="btn-action btn-secondary" id="btn-export">Xuất ra file...</button>
             </div>
 
             <!-- Footer Buttons -->
             <div class="button-row footer-row">
-                <button class="btn-action btn-secondary" id="btn-import" data-i18n="ea.import">Nạp từ file...</button>
-                <button class="btn-action btn-secondary" id="btn-export" data-i18n="ea.export">Xuất ra file...</button>
+                <button type="button" class="btn-action btn-secondary" id="btn-reload">Nạp lại</button>
+                <div class="footer-right-buttons">
+                    <button type="button" class="btn-action btn-primary" id="btn-save">Lưu & Áp dụng</button>
+                    <button type="button" class="btn-action btn-secondary" id="btn-cancel">Đóng</button>
+                </div>
             </div>
         </div>
 
-        <!-- Hidden inputs for C++ -->
+        <!-- Hidden inputs for C++ communication -->
         <input type="hidden" id="val-action" value="">
+        <input type="hidden" id="val-target-list" value="0">
+        <input type="hidden" id="val-entry-index" value="-1">
         <input type="hidden" id="val-entry-name" value="">
+        <input type="hidden" id="val-spell-suggest" value="1">
     </div>
 </body>
 
 </html>
+

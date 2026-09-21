@@ -346,6 +346,8 @@ set(NEXTKEY_CORE_SOURCES
     src/core/config/SpellExclusionCanonicalizer.cpp
     src/core/config/LexiconTransaction.h
     src/core/config/LexiconTransaction.cpp
+    src/core/config/LexiconValidation.h
+    src/core/config/LexiconValidation.cpp
 )
 
 # Windows-only sources (require Windows.h)
@@ -873,6 +875,7 @@ set(NEXTKEY_TEST_SOURCES
     tests/TypingConfigRCUTests.cpp
     tests/SpellExclusionCanonicalizerTest.cpp
     tests/LexiconTransactionTest.cpp
+    tests/LexiconValidationTest.cpp
     tests/MainThreadWorkerTests.cpp
     tests/AdaptiveTickTest.cpp
     tests/AdaptiveTickBenchmark.cpp

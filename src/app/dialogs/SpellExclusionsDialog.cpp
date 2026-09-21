@@ -1,9 +1,12 @@
-// VKey - Spell Check Exclusions Dialog Implementation
+// VKey - Lexicon & Spell Check Exclusions Dialog Implementation
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "SpellExclusionsDialog.h"
 #include "helpers/AppHelpers.h"
 #include "core/config/ConfigManager.h"
+#include "core/config/LexiconTransaction.h"
+#include "core/config/LexiconValidation.h"
+#include "core/config/SpellExclusionCanonicalizer.h"
 #include "core/WinStrings.h"
 #include "sciter-x-dom.hpp"
 #include "DialogUtils.h"
@@ -17,20 +20,58 @@ namespace NextKey {
 SpellExclusionsDialog::SpellExclusionsDialog(HWND parent)
     : SciterSubDialog({
         L"this://app/spellexclusions/spellexclusions.html",
-        L"VKey - Spell Exclusions",
-        340, 380, parent, true, 36, 40, true
+        L"VKey - Từ điển & Loại trừ chính tả",
+        420, 580, parent, true, 36, 40, true
     }) {
-    auto config = ConfigManager::LoadOrDefault();
-    entries_ = std::move(config.spellExclusions);
-    populateList();
+    loadData();
+    populateUI();
 }
 
-void SpellExclusionsDialog::persistAndSignal() {
-    auto path = ConfigManager::GetConfigPath();
-    auto config = ConfigManager::LoadFromFile(path).value_or(TypingConfig{});
-    config.spellExclusions = entries_;
-    (void)ConfigManager::SaveToFile(path, config);
-    SignalConfigChange();
+LRESULT SpellExclusionsDialog::onCustomMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_KEYDOWN && wParam == VK_ESCAPE) {
+        PostMessage(hwnd, WM_CLOSE, 0, 0);
+        return 0;
+    }
+    return -1;
+}
+
+void SpellExclusionsDialog::loadData() {
+    auto configPath = ConfigManager::GetConfigPath();
+    auto config = ConfigManager::LoadFromFile(configPath).value_or(TypingConfig{});
+    spellSuggestEnabled_ = config.spellSuggestEnabled;
+    spellExclusions_ = std::move(config.spellExclusions);
+
+    userDictWords_.clear();
+    (void)LexiconReader::LoadUserDictionaryWordsLocked(configPath, userDictWords_);
+    modified_ = false;
+}
+
+void SpellExclusionsDialog::populateUI() {
+    sciter::value userWordsArr = sciter::value::make_array();
+    for (const auto& w : userDictWords_) {
+        userWordsArr.append(sciter::value(w.c_str()));
+    }
+
+    sciter::value exclArr = sciter::value::make_array();
+    for (const auto& e : spellExclusions_) {
+        exclArr.append(sciter::value(e.c_str()));
+    }
+
+    call_function("setInitialData", sciter::value(spellSuggestEnabled_), userWordsArr, exclArr);
+}
+
+void SpellExclusionsDialog::populateList(int listIndex) {
+    sciter::value arr = sciter::value::make_array();
+    if (listIndex == 0) {
+        for (const auto& w : userDictWords_) {
+            arr.append(sciter::value(w.c_str()));
+        }
+    } else {
+        for (const auto& e : spellExclusions_) {
+            arr.append(sciter::value(e.c_str()));
+        }
+    }
+    call_function("renderList", sciter::value(listIndex), arr);
 }
 
 bool SpellExclusionsDialog::handle_event(HELEMENT he, BEHAVIOR_EVENT_PARAMS& params) {
@@ -38,7 +79,7 @@ bool SpellExclusionsDialog::handle_event(HELEMENT he, BEHAVIOR_EVENT_PARAMS& par
         element el(params.heTarget);
         std::wstring id = el.get_attribute("id");
 
-        if (id == L"btn-close") {
+        if (id == L"btn-close" || id == L"btn-cancel") {
             PostMessage(get_hwnd(), WM_CLOSE, 0, 0);
             return true;
         }
@@ -53,6 +94,25 @@ bool SpellExclusionsDialog::handle_event(HELEMENT he, BEHAVIOR_EVENT_PARAMS& par
             std::wstring action = val.is_string() ? val.get<std::wstring>() : L"";
             if (!action.empty()) {
                 element root = get_root();
+
+                element targetEl = root.find_first("#val-target-list");
+                int targetList = 0;
+                if (targetEl.is_valid()) {
+                    sciter::value tv = targetEl.get_value();
+                    if (tv.is_string()) {
+                        targetList = _wtoi(tv.get<std::wstring>().c_str());
+                    }
+                }
+
+                element indexEl = root.find_first("#val-entry-index");
+                int entryIndex = -1;
+                if (indexEl.is_valid()) {
+                    sciter::value iv = indexEl.get_value();
+                    if (iv.is_string()) {
+                        entryIndex = _wtoi(iv.get<std::wstring>().c_str());
+                    }
+                }
+
                 element nameInput = root.find_first("#val-entry-name");
                 std::wstring entryName;
                 if (nameInput.is_valid()) {
@@ -61,17 +121,28 @@ bool SpellExclusionsDialog::handle_event(HELEMENT he, BEHAVIOR_EVENT_PARAMS& par
                 }
 
                 if (action == L"add") {
-                    if (!entryName.empty()) {
-                        addEntry(entryName);
-                    }
+                    addEntry(targetList, entryName);
+                } else if (action == L"edit") {
+                    editEntry(targetList, entryIndex, entryName);
                 } else if (action == L"delete") {
-                    if (!entryName.empty()) {
-                        removeEntry(entryName);
-                    }
+                    deleteEntry(targetList, entryIndex);
                 } else if (action == L"import") {
-                    importExclusions();
+                    importEntries(targetList);
                 } else if (action == L"export") {
-                    exportExclusions();
+                    exportEntries(targetList);
+                } else if (action == L"reload") {
+                    reloadData();
+                } else if (action == L"save") {
+                    (void)saveAndApply();
+                } else if (action == L"toggle_suggest") {
+                    element sugEl = root.find_first("#val-spell-suggest");
+                    if (sugEl.is_valid()) {
+                        sciter::value sv = sugEl.get_value();
+                        if (sv.is_string()) {
+                            spellSuggestEnabled_ = (sv.get<std::wstring>() == L"1");
+                            modified_ = true;
+                        }
+                    }
                 } else if (action == L"close") {
                     PostMessage(get_hwnd(), WM_CLOSE, 0, 0);
                 }
@@ -85,101 +156,224 @@ bool SpellExclusionsDialog::handle_event(HELEMENT he, BEHAVIOR_EVENT_PARAMS& par
     return sciter::window::handle_event(he, params);
 }
 
-void SpellExclusionsDialog::populateList() {
-    call_function("clearList");
-    for (auto& entry : entries_) {
-        call_function("addToList", sciter::value(entry.c_str()));
+void SpellExclusionsDialog::addEntry(int targetList, const std::wstring& text) {
+    if (targetList == 0) {
+        // User Dictionary
+        std::wstring normalized;
+        auto valRes = LexiconValidator::ValidateUserDictWord(text, userDictWords_.size() + 1, &normalized);
+        if (!valRes.Succeeded()) {
+            call_function("showFieldError", sciter::value(valRes.errorMessage.c_str()));
+            return;
+        }
+        if (userDictWords_.size() >= kMaxUserDictEntries) {
+            call_function("showFieldError", sciter::value(L"Từ điển cá nhân đã đạt giới hạn 1.024 từ."));
+            return;
+        }
+        if (std::find(userDictWords_.begin(), userDictWords_.end(), normalized) != userDictWords_.end()) {
+            call_function("showFieldError", sciter::value(L"Từ này đã có trong từ điển cá nhân."));
+            return;
+        }
+        userDictWords_.push_back(normalized);
+        std::sort(userDictWords_.begin(), userDictWords_.end());
+        modified_ = true;
+        populateList(0);
+    } else {
+        // Spell Exclusions
+        std::wstring normalized;
+        auto valRes = LexiconValidator::ValidateSpellExclusionWord(text, spellExclusions_.size() + 1, &normalized);
+        if (!valRes.Succeeded()) {
+            call_function("showFieldError", sciter::value(valRes.errorMessage.c_str()));
+            return;
+        }
+        if (spellExclusions_.size() >= 8) {
+            call_function("showFieldError", sciter::value(L"Danh sách ngoại lệ đã đạt tối đa 8 từ."));
+            return;
+        }
+        if (std::find(spellExclusions_.begin(), spellExclusions_.end(), normalized) != spellExclusions_.end()) {
+            call_function("showFieldError", sciter::value(L"Từ viết tắt này đã có trong danh sách ngoại lệ."));
+            return;
+        }
+        spellExclusions_.push_back(normalized);
+        // Canonicalize to guarantee order and dedup
+        auto canon = SpellExclusionCanonicalizer::Canonicalize(spellExclusions_);
+        if (canon.Succeeded()) {
+            spellExclusions_ = std::move(canon.entries);
+        }
+        modified_ = true;
+        populateList(1);
     }
-    call_function("forceRefresh");
 }
 
-void SpellExclusionsDialog::addEntry(const std::wstring& text) {
-    // Trim
-    size_t start = 0, end = text.size();
-    while (start < end && text[start] == L' ') ++start;
-    while (end > start && text[end - 1] == L' ') --end;
-    if (end - start < 2) return;
-
-    std::wstring entry = text.substr(start, end - start);
-    for (auto& ch : entry) ch = towlower(ch);  // Store pre-lowercased
-
-    // Dedup
-    for (auto& existing : entries_) {
-        if (existing == entry) return;
+void SpellExclusionsDialog::editEntry(int targetList, int index, const std::wstring& text) {
+    if (targetList == 0) {
+        if (index < 0 || index >= static_cast<int>(userDictWords_.size())) return;
+        std::wstring normalized;
+        auto valRes = LexiconValidator::ValidateUserDictWord(text, index + 1, &normalized);
+        if (!valRes.Succeeded()) {
+            call_function("showFieldError", sciter::value(valRes.errorMessage.c_str()));
+            return;
+        }
+        userDictWords_[index] = normalized;
+        std::sort(userDictWords_.begin(), userDictWords_.end());
+        userDictWords_.erase(std::unique(userDictWords_.begin(), userDictWords_.end()), userDictWords_.end());
+        modified_ = true;
+        populateList(0);
+    } else {
+        if (index < 0 || index >= static_cast<int>(spellExclusions_.size())) return;
+        std::wstring normalized;
+        auto valRes = LexiconValidator::ValidateSpellExclusionWord(text, index + 1, &normalized);
+        if (!valRes.Succeeded()) {
+            call_function("showFieldError", sciter::value(valRes.errorMessage.c_str()));
+            return;
+        }
+        spellExclusions_[index] = normalized;
+        auto canon = SpellExclusionCanonicalizer::Canonicalize(spellExclusions_);
+        if (canon.Succeeded()) {
+            spellExclusions_ = std::move(canon.entries);
+        }
+        modified_ = true;
+        populateList(1);
     }
-
-    entries_.push_back(entry);
-    std::sort(entries_.begin(), entries_.end());
-    populateList();
-    persistAndSignal();
 }
 
-void SpellExclusionsDialog::removeEntry(const std::wstring& text) {
-    auto it = std::find(entries_.begin(), entries_.end(), text);
-    if (it != entries_.end()) {
-        entries_.erase(it);
-        call_function("removeFromList", sciter::value(text.c_str()));
-        persistAndSignal();
+void SpellExclusionsDialog::deleteEntry(int targetList, int index) {
+    if (targetList == 0) {
+        if (index >= 0 && index < static_cast<int>(userDictWords_.size())) {
+            userDictWords_.erase(userDictWords_.begin() + index);
+            modified_ = true;
+            populateList(0);
+        }
+    } else {
+        if (index >= 0 && index < static_cast<int>(spellExclusions_.size())) {
+            spellExclusions_.erase(spellExclusions_.begin() + index);
+            modified_ = true;
+            populateList(1);
+        }
     }
 }
 
-void SpellExclusionsDialog::importExclusions() {
+void SpellExclusionsDialog::importEntries(int targetList) {
     std::wstring path = ShowOpenFileDialogW(
         get_hwnd(),
-        L"Text file (*.txt)\0*.txt\0All (*.*)\0*.*\0",
+        L"Text files (*.txt)\0*.txt\0All files (*.*)\0*.*\0",
         L"txt"
     );
     if (path.empty()) return;
 
-    int msgboxID = MessageBoxW(
-        get_hwnd(),
-        L"B\u1EA1n c\u00F3 mu\u1ED1n gi\u1EEF l\u1EA1i danh s\u00E1ch hi\u1EC7n t\u1EA1i kh\u00F4ng?",
-        L"T\u1EEB kh\u00F3a lo\u1EA1i tr\u1EEB",
-        MB_ICONEXCLAMATION | MB_YESNO
-    );
-
-    bool append = (msgboxID == IDYES);
-
-    std::ifstream infile(path);
-    if (!infile.is_open()) return;
-
-    if (!append) {
-        entries_.clear();
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        MessageBoxW(get_hwnd(), L"Không thể mở file được chọn.", L"Lỗi mở file", MB_OK | MB_ICONERROR);
+        return;
     }
 
-    ParseConfigLines(infile, [&](const std::string& line) {
-        std::wstring wName = Utf8ToWide(line);
-        if (wName.empty()) return;
-        for (auto& ch : wName) ch = towlower(ch);
-        if (std::find(entries_.begin(), entries_.end(), wName) == entries_.end()) {
-            entries_.push_back(wName);
-        }
-    });
+    std::string content((std::istreambuf_iterator<char>(file)),
+                         std::istreambuf_iterator<char>());
+    file.close();
 
-    std::sort(entries_.begin(), entries_.end());
-    populateList();
-    persistAndSignal();
+    int choice = MessageBoxW(
+        get_hwnd(),
+        L"Bạn có muốn thêm tiếp vào danh sách hiện tại (Chọn YES) hay thay thế toàn bộ danh sách (Chọn NO)?",
+        L"Chế độ nhập dữ liệu",
+        MB_YESNOCANCEL | MB_ICONQUESTION
+    );
+    if (choice == IDCANCEL) return;
+    bool append = (choice == IDYES);
+
+    if (targetList == 0) {
+        auto res = LexiconValidator::ParseAndValidateUserDictText(content, append ? &userDictWords_ : nullptr, append);
+        if (!res.validation.Succeeded()) {
+            MessageBoxW(get_hwnd(), res.validation.errorMessage.c_str(), L"Lỗi dữ liệu", MB_OK | MB_ICONERROR);
+            return;
+        }
+        userDictWords_ = std::move(res.entries);
+        modified_ = true;
+        populateList(0);
+        call_function("showSuccessToast", sciter::value(L"Nhập từ điển thành công!"));
+    } else {
+        auto res = LexiconValidator::ParseAndValidateSpellExclusionsText(content, append ? &spellExclusions_ : nullptr, append);
+        if (!res.validation.Succeeded()) {
+            MessageBoxW(get_hwnd(), res.validation.errorMessage.c_str(), L"Lỗi dữ liệu", MB_OK | MB_ICONERROR);
+            return;
+        }
+        spellExclusions_ = std::move(res.entries);
+        modified_ = true;
+        populateList(1);
+        call_function("showSuccessToast", sciter::value(L"Nhập ngoại lệ thành công!"));
+    }
 }
 
-void SpellExclusionsDialog::exportExclusions() {
+void SpellExclusionsDialog::exportEntries(int targetList) {
+    std::wstring defaultName = (targetList == 0) ? L"user_dictionary" : L"spell_exclusions";
     std::wstring path = ShowSaveFileDialogW(
         get_hwnd(),
-        L"Text file (*.txt)\0*.txt\0",
+        L"Text files (*.txt)\0*.txt\0All files (*.*)\0*.*\0",
         L"txt",
-        L"VKeySpellExclusions"
+        defaultName.c_str()
     );
     if (path.empty()) return;
 
-    std::ofstream outfile(path);
-    if (!outfile.is_open()) return;
-
-    outfile << ";VKey Spell Exclusions\n";
-
-    std::vector<std::wstring> sorted = entries_;
-    std::sort(sorted.begin(), sorted.end());
-    for (auto& entry : sorted) {
-        outfile << WideToUtf8(entry) << "\n";
+    std::string content;
+    if (targetList == 0) {
+        content = LexiconValidator::FormatUserDictText(userDictWords_);
+    } else {
+        content = LexiconValidator::FormatSpellExclusionsText(spellExclusions_);
     }
+
+    std::ofstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        MessageBoxW(get_hwnd(), L"Không thể tạo file xuất dữ liệu.", L"Lỗi", MB_OK | MB_ICONERROR);
+        return;
+    }
+    file.write(content.data(), content.size());
+    file.close();
+
+    MessageBoxW(get_hwnd(), L"Xuất danh sách thành công.", L"Thành công", MB_OK | MB_ICONINFORMATION);
+}
+
+void SpellExclusionsDialog::reloadData() {
+    if (modified_) {
+        int choice = MessageBoxW(
+            get_hwnd(),
+            L"Các thay đổi chưa lưu sẽ bị hủy bỏ. Bạn có chắc chắn muốn nạp lại từ đĩa?",
+            L"Nạp lại",
+            MB_YESNO | MB_ICONQUESTION
+        );
+        if (choice != IDYES) return;
+    }
+    loadData();
+    populateUI();
+    call_function("showSuccessToast", sciter::value(L"Đã nạp lại dữ liệu từ đĩa."));
+}
+
+bool SpellExclusionsDialog::saveAndApply() {
+    auto configPath = ConfigManager::GetConfigPath();
+
+    auto canon = SpellExclusionCanonicalizer::Canonicalize(spellExclusions_);
+    if (!canon.Succeeded()) {
+        std::wstring err = L"Ngoại lệ viết tắt không hợp lệ: " + canon.error.message;
+        MessageBoxW(get_hwnd(), err.c_str(), L"Lỗi", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    spellExclusions_ = std::move(canon.entries);
+
+    std::string newConfigToml = ConfigManager::FormatConfigTomlForLexicon(
+        configPath, spellSuggestEnabled_, spellExclusions_);
+    std::string newUserDictText = LexiconValidator::FormatUserDictText(userDictWords_);
+
+    bool ok = LexiconWriter::CommitTransaction(configPath, newConfigToml, newUserDictText);
+    if (!ok) {
+        MessageBoxW(get_hwnd(), L"Lỗi khi thực hiện giao dịch lưu từ điển và cấu hình.", L"Lỗi giao dịch", MB_OK | MB_ICONERROR);
+        return false;
+    }
+
+    modified_ = false;
+    SignalConfigChange();
+
+    populateList(0);
+    populateList(1);
+    call_function("showSuccessToast", sciter::value(L"Đã lưu & áp dụng thành công!"));
+    return true;
 }
 
 }  // namespace NextKey
+

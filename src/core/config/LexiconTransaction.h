@@ -93,6 +93,12 @@ public:
     static bool LoadUserDictionaryLocked(
         const std::wstring& configPath,
         std::shared_ptr<const RustUserDictionarySnapshot>& outSnapshot);
+
+    /// Load user_dictionary.txt words under lock into outWords.
+    /// Missing file succeeds with empty list (FR1/N7).
+    static bool LoadUserDictionaryWordsLocked(
+        const std::wstring& configPath,
+        std::vector<std::wstring>& outWords);
 };
 
 /// Durable 4-state transaction writer for paired config.toml and user_dictionary.txt.
@@ -109,6 +115,14 @@ public:
         uint8_t oldGeneration,
         uint8_t newGeneration,
         bool notifySharedState = true);
+
+    /// Convenience overload that automatically discovers oldGeneration and increments it.
+    static bool CommitTransaction(
+        const std::wstring& configPath,
+        const std::string& newConfigToml,
+        const std::string& newUserDictText,
+        bool notifySharedState = true);
 };
 
 } // namespace NextKey
+

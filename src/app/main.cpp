@@ -257,7 +257,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     if (lpCmdLine && wcsstr(lpCmdLine, L"--appoverrides") != nullptr) {
         RunAppOverridesSubprocess();  // [[noreturn]]
     }
-    if (lpCmdLine && wcsstr(lpCmdLine, L"--spellexclusions") != nullptr) {
+    if (lpCmdLine && (wcsstr(lpCmdLine, L"--spellexclusions") != nullptr ||
+                      wcsstr(lpCmdLine, L"--lexicon") != nullptr)) {
         RunSpellExclusionsSubprocess();  // [[noreturn]]
     }
     if (lpCmdLine && wcsstr(lpCmdLine, L"--userdefined") != nullptr) {

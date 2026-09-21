@@ -160,6 +160,12 @@ public:
     /// Export custom keymap to a standalone .keymap (TOML) file
     [[nodiscard]] static bool ExportCustomKeyMap(const std::wstring& path, const TypingConfig& config);
 
+    /// Format a complete TOML configuration string with updated spellSuggest and spellExclusions.
+    [[nodiscard]] static std::string FormatConfigTomlForLexicon(
+        const std::wstring& configPath,
+        bool spellSuggestEnabled,
+        const std::vector<std::wstring>& spellExclusions);
+
     /// `%APPDATA%\VKey` (creates the directory if missing). Falls back to "."
     /// when SHGetFolderPathW fails. Public because runtime callers (HookEngine
     /// perf-histogram log path, logger fallback, etc.) need the same well-known

@@ -224,4 +224,29 @@ TEST_F(LexiconTransactionTest, LockedReaderRecoversUnfinishedTransactionAndLoads
     EXPECT_FALSE(std::filesystem::exists(journalPath));
 }
 
+TEST_F(LexiconTransactionTest, LoadUserDictionaryWordsLocked_MissingFileReturnsEmpty) {
+    std::vector<std::wstring> words;
+    EXPECT_TRUE(LexiconReader::LoadUserDictionaryWordsLocked(configPath_.wstring(), words));
+    EXPECT_TRUE(words.empty());
+}
+
+TEST_F(LexiconTransactionTest, LoadUserDictionaryWordsLocked_ExistingFileReturnsParsedWords) {
+    WriteFile(dictPath_, "; Header comment\nso\u00e0\n\nalo\n");
+    std::vector<std::wstring> words;
+    EXPECT_TRUE(LexiconReader::LoadUserDictionaryWordsLocked(configPath_.wstring(), words));
+    EXPECT_EQ(words.size(), 2u);
+    EXPECT_EQ(words[0], L"alo");
+    EXPECT_EQ(words[1], L"so\u00e0");
+}
+
+TEST_F(LexiconTransactionTest, CommitTransaction_ConvenienceOverload) {
+    const std::string newToml = "[features]\nspell_suggest = true\n";
+    const std::string newDict = "; Dict\nalo\n";
+
+    EXPECT_TRUE(LexiconWriter::CommitTransaction(configPath_.wstring(), newToml, newDict, false));
+    EXPECT_EQ(ReadFile(configPath_), newToml);
+    EXPECT_EQ(ReadFile(dictPath_), newDict);
+}
+
 } // namespace NextKey
+

@@ -696,5 +696,30 @@ TEST_F(ConfigManagerTest, SaveAndLoad_UnicodePath) {
     std::filesystem::remove(std::filesystem::path(unicodePath));
 }
 
+TEST_F(ConfigManagerTest, FormatConfigTomlForLexicon) {
+    WriteTestConfig(R"(
+[input]
+method = "telex"
+
+[features]
+macro_enabled = true
+spell_check = true
+spell_suggest = false
+spell_exclusions = [ "old" ]
+)");
+
+    std::vector<std::wstring> newExclusions = {L"h\u0111", L"\u0111c\u0111t"};
+    std::string formatted = ConfigManager::FormatConfigTomlForLexicon(testConfigPath_, true, newExclusions);
+    EXPECT_FALSE(formatted.empty());
+
+    // Verify spell_suggest was updated to true
+    EXPECT_NE(formatted.find("spell_suggest = true"), std::string::npos);
+    // Verify macro_enabled was preserved
+    EXPECT_NE(formatted.find("macro_enabled = true"), std::string::npos);
+    // Verify exclusions array updated
+    EXPECT_NE(formatted.find("h\xc4\x91"), std::string::npos);
+    EXPECT_NE(formatted.find("\xc4\x91c\xc4\x91t"), std::string::npos);
+}
+
 }  // namespace
 }  // namespace NextKey
