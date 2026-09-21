@@ -594,5 +594,24 @@ TEST(LexiconWireManagerTest, FastPathZeroAllocationAndCacheHits) {
     manager.Close();
 }
 
+TEST(LexiconWireManagerTest, PublishValidationFailurePopulatesErrorString) {
+    LexiconWireManager manager;
+    ASSERT_TRUE(manager.Create());
+
+    std::string err;
+    // 1. Invalid spell exclusion (entry too short < 2 scalars, e.g. single character)
+    EXPECT_FALSE(manager.Publish({ L"a" }, { L"valid" }, 1, true, &err));
+    EXPECT_FALSE(err.empty());
+    EXPECT_NE(err.find("Spell exclusion canonicalization failed"), std::string::npos);
+
+    // 2. Invalid user dictionary word (contains control character or whitespace)
+    err.clear();
+    EXPECT_FALSE(manager.Publish({ L"valid" }, { L"invalid word with spaces" }, 2, true, &err));
+    EXPECT_FALSE(err.empty());
+    EXPECT_NE(err.find("User dictionary validation failed"), std::string::npos);
+
+    manager.Close();
+}
+
 } // namespace
 } // namespace NextKey::Wire

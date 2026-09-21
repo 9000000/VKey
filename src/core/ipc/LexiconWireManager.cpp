@@ -22,6 +22,25 @@ namespace {
 
 static bool sTestSecurityFailure = false;
 
+std::string WideToUtf8Lossless(const std::wstring& wstr) {
+    if (wstr.empty()) {
+        return {};
+    }
+    std::u32string u32;
+    if (SpellExclusionCanonicalizer::Utf16ToUtf32(wstr, u32)) {
+        std::string utf8;
+        if (SpellExclusionCanonicalizer::Utf32ToUtf8(u32, utf8)) {
+            return utf8;
+        }
+    }
+    std::string fallback;
+    fallback.reserve(wstr.size());
+    for (wchar_t wc : wstr) {
+        fallback.push_back(static_cast<char>(wc <= 0x7F ? wc : '?'));
+    }
+    return fallback;
+}
+
 #if !defined(_WIN32)
 // Thread-safe in-process named shared memory registry for POSIX / Linux CI testing
 struct PosixNamedSharedMemoryRegistry {
@@ -317,7 +336,7 @@ bool LexiconWireManager::Publish(
         auto res = SpellExclusionCanonicalizer::Canonicalize(spellExclusions);
         if (!res.Succeeded()) {
             if (outError) {
-                std::string msg(res.error.message.begin(), res.error.message.end());
+                std::string msg = WideToUtf8Lossless(res.error.message);
                 *outError = "Spell exclusion canonicalization failed: " + msg;
             }
             return false;
@@ -332,8 +351,8 @@ bool LexiconWireManager::Publish(
         auto res = LexiconValidator::ValidateUserDictWord(userDictionary[i], i + 1, &norm);
         if (!res.Succeeded()) {
             if (outError) {
-                std::string msg(res.errorLine > 0 ? "entry " + std::to_string(res.errorLine) + ": " : "");
-                msg.append(res.errorMessage.begin(), res.errorMessage.end());
+                std::string msg = res.errorLine > 0 ? "entry " + std::to_string(res.errorLine) + ": " : "";
+                msg += WideToUtf8Lossless(res.errorMessage);
                 *outError = "User dictionary validation failed at " + msg;
             }
             return false;
