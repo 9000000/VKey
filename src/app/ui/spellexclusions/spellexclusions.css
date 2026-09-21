@@ -27,26 +27,26 @@
 }
 
 .segmented-tabs {
-    display: flex;
-    flex-direction: row;
+    flow: horizontal;
+    width: 100%;
     background: var(--bg-card);
     border: 1px solid var(--border-light);
-    border-radius: 6px;
-    padding: 2px;
+    border-radius: 8px;
+    padding: 3px;
     margin-bottom: 6px;
-    gap: 2px;
+    box-sizing: border-box;
 }
 
 .tab-btn {
-    flex: 1;
+    width: 50%;
     text-align: center;
-    padding: 6px 8px;
+    padding: 7px 10px;
     border: none;
     background: transparent;
     color: var(--text-secondary);
     font-size: 13px;
     font-weight: 500;
-    border-radius: 4px;
+    border-radius: 6px;
     cursor: pointer;
     transition: background 0.15s ease, color 0.15s ease;
 }
@@ -55,6 +55,7 @@
     background: var(--color-primary);
     color: #ffffff;
     font-weight: 600;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
 }
 
 .tab-btn:hover:not(.active) {
@@ -150,30 +151,17 @@
     font-style: italic;
 }
 
-.sub-actions-row {
-    display: flex;
-    flex-direction: row;
-    gap: 8px;
-    margin-bottom: 10px;
-}
-
-.sub-actions-row .btn-action {
-    flex: 1;
-}
-
 .footer-row {
     display: flex;
     flex-direction: row;
-    justify-content: space-between;
-    align-items: center;
-    padding-top: 6px;
+    gap: 8px;
+    padding-top: 8px;
     border-top: 1px solid var(--border-light);
+    margin-top: 4px;
 }
 
-.footer-right-buttons {
-    display: flex;
-    flex-direction: row;
-    gap: 8px;
+.footer-row .btn-action {
+    flex: 1;
 }
 
 /* Grayed out / dimmed state when spell_suggest is disabled */

@@ -26,6 +26,7 @@ Bản cập nhật này mang đến cải tiến đột phá về khả năng t�
     * **Tab "Hệ thống"**: Gom nhóm tuỳ chọn icon để giúp UI gọn hơn
     * **Tab "Macro"**: Tách riêng các nút hành động (Lưu, Test, Xóa, Nhập) và cải thiện bố cục danh sách macro để dễ sử dụng hơn.
     * **Xóa nhiều gõ tắt cùng lúc**: Thêm ô chọn ở bảng Macro để chọn và xóa nhiều từ gõ tắt trong một lần.
+    * **Quản lý "Từ điển & Loại trừ chính tả"**: Bổ sung hộp thoại đồ họa trực quan để quản lý Từ điển cá nhân (`user_dictionary.txt`) và Ngoại lệ viết tắt; hỗ trợ thêm, sửa, xóa, nạp/xuất file `.txt` và lưu áp dụng tức thì. Tab được thiết kế chia đều 50/50, phân tách rõ hàng thao tác tệp và hàng nút hành động.
 * **Chế độ "Kiểm tra chính tả nâng cao"**
     * **Engine Rust hiệu năng cao**: Bổ sung engine kiểm tra chính tả mới được viết bằng Rust, tập trung vào hiệu năng và khả năng nhận diện lỗi.
     * **Tự sửa lỗi gõ nhanh**: Phát hiện và sửa các lỗi gõ nhanh, đảo ký tự hoặc nhầm ký tự (ví dụ: `hcaof` → `chào`, `xywr` → `xử`).
@@ -51,6 +52,7 @@ Bản cập nhật này mang đến cải tiến đột phá về khả năng t�
 ### 🛠 Các lỗi đã được khắc phục
 *   **Sửa lỗi bỏ dấu từ ghép**: Khắc phục lỗi gõ từ `ruouwj` không bỏ dấu đúng cách để tạo thành từ `rượu`.
 *   **Sửa lỗi gõ từ tiếng Anh**: Khắc phục hiện tượng gõ từ `view` bị chuyển nhầm thành `vieư`.
+*   **Sửa lỗi nạp từ điển cá nhân (User Dictionary)**: Khắc phục lỗi engine chính tả Rust từ chối file `user_dictionary.txt` do xung đột cú pháp ghi chú header (`;` thay vì `#`), khiến các từ bảo vệ đã lưu (như `soà`, `khưm`...) vẫn bị tự sửa thành từ khác khi bật Kiểm tra chính tả nâng cao.
 *   **Tối ưu hóa trạng thái hoạt động**: Sửa lỗi ứng dụng chuyển sang trạng thái chờ (idle) quá nhanh gây ảnh hưởng đến trải nghiệm người dùng.
 *   **Cải tiến giao diện**: Tối ưu hóa hiệu năng hiển thị và chuyển đổi của các bộ giao diện (theme).
 *   **Sửa lỗi excel online**: Khắc phục lỗi mất từ trước đó khi dùng shift để viết hoa từ tiếng Việt. 

@@ -13,15 +13,12 @@ document.ready = function () {
 
 function initLexiconDialog() {
     var btnClose = document.getElementById("btn-close");
-    var btnCancel = document.getElementById("btn-cancel");
     var btnAdd = document.getElementById("btn-add");
     var btnEdit = document.getElementById("btn-edit");
     var btnDelete = document.getElementById("btn-delete");
     var btnDeselect = document.getElementById("btn-deselect");
     var btnImport = document.getElementById("btn-import");
     var btnExport = document.getElementById("btn-export");
-    var btnReload = document.getElementById("btn-reload");
-    var btnSave = document.getElementById("btn-save");
     var chkSpellSuggest = document.getElementById("cfg-spell-suggest");
 
     var tabUserDict = document.getElementById("tab-user-dict");
@@ -30,11 +27,6 @@ function initLexiconDialog() {
 
     if (btnClose) {
         btnClose.addEventListener("click", function () {
-            triggerAction("close");
-        });
-    }
-    if (btnCancel) {
-        btnCancel.addEventListener("click", function () {
             triggerAction("close");
         });
     }
@@ -92,18 +84,7 @@ function initLexiconDialog() {
             triggerAction("export");
         });
     }
-    if (btnReload) {
-        btnReload.addEventListener("click", function () {
-            clearFieldError();
-            triggerAction("reload");
-        });
-    }
-    if (btnSave) {
-        btnSave.addEventListener("click", function () {
-            clearFieldError();
-            triggerAction("save");
-        });
-    }
+
 
     // Input key handling
     if (entryInput) {

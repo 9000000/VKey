@@ -140,7 +140,7 @@ bool SpellExclusionsDialog::handle_event(HELEMENT he, BEHAVIOR_EVENT_PARAMS& par
                         sciter::value sv = sugEl.get_value();
                         if (sv.is_string()) {
                             spellSuggestEnabled_ = (sv.get<std::wstring>() == L"1");
-                            modified_ = true;
+                            (void)saveAndApply(false);
                         }
                     }
                 } else if (action == L"close") {
@@ -175,8 +175,7 @@ void SpellExclusionsDialog::addEntry(int targetList, const std::wstring& text) {
         }
         userDictWords_.push_back(normalized);
         std::sort(userDictWords_.begin(), userDictWords_.end());
-        modified_ = true;
-        populateList(0);
+        (void)saveAndApply(false);
     } else {
         // Spell Exclusions
         std::wstring normalized;
@@ -199,8 +198,7 @@ void SpellExclusionsDialog::addEntry(int targetList, const std::wstring& text) {
         if (canon.Succeeded()) {
             spellExclusions_ = std::move(canon.entries);
         }
-        modified_ = true;
-        populateList(1);
+        (void)saveAndApply(false);
     }
 }
 
@@ -216,8 +214,7 @@ void SpellExclusionsDialog::editEntry(int targetList, int index, const std::wstr
         userDictWords_[index] = normalized;
         std::sort(userDictWords_.begin(), userDictWords_.end());
         userDictWords_.erase(std::unique(userDictWords_.begin(), userDictWords_.end()), userDictWords_.end());
-        modified_ = true;
-        populateList(0);
+        (void)saveAndApply(false);
     } else {
         if (index < 0 || index >= static_cast<int>(spellExclusions_.size())) return;
         std::wstring normalized;
@@ -231,8 +228,7 @@ void SpellExclusionsDialog::editEntry(int targetList, int index, const std::wstr
         if (canon.Succeeded()) {
             spellExclusions_ = std::move(canon.entries);
         }
-        modified_ = true;
-        populateList(1);
+        (void)saveAndApply(false);
     }
 }
 
@@ -240,14 +236,12 @@ void SpellExclusionsDialog::deleteEntry(int targetList, int index) {
     if (targetList == 0) {
         if (index >= 0 && index < static_cast<int>(userDictWords_.size())) {
             userDictWords_.erase(userDictWords_.begin() + index);
-            modified_ = true;
-            populateList(0);
+            (void)saveAndApply(false);
         }
     } else {
         if (index >= 0 && index < static_cast<int>(spellExclusions_.size())) {
             spellExclusions_.erase(spellExclusions_.begin() + index);
-            modified_ = true;
-            populateList(1);
+            (void)saveAndApply(false);
         }
     }
 }
@@ -286,8 +280,7 @@ void SpellExclusionsDialog::importEntries(int targetList) {
             return;
         }
         userDictWords_ = std::move(res.entries);
-        modified_ = true;
-        populateList(0);
+        (void)saveAndApply(false);
         call_function("showSuccessToast", sciter::value(L"Nhập từ điển thành công!"));
     } else {
         auto res = LexiconValidator::ParseAndValidateSpellExclusionsText(content, append ? &spellExclusions_ : nullptr, append);
@@ -296,8 +289,7 @@ void SpellExclusionsDialog::importEntries(int targetList) {
             return;
         }
         spellExclusions_ = std::move(res.entries);
-        modified_ = true;
-        populateList(1);
+        (void)saveAndApply(false);
         call_function("showSuccessToast", sciter::value(L"Nhập ngoại lệ thành công!"));
     }
 }
@@ -345,7 +337,7 @@ void SpellExclusionsDialog::reloadData() {
     call_function("showSuccessToast", sciter::value(L"Đã nạp lại dữ liệu từ đĩa."));
 }
 
-bool SpellExclusionsDialog::saveAndApply() {
+bool SpellExclusionsDialog::saveAndApply(bool showToast) {
     auto configPath = ConfigManager::GetConfigPath();
 
     auto canon = SpellExclusionCanonicalizer::Canonicalize(spellExclusions_);
@@ -374,7 +366,9 @@ bool SpellExclusionsDialog::saveAndApply() {
 
     populateList(0);
     populateList(1);
-    call_function("showSuccessToast", sciter::value(L"Đã lưu & áp dụng thành công!"));
+    if (showToast) {
+        call_function("showSuccessToast", sciter::value(L"Đã lưu & áp dụng thành công!"));
+    }
     return true;
 }
 

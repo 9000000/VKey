@@ -31,7 +31,7 @@ private:
     void importEntries(int targetList);
     void exportEntries(int targetList);
     void reloadData();
-    bool saveAndApply();
+    bool saveAndApply(bool showToast = false);
 
     bool spellSuggestEnabled_ = true;
     std::vector<std::wstring> userDictWords_;
