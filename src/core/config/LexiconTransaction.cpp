@@ -72,9 +72,9 @@ bool DurableWrite(const std::filesystem::path& path, std::string_view data) {
         }
         offset += written;
     }
-    ::FlushFileBuffers(hFile);
+    BOOL flushed = ::FlushFileBuffers(hFile);
     ::CloseHandle(hFile);
-    return true;
+    return flushed != 0;
 #else
     int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) return false;
@@ -87,9 +87,9 @@ bool DurableWrite(const std::filesystem::path& path, std::string_view data) {
         }
         offset += static_cast<size_t>(written);
     }
-    ::fsync(fd);
+    int synced = ::fsync(fd);
     ::close(fd);
-    return true;
+    return synced == 0;
 #endif
 }
 
@@ -479,7 +479,15 @@ bool LexiconRecovery::RecoverIfNeeded(const std::filesystem::path& configPath) {
             }
 
             // Hashes verified: roll-forward
-            (void)LexiconWriter::PublishGeneration(record.newGeneration);
+            if (!LexiconWriter::PublishGeneration(record.newGeneration)) {
+                // Generation publishing failed! Keep backups and journal, fail-stale.
+                return false;
+            }
+
+            // Transition to GENERATION_PUBLISHED
+            if (!TransitionJournalState(configPath, record, LexiconJournalState::GenerationPublished)) {
+                return false;
+            }
 
             std::filesystem::remove(configTmp, ec);
             std::filesystem::remove(dictTmp, ec);

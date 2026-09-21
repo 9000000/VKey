@@ -480,5 +480,63 @@ TEST_F(LexiconTransactionTest, RollbackToBackupFailure_PreservesBackupFilesAndJo
     EXPECT_TRUE(std::filesystem::exists(configPath_) || std::filesystem::exists(configBak));
 }
 
+TEST_F(LexiconTransactionTest, RecoveryAtFilesReplaced_PublishGenerationFailure_PreservesBackupAndJournalAndFails) {
+    const std::string newConfig = "[features]\nspell_suggest = true\n";
+    const std::string newDict = "# Valid dictionary\nso\u00e0\n";
+    WriteFile(configPath_, newConfig);
+    WriteFile(dictPath_, newDict);
+
+    const auto configBak = testDir_ / "config.toml.bak";
+    const auto dictBak = testDir_ / "user_dictionary.txt.bak";
+    WriteFile(configBak, "old config");
+    WriteFile(dictBak, "old dict");
+
+    LexiconJournalRecord record;
+    record.state = LexiconJournalState::FilesReplaced;
+    record.configExistedBefore = true;
+    record.dictExistedBefore = true;
+    record.oldGeneration = 1;
+    record.newGeneration = 2;
+    record.newConfigHash = LexiconJournalRecord::ComputeHash(newConfig);
+    record.newDictHash = LexiconJournalRecord::ComputeHash(newDict);
+    record.configBakPath = configBak.string();
+    record.dictBakPath = dictBak.string();
+
+    const auto journalPath = testDir_ / "lexicon_txn.journal";
+    WriteFile(journalPath, record.Serialize());
+
+    // Fault injection: publisher fails
+    LexiconWriter::SetTestGenerationPublisher([](uint8_t) {
+        return false;
+    });
+
+    // Recovery must fail
+    EXPECT_FALSE(LexiconRecovery::RecoverIfNeeded(configPath_));
+
+    // CRITICAL: .bak and journal must be PRESERVED on disk!
+    EXPECT_TRUE(std::filesystem::exists(journalPath));
+    EXPECT_TRUE(std::filesystem::exists(configBak));
+    EXPECT_TRUE(std::filesystem::exists(dictBak));
+
+    // Reader must fail-stale because journal recovery failed
+    std::shared_ptr<const RustUserDictionarySnapshot> snapshot;
+    EXPECT_FALSE(LexiconReader::LoadUserDictionaryLocked(configPath_.wstring(), snapshot));
+
+    // Retry recovery with working publisher -> must roll-forward and clean up
+    LexiconWriter::SetTestGenerationPublisher([](uint8_t) {
+        return true;
+    });
+
+    EXPECT_TRUE(LexiconRecovery::RecoverIfNeeded(configPath_));
+    EXPECT_FALSE(std::filesystem::exists(journalPath));
+    EXPECT_FALSE(std::filesystem::exists(configBak));
+    EXPECT_FALSE(std::filesystem::exists(dictBak));
+
+    // Now reader succeeds
+    EXPECT_TRUE(LexiconReader::LoadUserDictionaryLocked(configPath_.wstring(), snapshot));
+
+    LexiconWriter::SetTestGenerationPublisher(nullptr);
+}
+
 } // namespace NextKey
 
