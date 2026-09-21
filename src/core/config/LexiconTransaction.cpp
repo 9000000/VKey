@@ -521,7 +521,9 @@ bool LexiconRecovery::RecoverIfNeeded(const std::filesystem::path& configPath) {
 
                 if (!LexiconWriter::PublishGeneration(record.oldGeneration)) {
                     // Persist in RollbackPending state so future recovery knows files are already rolled back
-                    TransitionJournalState(configPath, record, LexiconJournalState::RollbackPending);
+                    if (!TransitionJournalState(configPath, record, LexiconJournalState::RollbackPending)) {
+                        return false;
+                    }
                     return false;
                 }
                 std::filesystem::remove(configTmp, ec);
@@ -789,8 +791,11 @@ bool LexiconWriter::CommitTransaction(
     // 6. Publish Generation & Wire Mapping
     if (notifySharedState) {
         if (!PublishGeneration(newGeneration)) {
-            // Publishing failed! Rollback to backup files and fail transaction.
-            TransitionJournalState(configPath, record, LexiconJournalState::RollbackPending);
+            // Publishing failed! Transition journal to RollbackPending before rolling back.
+            // If durable journal transition fails, keep journal in current state and fail-stale.
+            if (!TransitionJournalState(configPath, record, LexiconJournalState::RollbackPending)) {
+                return false;
+            }
             if (RollbackToBackup(record, configPath, dictPath, configBak, dictBak)) {
                 std::filesystem::remove(configTmp, ec);
                 std::filesystem::remove(dictTmp, ec);
@@ -851,7 +856,10 @@ bool LexiconWriter::CommitTransaction(
             if (!PublishWireMapping(exclusions, dictRes.entries, wireGen, spellSuggest, &wireErr)) {
                 // SharedState generation was published at step 6; transition journal to RollbackPending
                 // BEFORE attempting rollback so crash recovery knows a rollback is underway.
-                TransitionJournalState(configPath, record, LexiconJournalState::RollbackPending);
+                // If durable journal transition fails, keep journal in current state and fail-stale.
+                if (!TransitionJournalState(configPath, record, LexiconJournalState::RollbackPending)) {
+                    return false;
+                }
 
                 // Attempt to restore old generation in SharedState
                 bool oldGenRestored = false;
