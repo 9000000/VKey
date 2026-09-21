@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "core/config/LexiconTransaction.h"
+#include "core/ipc/LexiconWireManager.h"
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -536,6 +537,81 @@ TEST_F(LexiconTransactionTest, RecoveryAtFilesReplaced_PublishGenerationFailure_
     EXPECT_TRUE(LexiconReader::LoadUserDictionaryLocked(configPath_.wstring(), snapshot));
 
     LexiconWriter::SetTestGenerationPublisher(nullptr);
+}
+
+TEST_F(LexiconTransactionTest, CommitTransaction_PublishesWireMappingWhenConfigured) {
+    // 1. Setup wire manager
+    Wire::LexiconWireManager wireManager;
+    ASSERT_TRUE(wireManager.Create());
+    LexiconWriter::SetWireManager(&wireManager);
+
+    std::string newConfigToml = R"(
+[input]
+method = "telex"
+
+[features]
+spell_suggest = true
+spell_exclusions = [ "msword", "excel" ]
+
+[internal]
+wire_generation = 4000
+)";
+    std::string newUserDict = "t\u1eeb\n\u0111i\u1ec3n\n";
+
+    bool ok = LexiconWriter::CommitTransaction(configPath_.wstring(), newConfigToml, newUserDict);
+    EXPECT_TRUE(ok);
+
+    // Verify wire mapping was updated with generation 4000
+    Wire::LexiconWireReader reader;
+    ASSERT_TRUE(reader.Open());
+    std::vector<uint8_t> localBuf;
+    Wire::LexiconWireView view;
+    std::string err;
+    ASSERT_TRUE(reader.ReadSnapshot(localBuf, view, &err)) << err;
+
+    EXPECT_EQ(view.header->generation, 4000u);
+    EXPECT_EQ(view.exclusionsRowCount, 2u);
+    EXPECT_EQ(view.wordCount, 2u);
+
+    reader.Close();
+    LexiconWriter::SetWireManager(nullptr);
+    wireManager.Close();
+}
+
+TEST_F(LexiconTransactionTest, CommitTransaction_RollsBackWhenWirePublishingFails) {
+    // 1. Initial valid commit
+    std::string validToml = "[input]\nmethod = \"telex\"\n";
+    std::string validDict = "ban\n";
+    ASSERT_TRUE(LexiconWriter::CommitTransaction(configPath_.wstring(), validToml, validDict));
+
+    // 2. Setup mock wire publisher hook that fails
+    LexiconWriter::SetTestWirePublisher([](const auto&, const auto&, uint64_t, bool, std::string* outErr) {
+        if (outErr) *outErr = "Simulated wire publish failure";
+        return false;
+    });
+
+    std::string newConfigToml = "[input]\nmethod = \"vni\"\n[internal]\nwire_generation = 5000\n";
+    std::string newUserDict = "moi\n";
+
+    // Transaction must fail
+    bool ok = LexiconWriter::CommitTransaction(configPath_.wstring(), newConfigToml, newUserDict);
+    EXPECT_FALSE(ok);
+
+    // Files must have rolled back to previous content
+    std::string currentToml = ReadFile(configPath_);
+    EXPECT_NE(currentToml.find("telex"), std::string::npos);
+    EXPECT_EQ(currentToml.find("vni"), std::string::npos);
+
+    std::string currentDict = ReadFile(dictPath_);
+    EXPECT_NE(currentDict.find("ban"), std::string::npos);
+    EXPECT_EQ(currentDict.find("moi"), std::string::npos);
+
+    // Journal and backups must be cleaned up
+    EXPECT_FALSE(std::filesystem::exists(testDir_ / "lexicon_txn.journal"));
+    EXPECT_FALSE(std::filesystem::exists(configPath_.string() + ".bak"));
+    EXPECT_FALSE(std::filesystem::exists(dictPath_.string() + ".bak"));
+
+    LexiconWriter::SetTestWirePublisher(nullptr);
 }
 
 } // namespace NextKey

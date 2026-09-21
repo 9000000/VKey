@@ -111,6 +111,28 @@ public:
         LexiconWireView& outView,
         std::string* outError = nullptr);
 
+    /// Reads a consistent snapshot from the wire mapping into localBuffer.
+    /// Updates cached identity with currentSharedStateEpoch, wireGeneration, and wireCrc32.
+    bool ReadSnapshot(
+        std::vector<uint8_t>& localBuffer,
+        LexiconWireView& outView,
+        uint32_t currentSharedStateEpoch,
+        std::string* outError = nullptr);
+
+    /// Fast-path snapshot reader:
+    /// 1. If cached wireGeneration > 0 and !HasEpochChanged(currentSharedStateEpoch),
+    ///    immediately returns true with outWasUpdated = false (< 1 ns).
+    /// 2. If epoch changed but wire header generation & CRC32 match cachedIdentity,
+    ///    updates cached sharedStateEpoch and returns true with outWasUpdated = false (skips 144 KiB copy).
+    /// 3. If wire changed, reads 144 KiB via seqlock, validates CRC32, updates cachedIdentity,
+    ///    and returns true with outWasUpdated = true.
+    bool ReadSnapshotFast(
+        std::vector<uint8_t>& localBuffer,
+        LexiconWireView& outView,
+        uint32_t currentSharedStateEpoch,
+        bool* outWasUpdated = nullptr,
+        std::string* outError = nullptr);
+
     /// Cached identity tuple for zero-latency hot-path checks.
     [[nodiscard]] const LexiconSnapshotIdentity& GetCachedIdentity() const noexcept;
     void SetCachedIdentity(const LexiconSnapshotIdentity& id) noexcept;

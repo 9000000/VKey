@@ -356,8 +356,11 @@ bool SpellExclusionsDialog::saveAndApply() {
     }
     spellExclusions_ = std::move(canon.entries);
 
+    uint64_t currentWireGen = ConfigManager::LoadWireGeneration(configPath);
+    uint64_t nextWireGen = currentWireGen + 1;
+
     std::string newConfigToml = ConfigManager::FormatConfigTomlForLexicon(
-        configPath, spellSuggestEnabled_, spellExclusions_);
+        configPath, spellSuggestEnabled_, spellExclusions_, nextWireGen);
     std::string newUserDictText = LexiconValidator::FormatUserDictText(userDictWords_);
 
     bool ok = LexiconWriter::CommitTransaction(configPath, newConfigToml, newUserDictText);

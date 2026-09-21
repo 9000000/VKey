@@ -288,5 +288,95 @@ TEST(LexiconWireManagerTest, LexiconWriterPublishWireMappingIntegration) {
     manager.Close();
 }
 
+TEST(LexiconWireManagerTest, FastPathCacheIdentityVerification) {
+    LexiconWireManager manager;
+    ASSERT_TRUE(manager.Create());
+    ASSERT_TRUE(manager.Publish({ L"msword" }, { L"viet" }, 10, true));
+
+    LexiconWireReader reader;
+    ASSERT_TRUE(reader.Open());
+
+    std::vector<uint8_t> localBuf;
+    LexiconWireView view;
+    bool wasUpdated = false;
+
+    // 1. Initial read: epoch = 100 -> must perform full copy and validation (wasUpdated == true)
+    ASSERT_TRUE(reader.ReadSnapshotFast(localBuf, view, 100, &wasUpdated));
+    EXPECT_TRUE(wasUpdated);
+    EXPECT_EQ(reader.GetCachedIdentity().sharedStateEpoch, 100u);
+    EXPECT_EQ(reader.GetCachedIdentity().wireGeneration, 10u);
+
+    // 2. Same epoch: epoch = 100 -> true zero-cost fast path (< 1 ns, wasUpdated == false)
+    wasUpdated = true;
+    ASSERT_TRUE(reader.ReadSnapshotFast(localBuf, view, 100, &wasUpdated));
+    EXPECT_FALSE(wasUpdated);
+
+    // 3. Epoch changed to 102, but wire mapping generation & CRC32 have NOT changed!
+    // -> Must skip 144 KiB payload copy, update cached epoch, and return wasUpdated == false
+    wasUpdated = true;
+    ASSERT_TRUE(reader.ReadSnapshotFast(localBuf, view, 102, &wasUpdated));
+    EXPECT_FALSE(wasUpdated);
+    EXPECT_EQ(reader.GetCachedIdentity().sharedStateEpoch, 102u);
+    EXPECT_EQ(reader.GetCachedIdentity().wireGeneration, 10u);
+
+    // 4. Wire mapping updated to generation 20:
+    ASSERT_TRUE(manager.Publish({ L"msword" }, { L"nam" }, 20, true));
+
+    // Next read at epoch 104 -> must detect change, copy 144 KiB, and update (wasUpdated == true)
+    wasUpdated = false;
+    ASSERT_TRUE(reader.ReadSnapshotFast(localBuf, view, 104, &wasUpdated));
+    EXPECT_TRUE(wasUpdated);
+    EXPECT_EQ(reader.GetCachedIdentity().sharedStateEpoch, 104u);
+    EXPECT_EQ(reader.GetCachedIdentity().wireGeneration, 20u);
+
+    reader.Close();
+    manager.Close();
+}
+
+TEST(LexiconWireManagerTest, CrossProcessSingleWriterEnforcement) {
+    LexiconWireManager manager1;
+    ASSERT_TRUE(manager1.Create());
+    EXPECT_TRUE(manager1.IsWritable());
+
+    // A second manager attempting to create mapping concurrently must be rejected
+    LexiconWireManager manager2;
+    EXPECT_FALSE(manager2.Create());
+    EXPECT_FALSE(manager2.IsWritable());
+
+    // Closing the active manager releases the writer lock
+    manager1.Close();
+    EXPECT_FALSE(manager1.IsWritable());
+
+    // Now second manager can acquire writer role
+    ASSERT_TRUE(manager2.Create());
+    EXPECT_TRUE(manager2.IsWritable());
+    manager2.Close();
+}
+
+TEST(LexiconWireManagerTest, ReaderReadOnlyAndWriteDenied) {
+    LexiconWireManager manager;
+    ASSERT_TRUE(manager.Create());
+    ASSERT_TRUE(manager.Publish({ L"msword" }, { L"viet" }, 1, true));
+
+    LexiconWireReader reader;
+    ASSERT_TRUE(reader.Open());
+    EXPECT_TRUE(reader.IsOpen());
+
+    // Reader provides const views only (cannot mutate shared memory)
+    std::vector<uint8_t> localBuf;
+    LexiconWireView view;
+    ASSERT_TRUE(reader.ReadSnapshot(localBuf, view));
+    EXPECT_NE(view.header, nullptr);
+
+    // A reader instance cannot be used to publish
+    // And second manager cannot write to existing active mapping
+    LexiconWireManager unauthorizedWriter;
+    EXPECT_FALSE(unauthorizedWriter.Create());
+    EXPECT_FALSE(unauthorizedWriter.IsWritable());
+
+    reader.Close();
+    manager.Close();
+}
+
 } // namespace
 } // namespace NextKey::Wire

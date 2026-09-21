@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 #if defined(_WIN32)
 #include <Windows.h>
@@ -24,9 +25,14 @@ namespace {
 struct PosixNamedSharedMemoryRegistry {
     std::mutex mutex;
     std::unordered_map<std::string, std::shared_ptr<std::vector<uint8_t>>> mappings;
+    std::unordered_set<std::string> activeWriters;
 
-    std::shared_ptr<std::vector<uint8_t>> GetOrCreate(const std::string& name, size_t size) {
+    std::shared_ptr<std::vector<uint8_t>> CreateForWriter(const std::string& name, size_t size) {
         std::lock_guard<std::mutex> lock(mutex);
+        if (activeWriters.find(name) != activeWriters.end()) {
+            return nullptr; // Another manager is already the active writer!
+        }
+        activeWriters.insert(name);
         auto it = mappings.find(name);
         if (it != mappings.end()) {
             return it->second;
@@ -45,8 +51,14 @@ struct PosixNamedSharedMemoryRegistry {
         return nullptr;
     }
 
+    void ReleaseWriter(const std::string& name) {
+        std::lock_guard<std::mutex> lock(mutex);
+        activeWriters.erase(name);
+    }
+
     void Remove(const std::string& name) {
         std::lock_guard<std::mutex> lock(mutex);
+        activeWriters.erase(name);
         mappings.erase(name);
     }
 };
@@ -64,6 +76,7 @@ PosixNamedSharedMemoryRegistry& GetPosixRegistry() {
 struct LexiconWireManager::Impl {
 #if defined(_WIN32)
     HANDLE hMapping = nullptr;
+    HANDLE hWriterMutex = nullptr;
     volatile LexiconWireHeader* pMapping = nullptr;
 #else
     std::shared_ptr<std::vector<uint8_t>> posixBlock;
@@ -94,6 +107,15 @@ bool LexiconWireManager::Create() {
     }
 
 #if defined(_WIN32)
+    pImpl_->hWriterMutex = CreateMutexW(nullptr, TRUE, L"Local\\VKeyLexiconWireWriterMutex");
+    if (!pImpl_->hWriterMutex || GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (pImpl_->hWriterMutex) {
+            CloseHandle(pImpl_->hWriterMutex);
+            pImpl_->hWriterMutex = nullptr;
+        }
+        return false;
+    }
+
     SECURITY_ATTRIBUTES sa = MakeAppContainerReadableSecurityAttributes();
 
     pImpl_->hMapping = CreateFileMappingW(
@@ -109,6 +131,16 @@ bool LexiconWireManager::Create() {
     }
 
     if (!pImpl_->hMapping) {
+        CloseHandle(pImpl_->hWriterMutex);
+        pImpl_->hWriterMutex = nullptr;
+        return false;
+    }
+
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(pImpl_->hMapping);
+        pImpl_->hMapping = nullptr;
+        CloseHandle(pImpl_->hWriterMutex);
+        pImpl_->hWriterMutex = nullptr;
         return false;
     }
 
@@ -116,6 +148,8 @@ bool LexiconWireManager::Create() {
     if (!pView) {
         CloseHandle(pImpl_->hMapping);
         pImpl_->hMapping = nullptr;
+        CloseHandle(pImpl_->hWriterMutex);
+        pImpl_->hWriterMutex = nullptr;
         return false;
     }
 
@@ -123,7 +157,10 @@ bool LexiconWireManager::Create() {
     pImpl_->isWritable = true;
     return true;
 #else
-    pImpl_->posixBlock = GetPosixRegistry().GetOrCreate(LEXICON_WIRE_MAPPING_NAME, WIRE_TOTAL_SIZE);
+    pImpl_->posixBlock = GetPosixRegistry().CreateForWriter(LEXICON_WIRE_MAPPING_NAME, WIRE_TOTAL_SIZE);
+    if (!pImpl_->posixBlock) {
+        return false;
+    }
     pImpl_->pMapping = reinterpret_cast<volatile LexiconWireHeader*>(pImpl_->posixBlock->data());
     pImpl_->isWritable = true;
     return true;
@@ -147,6 +184,11 @@ void LexiconWireManager::Close() noexcept {
     if (pImpl_->hMapping) {
         CloseHandle(pImpl_->hMapping);
         pImpl_->hMapping = nullptr;
+    }
+    if (pImpl_->hWriterMutex) {
+        ReleaseMutex(pImpl_->hWriterMutex);
+        CloseHandle(pImpl_->hWriterMutex);
+        pImpl_->hWriterMutex = nullptr;
     }
 #else
     if (pImpl_->posixBlock) {
@@ -367,6 +409,14 @@ bool LexiconWireReader::ReadSnapshot(
     std::vector<uint8_t>& localBuffer,
     LexiconWireView& outView,
     std::string* outError) {
+    return ReadSnapshot(localBuffer, outView, pImpl_->cachedIdentity.sharedStateEpoch, outError);
+}
+
+bool LexiconWireReader::ReadSnapshot(
+    std::vector<uint8_t>& localBuffer,
+    LexiconWireView& outView,
+    uint32_t currentSharedStateEpoch,
+    std::string* outError) {
     if (!IsOpen()) {
         if (outError) *outError = "LexiconWireReader is not open";
         return false;
@@ -385,8 +435,55 @@ bool LexiconWireReader::ReadSnapshot(
         return false;
     }
 
+    pImpl_->cachedIdentity.sharedStateEpoch = currentSharedStateEpoch;
     pImpl_->cachedIdentity.wireGeneration = outView.header->generation;
     pImpl_->cachedIdentity.wireCrc32 = outView.header->crc32;
+    return true;
+}
+
+bool LexiconWireReader::ReadSnapshotFast(
+    std::vector<uint8_t>& localBuffer,
+    LexiconWireView& outView,
+    uint32_t currentSharedStateEpoch,
+    bool* outWasUpdated,
+    std::string* outError) {
+    if (!IsOpen()) {
+        if (!Open()) {
+            if (outError) *outError = "LexiconWireReader could not open wire mapping";
+            return false;
+        }
+    }
+
+    // Path 1: Zero-cost fast path (< 1 ns): SharedState epoch has not changed since last read
+    if (pImpl_->cachedIdentity.wireGeneration > 0 &&
+        !HasEpochChanged(currentSharedStateEpoch)) {
+        if (outWasUpdated) *outWasUpdated = false;
+        return true;
+    }
+
+    // Path 2: SharedState epoch changed, but wire mapping generation & CRC32 might be identical
+    if (pImpl_->cachedIdentity.wireGeneration > 0 && pImpl_->pMapping != nullptr) {
+        uint32_t seq1 = SeqlockBeginRead(pImpl_->pMapping->seqlock);
+        if ((seq1 & 1) == 0 && pImpl_->pMapping->magic == WIRE_MAGIC) {
+            uint64_t gen = pImpl_->pMapping->generation;
+            uint32_t crc = pImpl_->pMapping->crc32;
+            if (SeqlockValidateRead(pImpl_->pMapping->seqlock, seq1) &&
+                gen == pImpl_->cachedIdentity.wireGeneration &&
+                crc == pImpl_->cachedIdentity.wireCrc32) {
+                // Wire mapping content did not change; update cached epoch and return
+                pImpl_->cachedIdentity.sharedStateEpoch = currentSharedStateEpoch;
+                if (outWasUpdated) *outWasUpdated = false;
+                return true;
+            }
+        }
+    }
+
+    // Path 3: Wire content changed or initial read: perform full seqlock copy and validation
+    if (!ReadSnapshot(localBuffer, outView, currentSharedStateEpoch, outError)) {
+        return false;
+    }
+
+    if (outWasUpdated) *outWasUpdated = true;
     return true;
 }
 

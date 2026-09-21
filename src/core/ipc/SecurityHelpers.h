@@ -32,22 +32,61 @@ inline SECURITY_ATTRIBUTES MakeCreatorOnlySecurityAttributes() noexcept {
     return sa;
 }
 
-// Returns a SECURITY_ATTRIBUTES that grants full access to SYSTEM, Admins, and Interactive User,
-// plus read-only access to ALL APPLICATION PACKAGES (AC) and ALL RESTRICTED APPLICATION PACKAGES (RA)
-// so AppContainer sandbox processes (Edge, Chromium, UWP) can read the shared memory mapping.
+// Returns true and writes string representation of the current process's user SID (e.g. S-1-5-21-...).
+inline bool GetCurrentProcessUserSidString(std::wstring& outSid) noexcept {
+    HANDLE hToken = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        return false;
+    }
+    DWORD len = 0;
+    (void)GetTokenInformation(hToken, TokenUser, nullptr, 0, &len);
+    if (len == 0) {
+        CloseHandle(hToken);
+        return false;
+    }
+    std::vector<BYTE> buffer(len);
+    if (!GetTokenInformation(hToken, TokenUser, buffer.data(), len, &len)) {
+        CloseHandle(hToken);
+        return false;
+    }
+    CloseHandle(hToken);
+    auto* pTokenUser = reinterpret_cast<TOKEN_USER*>(buffer.data());
+    LPWSTR stringSid = nullptr;
+    if (!ConvertSidToStringSidW(pTokenUser->User.Sid, &stringSid)) {
+        return false;
+    }
+    outSid = stringSid;
+    LocalFree(stringSid);
+    return true;
+}
+
+// Returns a SECURITY_ATTRIBUTES that grants full access (write) strictly to SYSTEM, Admins,
+// and the creator user (current process User SID).
+// Interactive User (IU) and AppContainer sandbox packages (AC, RA) receive ONLY read access (GENERIC_READ).
+// This enforces the single-writer invariant and prevents rogue interactive processes from tampering with the wire mapping.
 // Call LocalFree(sa.lpSecurityDescriptor) after the handle is created.
 //
 // SDDL breakdown:
-//   D:PAI          — DACL, protected, auto-inherited
-//   (A;;GA;;;SY)   — Allow GENERIC_ALL to SYSTEM
-//   (A;;GA;;;BA)   — Allow GENERIC_ALL to Built-in Administrators
-//   (A;;GA;;;IU)   — Allow GENERIC_ALL to Interactively logged-on User
-//   (A;;GR;;;AC)   — Allow GENERIC_READ to ALL APPLICATION PACKAGES (S-1-15-2-1)
-//   (A;;GR;;;RA)   — Allow GENERIC_READ to ALL RESTRICTED APPLICATION PACKAGES (S-1-15-2-2)
+//   D:PAI              — DACL, protected, auto-inherited
+//   (A;;GA;;;SY)       — Allow GENERIC_ALL to SYSTEM
+//   (A;;GA;;;BA)       — Allow GENERIC_ALL to Built-in Administrators
+//   (A;;GA;;;<UserSID>)— Allow GENERIC_ALL strictly to the creator user
+//   (A;;GR;;;IU)       — Allow GENERIC_READ to Interactively logged-on User (read-only)
+//   (A;;GR;;;AC)       — Allow GENERIC_READ to ALL APPLICATION PACKAGES (S-1-15-2-1)
+//   (A;;GR;;;RA)       — Allow GENERIC_READ to ALL RESTRICTED APPLICATION PACKAGES (S-1-15-2-2)
 inline SECURITY_ATTRIBUTES MakeAppContainerReadableSecurityAttributes() noexcept {
+    std::wstring userSid;
+    std::wstring sddl;
+    if (GetCurrentProcessUserSidString(userSid) && !userSid.empty()) {
+        sddl = L"D:PAI(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;" + userSid + L")(A;;GR;;;IU)(A;;GR;;;AC)(A;;GR;;;RA)";
+    } else {
+        // Fallback if token user SID cannot be queried
+        sddl = L"D:PAI(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;IU)(A;;GR;;;AC)(A;;GR;;;RA)";
+    }
+
     PSECURITY_DESCRIPTOR pSD = nullptr;
     ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        L"D:PAI(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)(A;;GR;;;AC)(A;;GR;;;RA)",
+        sddl.c_str(),
         SDDL_REVISION_1,
         &pSD,
         nullptr);

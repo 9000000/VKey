@@ -3,8 +3,11 @@
 
 #include "LexiconTransaction.h"
 #include "LexiconValidation.h"
+#include "SpellExclusionCanonicalizer.h"
 #include "core/engine/RustInputEngine.h"
 #include "core/ipc/LexiconWireManager.h"
+
+#include <toml.hpp>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -736,7 +739,7 @@ bool LexiconWriter::CommitTransaction(
         return false;
     }
 
-    // 6. Publish Generation
+    // 6. Publish Generation & Wire Mapping
     if (notifySharedState) {
         if (!PublishGeneration(newGeneration)) {
             // Publishing failed! Rollback to backup files and fail transaction.
@@ -749,6 +752,65 @@ bool LexiconWriter::CommitTransaction(
                 std::filesystem::remove(journalTmp, ec);
             }
             return false;
+        }
+
+        // Publish wire mapping if wire manager or test publisher is configured
+        if (sWireManager || sTestWirePublisher) {
+            bool spellSuggest = true;
+            std::vector<std::wstring> exclusions;
+            uint64_t wireGen = 0;
+
+            try {
+                auto tbl = toml::parse(newConfigToml);
+                if (auto* features = tbl["features"].as_table()) {
+                    if (auto* ss = (*features)["spell_suggest"].as_boolean()) {
+                        spellSuggest = ss->get();
+                    }
+                    if (auto* arr = (*features)["spell_exclusions"].as_array()) {
+                        for (auto&& item : *arr) {
+                            if (auto* s = item.as_string()) {
+                                std::string u8 = s->get();
+                                std::wstring u16;
+                                std::u32string u32;
+                                if (SpellExclusionCanonicalizer::Utf8ToUtf32(u8, u32) &&
+                                    SpellExclusionCanonicalizer::Utf32ToUtf16(u32, u16)) {
+                                    exclusions.push_back(u16);
+                                }
+                            }
+                        }
+                    }
+                }
+                if (auto* internalTbl = tbl["internal"].as_table()) {
+                    if (auto* wg = (*internalTbl)["wire_generation"].as_integer()) {
+                        if (wg->get() > 0) {
+                            wireGen = static_cast<uint64_t>(wg->get());
+                        }
+                    }
+                }
+            } catch (...) {
+            }
+
+            if (wireGen == 0) {
+                if (sWireManager && sWireManager->IsWritable()) {
+                    wireGen = sWireManager->GetWireGeneration() + 1;
+                } else {
+                    wireGen = static_cast<uint64_t>(newGeneration);
+                }
+            }
+
+            auto dictRes = LexiconValidator::ParseAndValidateUserDictText(newUserDictText);
+            std::string wireErr;
+            if (!PublishWireMapping(exclusions, dictRes.entries, wireGen, spellSuggest, &wireErr)) {
+                if (RollbackToBackup(record, configPath, dictPath, configBak, dictBak)) {
+                    std::filesystem::remove(configTmp, ec);
+                    std::filesystem::remove(dictTmp, ec);
+                    std::filesystem::remove(configBak, ec);
+                    std::filesystem::remove(dictBak, ec);
+                    std::filesystem::remove(journalPath, ec);
+                    std::filesystem::remove(journalTmp, ec);
+                }
+                return false;
+            }
         }
     }
 
