@@ -404,16 +404,51 @@ RustUserDictionarySnapshot::~RustUserDictionarySnapshot() {
 #endif
 }
 
+bool RustInputEngine::CreateUserDictionaryTemplate(
+    const std::wstring& configPath, bool* created) {
+    const std::filesystem::path path = UserDictionaryPath(configPath);
+    bool createdLocal = false;
+    const bool ok = EnsureUserDictionaryTemplate(path, createdLocal);
+    if (created) *created = createdLocal;
+    return ok;
+}
+
 RustUserDictionaryLoadResult RustInputEngine::LoadUserDictionary(
     const std::wstring& configPath) {
     RustUserDictionaryLoadResult result;
     const std::filesystem::path path = UserDictionaryPath(configPath);
     result.path = path.wstring();
     try {
-        if (!EnsureUserDictionaryTemplate(path, result.created)) {
-            result.status = RustUserDictionaryLoadStatus::IoError;
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec) || ec) {
+            // Missing file produces a valid empty snapshot without creating the file on disk.
+            // Succeeded() is true, snapshot contains an empty compiled dictionary.
+            result.status = RustUserDictionaryLoadStatus::Loaded;
+            result.created = false;
+#if VKEY_ENGINE_ABI_VERSION >= 8u
+            const EngineApi& api = Api();
+            if (api.ok && api.user_dictionary_create_utf16) {
+                uint32_t status = VKEY_USER_DICTIONARY_OK;
+                size_t errorLine = 0;
+                VKeyUserDictionary* dictionary = api.user_dictionary_create_utf16(
+                    nullptr, 0, &status, &errorLine);
+                result.engineStatus = status;
+                result.errorLine = errorLine;
+                if (!dictionary) {
+                    result.status = RustUserDictionaryLoadStatus::EngineRejected;
+                    return result;
+                }
+                result.snapshot = std::shared_ptr<const RustUserDictionarySnapshot>(
+                    new RustUserDictionarySnapshot(dictionary));
+            } else {
+                result.status = RustUserDictionaryLoadStatus::EngineUnavailable;
+            }
+#else
+            result.status = RustUserDictionaryLoadStatus::EngineUnavailable;
+#endif
             return result;
         }
+
         std::string bytes;
         bool oversized = false;
         if (!ReadBoundedFile(path, bytes, oversized)) {

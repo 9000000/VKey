@@ -752,18 +752,40 @@ protected:
     std::filesystem::path dictionaryPath_;
 };
 
-TEST_F(RustUserDictionaryFileTest, MissingFileCreatesCommentOnlyTemplate) {
+TEST_F(RustUserDictionaryFileTest, MissingFileLoadsEmptySnapshotWithoutCreatingFile) {
     ASSERT_FALSE(std::filesystem::exists(dictionaryPath_));
 
     const auto loaded = RustInputEngine::LoadUserDictionary(configPath_.wstring());
 
     ASSERT_TRUE(loaded.Succeeded());
-    EXPECT_TRUE(loaded.created);
+    EXPECT_FALSE(loaded.created);
+    EXPECT_FALSE(std::filesystem::exists(dictionaryPath_));
+    ASSERT_NE(loaded.snapshot, nullptr);
+
+    bool corrected = true;
+    // An empty dictionary provides no protection against correction of unknown/broken words
+    EXPECT_NE(CommitRaw(loaded.snapshot, &corrected), L"gnuwowif");
+    EXPECT_TRUE(corrected);
+}
+
+TEST_F(RustUserDictionaryFileTest, ExplicitCreateCreatesTemplateAndIsIdempotent) {
+    ASSERT_FALSE(std::filesystem::exists(dictionaryPath_));
+
+    bool created = false;
+    EXPECT_TRUE(RustInputEngine::CreateUserDictionaryTemplate(configPath_.wstring(), &created));
+    EXPECT_TRUE(created);
     EXPECT_TRUE(std::filesystem::exists(dictionaryPath_));
+
     std::ifstream input(dictionaryPath_, std::ios::binary);
     const std::string text((std::istreambuf_iterator<char>(input)),
                            std::istreambuf_iterator<char>());
     EXPECT_NE(text.find("https://github.com/phatMT97/VKey/issues"), std::string::npos);
+
+    // Second call is idempotent: does not overwrite or fail
+    created = true;
+    EXPECT_TRUE(RustInputEngine::CreateUserDictionaryTemplate(configPath_.wstring(), &created));
+    EXPECT_FALSE(created);
+    EXPECT_TRUE(std::filesystem::exists(dictionaryPath_));
 }
 
 TEST_F(RustUserDictionaryFileTest, EmptyFileIsValidAndClearsProtection) {

@@ -84,13 +84,19 @@ public:
     /// Empty when LibraryAvailable(); otherwise a bounded diagnostic.
     [[nodiscard]] static std::wstring UnavailableReason();
 
-    /// Resolve `user_dictionary.txt` beside config.toml, creating the
-    /// comment-only template if absent, then read and compile it. Missing and
-    /// empty files both produce a valid empty snapshot. Invalid/unreadable
-    /// files return failure so callers can retain their last valid snapshot.
+    /// Resolve `user_dictionary.txt` beside config.toml and read/compile it.
+    /// Missing and empty files both produce a valid empty snapshot WITHOUT
+    /// creating the file on disk. Invalid/unreadable files return failure so
+    /// callers can retain their last valid snapshot.
     /// Cold path only: performs file I/O, UTF-8 decoding and allocation.
     [[nodiscard]] static RustUserDictionaryLoadResult LoadUserDictionary(
         const std::wstring& configPath);
+
+    /// Explicitly create the documented `user_dictionary.txt` template beside
+    /// config.toml if it does not already exist. Idempotent and race-safe.
+    /// Called only when the user explicitly triggers an Open/Create action from UI.
+    static bool CreateUserDictionaryTemplate(
+        const std::wstring& configPath, bool* created = nullptr);
 
     /// Attach a precompiled immutable snapshot. Null clears protection. Returns
     /// false without changing the engine if composition is active.
