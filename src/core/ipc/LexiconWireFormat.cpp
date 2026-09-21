@@ -451,6 +451,7 @@ bool LexiconWireDeserializer::ValidateAndInspect(
     outView.header = header;
     outView.exclusionsBuf = reinterpret_cast<const uint16_t*>(wireBuffer + header->exclusionsOffsetBytes);
     outView.exclusionsUnits = header->exclusionsUtf16Units;
+    outView.exclusionsRowCount = header->exclusionsRowCount;
     outView.userDictBuf = reinterpret_cast<const uint16_t*>(wireBuffer + header->userDictOffsetBytes);
     outView.userDictUnits = header->userDictUtf16Units;
     outView.indexEntries = indexTable;

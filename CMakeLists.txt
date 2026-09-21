@@ -350,6 +350,8 @@ set(NEXTKEY_CORE_SOURCES
     src/core/config/LexiconValidation.cpp
     src/core/ipc/LexiconWireFormat.h
     src/core/ipc/LexiconWireFormat.cpp
+    src/core/ipc/LexiconWireManager.h
+    src/core/ipc/LexiconWireManager.cpp
 )
 
 # Windows-only sources (require Windows.h)
@@ -879,6 +881,7 @@ set(NEXTKEY_TEST_SOURCES
     tests/LexiconTransactionTest.cpp
     tests/LexiconValidationTest.cpp
     tests/LexiconWireFormatTest.cpp
+    tests/LexiconWireManagerTest.cpp
     tests/MainThreadWorkerTests.cpp
     tests/AdaptiveTickTest.cpp
     tests/AdaptiveTickBenchmark.cpp

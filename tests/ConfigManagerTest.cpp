@@ -721,5 +721,42 @@ spell_exclusions = [ "old" ]
     EXPECT_NE(formatted.find("\xc4\x91c\xc4\x91t"), std::string::npos);
 }
 
+TEST_F(ConfigManagerTest, FormatConfigTomlForLexicon_WithWireGeneration) {
+    WriteTestConfig(R"(
+[input]
+method = "telex"
+
+[features]
+spell_suggest = false
+)");
+
+    std::vector<std::wstring> exclusions = { L"msword" };
+    std::string formatted = ConfigManager::FormatConfigTomlForLexicon(testConfigPath_, true, exclusions, 12345ULL);
+    EXPECT_FALSE(formatted.empty());
+
+    EXPECT_NE(formatted.find("spell_suggest = true"), std::string::npos);
+    EXPECT_NE(formatted.find("[internal]"), std::string::npos);
+    EXPECT_NE(formatted.find("wire_generation = 12345"), std::string::npos);
+}
+
+TEST_F(ConfigManagerTest, LoadAndSaveWireGeneration) {
+    // Missing file or missing [internal] returns default generation 1
+    EXPECT_EQ(ConfigManager::LoadWireGeneration(testConfigPath_), 1ULL);
+
+    WriteTestConfig(R"(
+[input]
+method = "telex"
+
+[internal]
+wire_generation = 9876543210
+)");
+
+    EXPECT_EQ(ConfigManager::LoadWireGeneration(testConfigPath_), 9876543210ULL);
+
+    // Save updated generation
+    ASSERT_TRUE(ConfigManager::SaveWireGeneration(testConfigPath_, 9876543211ULL));
+    EXPECT_EQ(ConfigManager::LoadWireGeneration(testConfigPath_), 9876543211ULL);
+}
+
 }  // namespace
 }  // namespace NextKey

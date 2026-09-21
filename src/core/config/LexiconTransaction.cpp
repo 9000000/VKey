@@ -4,6 +4,7 @@
 #include "LexiconTransaction.h"
 #include "LexiconValidation.h"
 #include "core/engine/RustInputEngine.h"
+#include "core/ipc/LexiconWireManager.h"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -206,11 +207,43 @@ bool TransitionJournalState(
 }
 
 LexiconWriter::GenerationPublisher sTestGenerationPublisher = nullptr;
+Wire::LexiconWireManager* sWireManager = nullptr;
+LexiconWriter::WirePublisher sTestWirePublisher = nullptr;
 
 } // namespace
 
 void LexiconWriter::SetTestGenerationPublisher(GenerationPublisher publisher) {
     sTestGenerationPublisher = std::move(publisher);
+}
+
+void LexiconWriter::SetTestWirePublisher(WirePublisher publisher) {
+    sTestWirePublisher = std::move(publisher);
+}
+
+void LexiconWriter::SetWireManager(Wire::LexiconWireManager* manager) noexcept {
+    sWireManager = manager;
+}
+
+Wire::LexiconWireManager* LexiconWriter::GetWireManager() noexcept {
+    return sWireManager;
+}
+
+bool LexiconWriter::PublishWireMapping(
+    const std::vector<std::wstring>& spellExclusions,
+    const std::vector<std::wstring>& userDictionary,
+    uint64_t generation,
+    bool spellSuggestEnabled,
+    std::string* outError) {
+    if (sTestWirePublisher) {
+        return sTestWirePublisher(spellExclusions, userDictionary, generation, spellSuggestEnabled, outError);
+    }
+    if (sWireManager && sWireManager->IsWritable()) {
+        return sWireManager->Publish(spellExclusions, userDictionary, generation, spellSuggestEnabled, outError);
+    }
+    if (outError) {
+        *outError = "Wire mapping manager is not configured or not writable";
+    }
+    return false;
 }
 
 bool LexiconWriter::PublishGeneration(uint8_t newGeneration) {

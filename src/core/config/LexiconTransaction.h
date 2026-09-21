@@ -103,17 +103,43 @@ public:
         std::vector<std::wstring>& outWords);
 };
 
+namespace Wire {
+class LexiconWireManager;
+}
+
 /// Durable 4-state transaction writer for paired config.toml and user_dictionary.txt.
 class LexiconWriter {
 public:
     using GenerationPublisher = std::function<bool(uint8_t)>;
+    using WirePublisher = std::function<bool(
+        const std::vector<std::wstring>& /* spellExclusions */,
+        const std::vector<std::wstring>& /* userDictionary */,
+        uint64_t /* generation */,
+        bool /* spellSuggestEnabled */,
+        std::string* /* outError */)>;
 
     /// Hook to override generation publishing in tests. Set to nullptr to restore default.
     static void SetTestGenerationPublisher(GenerationPublisher publisher);
 
+    /// Hook to override wire mapping publishing in tests. Set to nullptr to restore default.
+    static void SetTestWirePublisher(WirePublisher publisher);
+
+    /// Set process-wide wire manager (called by Core process on startup).
+    static void SetWireManager(Wire::LexiconWireManager* manager) noexcept;
+    [[nodiscard]] static Wire::LexiconWireManager* GetWireManager() noexcept;
+
     /// Publish generation to SharedState (using OpenReadWrite on Windows).
     /// Returns true if published and verified, false otherwise.
     [[nodiscard]] static bool PublishGeneration(uint8_t newGeneration);
+
+    /// Publish lexicon snapshot to the shared memory wire mapping (Local\VKeyLexiconWireMapping).
+    /// Uses LexiconWireManager to write through Seqlock with AppContainer accessibility.
+    [[nodiscard]] static bool PublishWireMapping(
+        const std::vector<std::wstring>& spellExclusions,
+        const std::vector<std::wstring>& userDictionary,
+        uint64_t generation,
+        bool spellSuggestEnabled,
+        std::string* outError = nullptr);
 
     /// Execute a paired transaction writing both config.toml and user_dictionary.txt.
     /// Prepares temp files, creates backups, writes durable journal (PREPARED),

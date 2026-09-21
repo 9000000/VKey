@@ -160,11 +160,19 @@ public:
     /// Export custom keymap to a standalone .keymap (TOML) file
     [[nodiscard]] static bool ExportCustomKeyMap(const std::wstring& path, const TypingConfig& config);
 
-    /// Format a complete TOML configuration string with updated spellSuggest and spellExclusions.
+    /// Format a complete TOML configuration string with updated spellSuggest, spellExclusions,
+    /// and optional persistent wireGeneration in [internal].
     [[nodiscard]] static std::string FormatConfigTomlForLexicon(
         const std::wstring& configPath,
         bool spellSuggestEnabled,
-        const std::vector<std::wstring>& spellExclusions);
+        const std::vector<std::wstring>& spellExclusions,
+        uint64_t wireGeneration = 0);
+
+    /// Load 64-bit monotonic wire generation from [internal].wire_generation (defaults to 1).
+    [[nodiscard]] static uint64_t LoadWireGeneration(const std::wstring& path);
+
+    /// Save 64-bit monotonic wire generation to [internal].wire_generation.
+    [[nodiscard]] static bool SaveWireGeneration(const std::wstring& path, uint64_t generation);
 
     /// `%APPDATA%\VKey` (creates the directory if missing). Falls back to "."
     /// when SHGetFolderPathW fails. Public because runtime callers (HookEngine

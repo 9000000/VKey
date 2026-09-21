@@ -1434,7 +1434,8 @@ bool ConfigManager::ExportCustomKeyMap(const std::wstring& path, const TypingCon
 std::string ConfigManager::FormatConfigTomlForLexicon(
     const std::wstring& configPath,
     bool spellSuggestEnabled,
-    const std::vector<std::wstring>& spellExclusions) {
+    const std::vector<std::wstring>& spellExclusions,
+    uint64_t wireGeneration) {
     try {
         std::string utf8Path = WideToUtf8(configPath);
         auto tbl = LoadExistingToml(utf8Path);
@@ -1454,11 +1455,54 @@ std::string ConfigManager::FormatConfigTomlForLexicon(
             tbl.insert_or_assign("features", std::move(newFeatures));
         }
 
+        if (wireGeneration > 0) {
+            if (auto* internalTbl = tbl["internal"].as_table()) {
+                internalTbl->insert_or_assign("wire_generation", static_cast<int64_t>(wireGeneration));
+            } else {
+                toml::table newInternal;
+                newInternal.insert_or_assign("wire_generation", static_cast<int64_t>(wireGeneration));
+                tbl.insert_or_assign("internal", std::move(newInternal));
+            }
+        }
+
         std::stringstream ss;
         ss << tbl;
         return ss.str();
     } catch (...) {
         return "";
+    }
+}
+
+uint64_t ConfigManager::LoadWireGeneration(const std::wstring& path) {
+    try {
+        std::string utf8Path = WideToUtf8(path);
+        auto tbl = LoadExistingToml(utf8Path);
+        if (auto* internalTbl = tbl["internal"].as_table()) {
+            if (auto* genVal = (*internalTbl)["wire_generation"].as_integer()) {
+                if (genVal->get() > 0) {
+                    return static_cast<uint64_t>(genVal->get());
+                }
+            }
+        }
+    } catch (...) {}
+    return 1;
+}
+
+bool ConfigManager::SaveWireGeneration(const std::wstring& path, uint64_t generation) {
+    try {
+        ConfigFileLock lock;
+        std::string utf8Path = WideToUtf8(path);
+        auto tbl = LoadExistingToml(utf8Path);
+        if (auto* internalTbl = tbl["internal"].as_table()) {
+            internalTbl->insert_or_assign("wire_generation", static_cast<int64_t>(generation));
+        } else {
+            toml::table newInternal;
+            newInternal.insert_or_assign("wire_generation", static_cast<int64_t>(generation));
+            tbl.insert_or_assign("internal", std::move(newInternal));
+        }
+        return WriteToml(utf8Path, tbl);
+    } catch (...) {
+        return false;
     }
 }
 

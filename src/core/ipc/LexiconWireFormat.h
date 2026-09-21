@@ -272,6 +272,7 @@ struct LexiconWireView {
     const LexiconWireHeader* header = nullptr;
     const uint16_t* exclusionsBuf = nullptr;
     size_t exclusionsUnits = 0;
+    size_t exclusionsRowCount = 0;
     const uint16_t* userDictBuf = nullptr;
     size_t userDictUnits = 0;
     const DictWordEntryWire* indexEntries = nullptr;
