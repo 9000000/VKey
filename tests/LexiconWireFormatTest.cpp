@@ -237,7 +237,14 @@ TEST(LexiconWireFormatTest, CapacityLimitsAndValidationFailures) {
     EXPECT_FALSE(LexiconWireSerializer::Serialize(
         {}, { longWord }, 1, true, buffer.data(), buffer.size(), &err));
 
-    // 6. Corrupt magic in deserializer
+    // 6. Unpaired surrogate in input
+    LexiconWireSerializeParams badSurrogateParams;
+    badSurrogateParams.userDictionary = { u"valid", std::u16string{u'a', char16_t(0xD800), u'b'} };
+    EXPECT_FALSE(LexiconWireSerializer::Serialize(
+        badSurrogateParams, buffer.data(), buffer.size(), &err));
+    EXPECT_NE(err.find("surrogate"), std::string::npos);
+
+    // 7. Corrupt magic in deserializer
     ASSERT_TRUE(LexiconWireSerializer::Serialize(
         { L"ok" }, { L"word" }, 1, true, buffer.data(), buffer.size()));
     auto* header = reinterpret_cast<LexiconWireHeader*>(buffer.data());
@@ -245,6 +252,17 @@ TEST(LexiconWireFormatTest, CapacityLimitsAndValidationFailures) {
     LexiconWireView view;
     EXPECT_FALSE(LexiconWireDeserializer::ValidateAndInspect(buffer.data(), buffer.size(), view, &err));
     EXPECT_NE(err.find("magic"), std::string::npos);
+
+    // 8. Deserializer detects mismatched scalarCount in index table
+    ASSERT_TRUE(LexiconWireSerializer::Serialize(
+        { L"ok" }, { L"word" }, 1, true, buffer.data(), buffer.size()));
+    auto* indexTable = reinterpret_cast<DictWordEntryWire*>(buffer.data() + USER_DICT_INDEX_OFFSET);
+    indexTable[0].scalarCount = 2; // Corrupt scalarCount (within 1..64 bounds but != actual 4 scalars)
+    // Recalculate CRC so CRC passes and index validation fails
+    header = reinterpret_cast<LexiconWireHeader*>(buffer.data());
+    header->crc32 = ComputeCrc32(buffer.data() + header->payloadOffsetBytes, header->payloadSizeBytes);
+    EXPECT_FALSE(LexiconWireDeserializer::ValidateAndInspect(buffer.data(), buffer.size(), view, &err));
+    EXPECT_NE(err.find("scalarCount"), std::string::npos);
 }
 
 TEST(LexiconWireFormatTest, SeqlockWriterReaderConcurrency) {

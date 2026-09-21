@@ -46,6 +46,17 @@ char32_t DecodeNextScalar(std::u16string_view str, size_t& index) noexcept {
     return static_cast<char32_t>(c1);
 }
 
+bool HasInvalidSurrogates(std::u16string_view str) noexcept {
+    size_t index = 0;
+    while (index < str.size()) {
+        char32_t cp = DecodeNextScalar(str, index);
+        if (cp >= 0xD800 && cp <= 0xDFFF) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 uint32_t ComputeCrc32(const void* data, size_t size) noexcept {
@@ -148,6 +159,10 @@ bool LexiconWireSerializer::Serialize(
         auto* exclDest = reinterpret_cast<char16_t*>(outBuffer + EXCLUSIONS_REGION_OFFSET);
         for (size_t rowIdx = 0; rowIdx < params.spellExclusions.size(); ++rowIdx) {
             const auto& row = params.spellExclusions[rowIdx];
+            if (HasInvalidSurrogates(row)) {
+                if (outError) *outError = "Spell exclusion row contains invalid or unpaired UTF-16 surrogate code point";
+                return false;
+            }
             size_t scalars = CountUnicodeScalars(row);
             if (scalars < MIN_EXCLUSION_SCALARS || scalars > MAX_EXCLUSION_SCALARS) {
                 if (outError) {
@@ -192,6 +207,10 @@ bool LexiconWireSerializer::Serialize(
 
     for (size_t i = 0; i < sortedWords.size(); ++i) {
         const auto& word = sortedWords[i];
+        if (HasInvalidSurrogates(word)) {
+            if (outError) *outError = "User dictionary word contains invalid or unpaired UTF-16 surrogate code point";
+            return false;
+        }
         size_t scalars = CountUnicodeScalars(word);
         if (scalars < MIN_DICT_WORD_SCALARS || scalars > MAX_DICT_WORD_SCALARS) {
             if (outError) *outError = "User dictionary word scalar count must be between 1 and 64";
@@ -353,6 +372,37 @@ bool LexiconWireDeserializer::ValidateAndInspect(
         return false;
     }
 
+    // Validate spell exclusion rows
+    if (header->exclusionsRowCount > 0) {
+        const auto* exclChars = reinterpret_cast<const char16_t*>(wireBuffer + header->exclusionsOffsetBytes);
+        size_t rowStart = 0;
+        size_t parsedRows = 0;
+        for (size_t i = 0; i < header->exclusionsUtf16Units; ++i) {
+            if (exclChars[i] == u'\n') {
+                if (i <= rowStart) {
+                    if (outError) *outError = "Spell exclusions contain empty row";
+                    return false;
+                }
+                std::u16string_view rowView(exclChars + rowStart, i - rowStart);
+                if (HasInvalidSurrogates(rowView)) {
+                    if (outError) *outError = "Spell exclusion row contains invalid or unpaired UTF-16 surrogate code point";
+                    return false;
+                }
+                size_t scalars = CountUnicodeScalars(rowView);
+                if (scalars < MIN_EXCLUSION_SCALARS || scalars > MAX_EXCLUSION_SCALARS) {
+                    if (outError) *outError = "Spell exclusion row scalar count out of allowed bounds (2..128)";
+                    return false;
+                }
+                parsedRows++;
+                rowStart = i + 1;
+            }
+        }
+        if (parsedRows != header->exclusionsRowCount) {
+            if (outError) *outError = "Spell exclusions row count mismatch with actual newline delimiters";
+            return false;
+        }
+    }
+
     // Validate index entries
     const auto* indexTable = reinterpret_cast<const DictWordEntryWire*>(wireBuffer + USER_DICT_INDEX_OFFSET);
     const auto* textPool = reinterpret_cast<const char16_t*>(wireBuffer + USER_DICT_POOL_OFFSET);
@@ -378,6 +428,16 @@ bool LexiconWireDeserializer::ValidateAndInspect(
         }
 
         std::u16string_view currentWord(textPool + entry.offsetUnits, entry.lengthUtf16Units);
+        if (HasInvalidSurrogates(currentWord)) {
+            if (outError) *outError = "User dictionary word contains invalid or unpaired UTF-16 surrogate code point";
+            return false;
+        }
+        size_t actualScalars = CountUnicodeScalars(currentWord);
+        if (actualScalars != entry.scalarCount) {
+            if (outError) *outError = "Index entry scalarCount does not match actual decoded Unicode scalars in word";
+            return false;
+        }
+
         if (i > 0) {
             if (CompareUtf16ByUnicodeScalar(prevWord, currentWord) >= 0) {
                 if (outError) *outError = "User dictionary index entries not strictly monotonically sorted";

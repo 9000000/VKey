@@ -129,7 +129,7 @@ inline uint32_t SeqlockBeginWrite(volatile uint32_t& seqlock) noexcept {
     MemoryBarrier();
     return seq;
 #else
-    auto& ref = reinterpret_cast<std::atomic<uint32_t>&>(const_cast<uint32_t&>(seqlock));
+    std::atomic_ref<uint32_t> ref(const_cast<uint32_t&>(seqlock));
     uint32_t seq = ref.fetch_add(1, std::memory_order_acq_rel) + 1;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     return seq;
@@ -142,7 +142,7 @@ inline void SeqlockEndWrite(volatile uint32_t& seqlock) noexcept {
     ::InterlockedIncrement(reinterpret_cast<volatile LONG*>(&seqlock));
 #else
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    auto& ref = reinterpret_cast<std::atomic<uint32_t>&>(const_cast<uint32_t&>(seqlock));
+    std::atomic_ref<uint32_t> ref(const_cast<uint32_t&>(seqlock));
     ref.fetch_add(1, std::memory_order_acq_rel);
 #endif
 }
@@ -154,7 +154,7 @@ inline uint32_t SeqlockBeginRead(const volatile uint32_t& seqlock) noexcept {
     MemoryBarrier();
     return seq;
 #else
-    auto& ref = reinterpret_cast<const std::atomic<uint32_t>&>(const_cast<const uint32_t&>(seqlock));
+    std::atomic_ref<uint32_t> ref(const_cast<uint32_t&>(seqlock));
     uint32_t seq = ref.load(std::memory_order_acquire);
     std::atomic_thread_fence(std::memory_order_acquire);
     return seq;
@@ -169,7 +169,7 @@ inline bool SeqlockValidateRead(const volatile uint32_t& seqlock, uint32_t start
     return (startSeq == currentSeq) && !(startSeq & 1);
 #else
     std::atomic_thread_fence(std::memory_order_acquire);
-    auto& ref = reinterpret_cast<const std::atomic<uint32_t>&>(const_cast<const uint32_t&>(seqlock));
+    std::atomic_ref<uint32_t> ref(const_cast<uint32_t&>(seqlock));
     uint32_t currentSeq = ref.load(std::memory_order_acquire);
     return (startSeq == currentSeq) && !(startSeq & 1);
 #endif
