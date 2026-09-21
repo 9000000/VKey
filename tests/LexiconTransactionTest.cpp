@@ -56,10 +56,15 @@ TEST_F(LexiconTransactionTest, JournalSerializationAndDeserialization) {
     record.newConfigHash = "fedcba9876543210";
     record.oldDictHash = "";
     record.newDictHash = "aabbccddeeff0011";
+    record.configBakPath = "/tmp/test/config.toml.bak";
+    record.dictBakPath = "/tmp/test/user_dictionary.txt.bak";
+    record.configTmpPath = "/tmp/test/config.toml.tmp";
+    record.dictTmpPath = "/tmp/test/user_dictionary.txt.tmp";
 
     const std::string serialized = record.Serialize();
     EXPECT_NE(serialized.find("VKEY_LEXICON_JOURNAL_V1"), std::string::npos);
     EXPECT_NE(serialized.find("state=PREPARED"), std::string::npos);
+    EXPECT_NE(serialized.find("config_bak_path=/tmp/test/config.toml.bak"), std::string::npos);
 
     LexiconJournalRecord deserialized;
     ASSERT_TRUE(LexiconJournalRecord::Deserialize(serialized, deserialized));
@@ -72,6 +77,10 @@ TEST_F(LexiconTransactionTest, JournalSerializationAndDeserialization) {
     EXPECT_EQ(deserialized.newConfigHash, "fedcba9876543210");
     EXPECT_EQ(deserialized.oldDictHash, "");
     EXPECT_EQ(deserialized.newDictHash, "aabbccddeeff0011");
+    EXPECT_EQ(deserialized.configBakPath, "/tmp/test/config.toml.bak");
+    EXPECT_EQ(deserialized.dictBakPath, "/tmp/test/user_dictionary.txt.bak");
+    EXPECT_EQ(deserialized.configTmpPath, "/tmp/test/config.toml.tmp");
+    EXPECT_EQ(deserialized.dictTmpPath, "/tmp/test/user_dictionary.txt.tmp");
 }
 
 TEST_F(LexiconTransactionTest, LexiconSyncLockBasicAcquisition) {
@@ -182,6 +191,8 @@ TEST_F(LexiconTransactionTest, CrashRecoveryAtFilesReplacedRollsForward) {
     record.dictExistedBefore = true;
     record.oldGeneration = 1;
     record.newGeneration = 2;
+    record.newConfigHash = LexiconJournalRecord::ComputeHash("new replaced config");
+    record.newDictHash = LexiconJournalRecord::ComputeHash("new replaced dict");
 
     const auto journalPath = testDir_ / "lexicon_txn.journal";
     WriteFile(journalPath, record.Serialize());
@@ -246,6 +257,179 @@ TEST_F(LexiconTransactionTest, CommitTransaction_ConvenienceOverload) {
     EXPECT_TRUE(LexiconWriter::CommitTransaction(configPath_.wstring(), newToml, newDict, false));
     EXPECT_EQ(ReadFile(configPath_), newToml);
     EXPECT_EQ(ReadFile(dictPath_), newDict);
+}
+
+TEST_F(LexiconTransactionTest, PublishGenerationFailure_RollsBackFilesAndFailsTransaction) {
+    WriteFile(configPath_, "pristine config");
+    WriteFile(dictPath_, "pristine dict");
+
+    LexiconWriter::SetTestGenerationPublisher([](uint8_t) {
+        return false; // Simulate failure to open/write shared state
+    });
+
+    const std::string newToml = "[features]\nspell_suggest = true\n";
+    const std::string newDict = "new dict\n";
+
+    bool success = LexiconWriter::CommitTransaction(
+        configPath_.wstring(),
+        newToml,
+        newDict,
+        1,
+        2,
+        true);
+
+    EXPECT_FALSE(success);
+
+    // Verify rollback: disk still has pristine old content
+    EXPECT_EQ(ReadFile(configPath_), "pristine config");
+    EXPECT_EQ(ReadFile(dictPath_), "pristine dict");
+
+    // All artifacts cleaned
+    EXPECT_FALSE(std::filesystem::exists(testDir_ / "lexicon_txn.journal"));
+    EXPECT_FALSE(std::filesystem::exists(testDir_ / "lexicon_txn.journal.tmp"));
+    EXPECT_FALSE(std::filesystem::exists(testDir_ / "config.toml.bak"));
+    EXPECT_FALSE(std::filesystem::exists(testDir_ / "user_dictionary.txt.bak"));
+
+    LexiconWriter::SetTestGenerationPublisher(nullptr);
+}
+
+TEST_F(LexiconTransactionTest, CorruptedJournal_FailsRecoveryAndReaderFailsStale) {
+    WriteFile(configPath_, "good config");
+    WriteFile(dictPath_, "; comment\nvalidword\n");
+
+    const auto journalPath = testDir_ / "lexicon_txn.journal";
+    WriteFile(journalPath, "CORRUPT_HEADER_NOT_VKEY\ngarbage=123\n");
+
+    // Recovery must fail
+    EXPECT_FALSE(LexiconRecovery::RecoverIfNeeded(configPath_));
+
+    // Must be quarantined to .corrupt
+    EXPECT_TRUE(std::filesystem::exists(testDir_ / "lexicon_txn.journal.corrupt"));
+
+    // Reader must fail-stale
+    std::shared_ptr<const RustUserDictionarySnapshot> snapshot;
+    EXPECT_FALSE(LexiconReader::LoadUserDictionaryLocked(configPath_.wstring(), snapshot));
+
+    std::vector<std::wstring> words;
+    EXPECT_FALSE(LexiconReader::LoadUserDictionaryWordsLocked(configPath_.wstring(), words));
+
+    // CleanStaleArtifacts cleans the .corrupt file
+    LexiconRecovery::CleanStaleArtifacts(configPath_);
+    EXPECT_FALSE(std::filesystem::exists(testDir_ / "lexicon_txn.journal.corrupt"));
+}
+
+TEST_F(LexiconTransactionTest, FilesReplaced_HashMismatchRollsBackToBackup) {
+    // Original files backed up
+    const auto configBak = testDir_ / "config.toml.bak";
+    const auto dictBak = testDir_ / "user_dictionary.txt.bak";
+    WriteFile(configBak, "original config");
+    WriteFile(dictBak, "original dict");
+
+    // Replaced files on disk are torn/corrupted
+    WriteFile(configPath_, "corrupted half-written config");
+    WriteFile(dictPath_, "corrupted half-written dict");
+
+    LexiconJournalRecord record;
+    record.state = LexiconJournalState::FilesReplaced;
+    record.configExistedBefore = true;
+    record.dictExistedBefore = true;
+    record.oldGeneration = 1;
+    record.newGeneration = 2;
+    record.newConfigHash = LexiconJournalRecord::ComputeHash("intact new config");
+    record.newDictHash = LexiconJournalRecord::ComputeHash("intact new dict");
+
+    const auto journalPath = testDir_ / "lexicon_txn.journal";
+    WriteFile(journalPath, record.Serialize());
+
+    // RecoverIfNeeded detects hash mismatch and rolls back
+    ASSERT_TRUE(LexiconRecovery::RecoverIfNeeded(configPath_));
+
+    // Rolled back to original files
+    EXPECT_EQ(ReadFile(configPath_), "original config");
+    EXPECT_EQ(ReadFile(dictPath_), "original dict");
+
+    EXPECT_FALSE(std::filesystem::exists(journalPath));
+    EXPECT_FALSE(std::filesystem::exists(configBak));
+    EXPECT_FALSE(std::filesystem::exists(dictBak));
+}
+
+TEST_F(LexiconTransactionTest, RecoveryAtGenerationPublished_CleansBackupsAndCommits) {
+    WriteFile(configPath_, "published new config");
+    WriteFile(dictPath_, "published new dict");
+
+    const auto configBak = testDir_ / "config.toml.bak";
+    const auto dictBak = testDir_ / "user_dictionary.txt.bak";
+    WriteFile(configBak, "old config");
+    WriteFile(dictBak, "old dict");
+
+    LexiconJournalRecord record;
+    record.state = LexiconJournalState::GenerationPublished;
+    record.configExistedBefore = true;
+    record.dictExistedBefore = true;
+    record.oldGeneration = 1;
+    record.newGeneration = 2;
+
+    const auto journalPath = testDir_ / "lexicon_txn.journal";
+    WriteFile(journalPath, record.Serialize());
+
+    ASSERT_TRUE(LexiconRecovery::RecoverIfNeeded(configPath_));
+
+    EXPECT_EQ(ReadFile(configPath_), "published new config");
+    EXPECT_EQ(ReadFile(dictPath_), "published new dict");
+    EXPECT_FALSE(std::filesystem::exists(journalPath));
+    EXPECT_FALSE(std::filesystem::exists(configBak));
+    EXPECT_FALSE(std::filesystem::exists(dictBak));
+}
+
+TEST_F(LexiconTransactionTest, RecoveryAtCommitted_CleansRemainingJournal) {
+    WriteFile(configPath_, "committed config");
+    WriteFile(dictPath_, "committed dict");
+
+    LexiconJournalRecord record;
+    record.state = LexiconJournalState::Committed;
+    record.configExistedBefore = true;
+    record.dictExistedBefore = true;
+
+    const auto journalPath = testDir_ / "lexicon_txn.journal";
+    WriteFile(journalPath, record.Serialize());
+
+    ASSERT_TRUE(LexiconRecovery::RecoverIfNeeded(configPath_));
+
+    EXPECT_EQ(ReadFile(configPath_), "committed config");
+    EXPECT_EQ(ReadFile(dictPath_), "committed dict");
+    EXPECT_FALSE(std::filesystem::exists(journalPath));
+}
+
+TEST_F(LexiconTransactionTest, CrashRecoveryAtPrepared_DestinationAlreadyExists_OverwritesAtomically) {
+    // Both destination files already exist on disk (partially written/modified during crash)
+    WriteFile(configPath_, "corrupted half-written config");
+    WriteFile(dictPath_, "corrupted half-written dict");
+
+    const auto configBak = testDir_ / "config.toml.bak";
+    const auto dictBak = testDir_ / "user_dictionary.txt.bak";
+    WriteFile(configBak, "pristine old config");
+    WriteFile(dictBak, "pristine old dict");
+
+    LexiconJournalRecord record;
+    record.state = LexiconJournalState::Prepared;
+    record.configExistedBefore = true;
+    record.dictExistedBefore = true;
+    record.oldGeneration = 1;
+    record.newGeneration = 2;
+    record.configBakPath = configBak.string();
+    record.dictBakPath = dictBak.string();
+
+    const auto journalPath = testDir_ / "lexicon_txn.journal";
+    WriteFile(journalPath, record.Serialize());
+
+    ASSERT_TRUE(LexiconRecovery::RecoverIfNeeded(configPath_));
+
+    // Must successfully overwrite existing files with pristine backups
+    EXPECT_EQ(ReadFile(configPath_), "pristine old config");
+    EXPECT_EQ(ReadFile(dictPath_), "pristine old dict");
+    EXPECT_FALSE(std::filesystem::exists(journalPath));
+    EXPECT_FALSE(std::filesystem::exists(configBak));
+    EXPECT_FALSE(std::filesystem::exists(dictBak));
 }
 
 } // namespace NextKey

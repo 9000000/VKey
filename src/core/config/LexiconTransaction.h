@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -36,11 +37,12 @@ struct LexiconJournalRecord {
     std::string newConfigHash;
     std::string oldDictHash;
     std::string newDictHash;
-    std::wstring configBakPath;
-    std::wstring dictBakPath;
-    std::wstring configTmpPath;
-    std::wstring dictTmpPath;
+    std::string configBakPath;
+    std::string dictBakPath;
+    std::string configTmpPath;
+    std::string dictTmpPath;
 
+    [[nodiscard]] static std::string ComputeHash(std::string_view data);
     [[nodiscard]] std::string Serialize() const;
     static bool Deserialize(std::string_view text, LexiconJournalRecord& outRecord);
 };
@@ -104,6 +106,11 @@ public:
 /// Durable 4-state transaction writer for paired config.toml and user_dictionary.txt.
 class LexiconWriter {
 public:
+    using GenerationPublisher = std::function<bool(uint8_t)>;
+
+    /// Hook to override generation publishing in tests. Set to nullptr to restore default.
+    static void SetTestGenerationPublisher(GenerationPublisher publisher);
+
     /// Execute a paired transaction writing both config.toml and user_dictionary.txt.
     /// Prepares temp files, creates backups, writes durable journal (PREPARED),
     /// replaces files (FILES_REPLACED), bumps generation (GENERATION_PUBLISHED),

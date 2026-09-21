@@ -26,9 +26,7 @@
 
 namespace NextKey {
 
-namespace {
-
-std::string ComputeFnv1aHex(std::string_view data) {
+std::string LexiconJournalRecord::ComputeHash(std::string_view data) {
     uint64_t hash = 14695981039346656037ull;
     for (char c : data) {
         hash ^= static_cast<uint8_t>(c);
@@ -37,6 +35,12 @@ std::string ComputeFnv1aHex(std::string_view data) {
     char buf[17];
     std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(hash));
     return std::string(buf);
+}
+
+namespace {
+
+std::string ComputeFnv1aHex(std::string_view data) {
+    return LexiconJournalRecord::ComputeHash(data);
 }
 
 std::string ReadFileBytes(const std::filesystem::path& path) {
@@ -138,7 +142,43 @@ std::filesystem::path GetJournalTmpPath(const std::filesystem::path& configPath)
     return configPath.parent_path() / "lexicon_txn.journal.tmp";
 }
 
+std::string PathToUtf8String(const std::filesystem::path& p) {
+    auto u8 = p.u8string();
+    return std::string(reinterpret_cast<const char*>(u8.data()), u8.size());
+}
+
+std::filesystem::path Utf8StringToPath(std::string_view utf8Str) {
+    std::u8string u8(reinterpret_cast<const char8_t*>(utf8Str.data()), utf8Str.size());
+    return std::filesystem::path(u8);
+}
+
+void RollbackToBackup(
+    const LexiconJournalRecord& record,
+    const std::filesystem::path& configPath,
+    const std::filesystem::path& dictPath,
+    const std::filesystem::path& configBak,
+    const std::filesystem::path& dictBak) {
+    std::error_code ec;
+    if (record.configExistedBefore && std::filesystem::exists(configBak, ec)) {
+        DurableAtomicRename(configBak, configPath);
+    } else if (!record.configExistedBefore) {
+        std::filesystem::remove(configPath, ec);
+    }
+
+    if (record.dictExistedBefore && std::filesystem::exists(dictBak, ec)) {
+        DurableAtomicRename(dictBak, dictPath);
+    } else if (!record.dictExistedBefore) {
+        std::filesystem::remove(dictPath, ec);
+    }
+}
+
+LexiconWriter::GenerationPublisher sTestGenerationPublisher = nullptr;
+
 } // namespace
+
+void LexiconWriter::SetTestGenerationPublisher(GenerationPublisher publisher) {
+    sTestGenerationPublisher = std::move(publisher);
+}
 
 // ─── LexiconJournalRecord Serialization ─────────────────────────────────────
 
@@ -161,6 +201,10 @@ std::string LexiconJournalRecord::Serialize() const {
     ss << "new_config_hash=" << newConfigHash << "\n";
     ss << "old_dict_hash=" << oldDictHash << "\n";
     ss << "new_dict_hash=" << newDictHash << "\n";
+    ss << "config_bak_path=" << configBakPath << "\n";
+    ss << "dict_bak_path=" << dictBakPath << "\n";
+    ss << "config_tmp_path=" << configTmpPath << "\n";
+    ss << "dict_tmp_path=" << dictTmpPath << "\n";
     return ss.str();
 }
 
@@ -204,6 +248,14 @@ bool LexiconJournalRecord::Deserialize(std::string_view text, LexiconJournalReco
             outRecord.oldDictHash = val;
         } else if (key == "new_dict_hash") {
             outRecord.newDictHash = val;
+        } else if (key == "config_bak_path") {
+            outRecord.configBakPath = val;
+        } else if (key == "dict_bak_path") {
+            outRecord.dictBakPath = val;
+        } else if (key == "config_tmp_path") {
+            outRecord.configTmpPath = val;
+        } else if (key == "dict_tmp_path") {
+            outRecord.dictTmpPath = val;
         }
     }
     return outRecord.state != LexiconJournalState::Unknown;
@@ -297,7 +349,14 @@ void LexiconSyncLock::Unlock() noexcept {
 
 bool LexiconRecovery::RecoverIfNeeded(const std::filesystem::path& configPath) {
     const auto journalPath = GetJournalPath(configPath);
+    const auto corruptPath = configPath.parent_path() / "lexicon_txn.journal.corrupt";
     std::error_code ec;
+
+    if (std::filesystem::exists(corruptPath, ec)) {
+        // A previously quarantined corrupt journal exists: fail recovery (fail-stale policy)
+        return false;
+    }
+
     if (!std::filesystem::exists(journalPath, ec)) {
         return true;
     }
@@ -305,32 +364,33 @@ bool LexiconRecovery::RecoverIfNeeded(const std::filesystem::path& configPath) {
     const std::string journalText = ReadFileBytes(journalPath);
     LexiconJournalRecord record;
     if (!LexiconJournalRecord::Deserialize(journalText, record)) {
-        // Corrupt journal: clean it up to prevent permanent blockage
-        std::filesystem::remove(journalPath, ec);
+        // Corrupt journal: quarantine to .corrupt so forensics can inspect, and fail recovery (fail-stale policy)
+        std::filesystem::rename(journalPath, corruptPath, ec);
+        if (ec) {
+            std::filesystem::remove(journalPath, ec);
+        }
         return false;
     }
 
-    const auto configBak = configPath.parent_path() / (configPath.filename().string() + ".bak");
+    const auto configBak = record.configBakPath.empty()
+        ? configPath.parent_path() / (configPath.filename().string() + ".bak")
+        : Utf8StringToPath(record.configBakPath);
     const auto dictPath = configPath.parent_path() / "user_dictionary.txt";
-    const auto dictBak = configPath.parent_path() / "user_dictionary.txt.bak";
-    const auto configTmp = configPath.parent_path() / (configPath.filename().string() + ".tmp");
-    const auto dictTmp = configPath.parent_path() / "user_dictionary.txt.tmp";
+    const auto dictBak = record.dictBakPath.empty()
+        ? configPath.parent_path() / "user_dictionary.txt.bak"
+        : Utf8StringToPath(record.dictBakPath);
+    const auto configTmp = record.configTmpPath.empty()
+        ? configPath.parent_path() / (configPath.filename().string() + ".tmp")
+        : Utf8StringToPath(record.configTmpPath);
+    const auto dictTmp = record.dictTmpPath.empty()
+        ? configPath.parent_path() / "user_dictionary.txt.tmp"
+        : Utf8StringToPath(record.dictTmpPath);
 
     switch (record.state) {
         case LexiconJournalState::Prepared: {
             // Crash occurred before or during file replacement.
-            // Rollback: restore previous files from .bak if they existed, clean .tmp and .bak
-            if (record.configExistedBefore && std::filesystem::exists(configBak, ec)) {
-                std::filesystem::rename(configBak, configPath, ec);
-            } else if (!record.configExistedBefore) {
-                std::filesystem::remove(configPath, ec);
-            }
-
-            if (record.dictExistedBefore && std::filesystem::exists(dictBak, ec)) {
-                std::filesystem::rename(dictBak, dictPath, ec);
-            } else if (!record.dictExistedBefore) {
-                std::filesystem::remove(dictPath, ec);
-            }
+            // Rollback to original files.
+            RollbackToBackup(record, configPath, dictPath, configBak, dictBak);
 
             std::filesystem::remove(configTmp, ec);
             std::filesystem::remove(dictTmp, ec);
@@ -341,8 +401,23 @@ bool LexiconRecovery::RecoverIfNeeded(const std::filesystem::path& configPath) {
         }
 
         case LexiconJournalState::FilesReplaced: {
-            // Both files are safely on disk.
-            // Roll-forward: verify checksums if possible, publish new generation
+            // Both files were replaced on disk before crash.
+            // MUST verify checksums of the replaced files.
+            const std::string curConfigHash = ComputeFnv1aHex(ReadFileBytes(configPath));
+            const std::string curDictHash = ComputeFnv1aHex(ReadFileBytes(dictPath));
+
+            if (curConfigHash != record.newConfigHash || curDictHash != record.newDictHash) {
+                // Hash mismatch! Files on disk are corrupted or incomplete. Rollback to backup!
+                RollbackToBackup(record, configPath, dictPath, configBak, dictBak);
+                std::filesystem::remove(configTmp, ec);
+                std::filesystem::remove(dictTmp, ec);
+                std::filesystem::remove(configBak, ec);
+                std::filesystem::remove(dictBak, ec);
+                std::filesystem::remove(journalPath, ec);
+                break;
+            }
+
+            // Hashes verified: roll-forward
 #if defined(_WIN32)
             SharedStateManager sm;
             if (sm.Open()) {
@@ -355,11 +430,31 @@ bool LexiconRecovery::RecoverIfNeeded(const std::filesystem::path& configPath) {
             std::filesystem::remove(dictTmp, ec);
             std::filesystem::remove(configBak, ec);
             std::filesystem::remove(dictBak, ec);
+
+            // Transition to COMMITTED before final journal deletion
+            record.state = LexiconJournalState::Committed;
+            const auto journalTmp = GetJournalTmpPath(configPath);
+            (void)DurableWrite(journalTmp, record.Serialize());
+            (void)DurableAtomicRename(journalTmp, journalPath);
             std::filesystem::remove(journalPath, ec);
             break;
         }
 
-        case LexiconJournalState::GenerationPublished:
+        case LexiconJournalState::GenerationPublished: {
+            std::filesystem::remove(configTmp, ec);
+            std::filesystem::remove(dictTmp, ec);
+            std::filesystem::remove(configBak, ec);
+            std::filesystem::remove(dictBak, ec);
+
+            // Transition to COMMITTED before final journal deletion
+            record.state = LexiconJournalState::Committed;
+            const auto journalTmp = GetJournalTmpPath(configPath);
+            (void)DurableWrite(journalTmp, record.Serialize());
+            (void)DurableAtomicRename(journalTmp, journalPath);
+            std::filesystem::remove(journalPath, ec);
+            break;
+        }
+
         case LexiconJournalState::Committed: {
             // Clean up left-over artifacts
             std::filesystem::remove(configTmp, ec);
@@ -381,6 +476,7 @@ void LexiconRecovery::CleanStaleArtifacts(const std::filesystem::path& configPat
     std::error_code ec;
     std::filesystem::remove(GetJournalPath(configPath), ec);
     std::filesystem::remove(GetJournalTmpPath(configPath), ec);
+    std::filesystem::remove(configPath.parent_path() / "lexicon_txn.journal.corrupt", ec);
     std::filesystem::remove(configPath.parent_path() / (configPath.filename().string() + ".tmp"), ec);
     std::filesystem::remove(configPath.parent_path() / (configPath.filename().string() + ".bak"), ec);
     std::filesystem::remove(configPath.parent_path() / "user_dictionary.txt.tmp", ec);
@@ -398,8 +494,11 @@ bool LexiconReader::LoadUserDictionaryLocked(
         return false;
     }
 
-    // Recover any unfinished transaction before reading
-    LexiconRecovery::RecoverIfNeeded(configPath);
+    // Recover any unfinished transaction before reading.
+    // If recovery fails (e.g. corrupt journal or unrecoverable state), FAIL-STALE!
+    if (!LexiconRecovery::RecoverIfNeeded(configPath)) {
+        return false;
+    }
 
     auto result = RustInputEngine::LoadUserDictionary(configPath);
     if (result.Succeeded()) {
@@ -418,7 +517,9 @@ bool LexiconReader::LoadUserDictionaryWordsLocked(
     }
 
     const std::filesystem::path configPath(configPathStr);
-    LexiconRecovery::RecoverIfNeeded(configPath);
+    if (!LexiconRecovery::RecoverIfNeeded(configPath)) {
+        return false;
+    }
 
     const std::filesystem::path dictPath = configPath.parent_path() / "user_dictionary.txt";
     std::error_code ec;
@@ -461,8 +562,11 @@ bool LexiconWriter::CommitTransaction(
     const std::filesystem::path journalPath = GetJournalPath(configPath);
     const std::filesystem::path journalTmp = GetJournalTmpPath(configPath);
 
-    // Run recovery on any previous dead transaction first
-    LexiconRecovery::RecoverIfNeeded(configPath);
+    // Run recovery on any previous dead transaction first.
+    // If previous transaction failed recovery (e.g. corrupt journal), abort safely.
+    if (!LexiconRecovery::RecoverIfNeeded(configPath)) {
+        return false;
+    }
 
     std::error_code ec;
     bool configExisted = std::filesystem::exists(configPath, ec);
@@ -497,6 +601,10 @@ bool LexiconWriter::CommitTransaction(
     record.newDictHash = ComputeFnv1aHex(newUserDictText);
     if (configExisted) record.oldConfigHash = ComputeFnv1aHex(ReadFileBytes(configPath));
     if (dictExisted) record.oldDictHash = ComputeFnv1aHex(ReadFileBytes(dictPath));
+    record.configBakPath = PathToUtf8String(configBak);
+    record.dictBakPath = PathToUtf8String(dictBak);
+    record.configTmpPath = PathToUtf8String(configTmp);
+    record.dictTmpPath = PathToUtf8String(dictTmp);
 
     // Durable write journal in PREPARED state
     if (!DurableWrite(journalTmp, record.Serialize()) || !DurableAtomicRename(journalTmp, journalPath)) {
@@ -506,29 +614,53 @@ bool LexiconWriter::CommitTransaction(
 
     // 4. Replace files
     if (!ReplaceOrMove(configTmp, configPath, configBak, configExisted)) {
-        LexiconRecovery::RecoverIfNeeded(configPath);
+        RollbackToBackup(record, configPath, dictPath, configBak, dictBak);
+        LexiconRecovery::CleanStaleArtifacts(configPath);
         return false;
     }
     if (!ReplaceOrMove(dictTmp, dictPath, dictBak, dictExisted)) {
-        LexiconRecovery::RecoverIfNeeded(configPath);
+        RollbackToBackup(record, configPath, dictPath, configBak, dictBak);
+        LexiconRecovery::CleanStaleArtifacts(configPath);
         return false;
     }
 
     // 5. Transition journal to FILES_REPLACED
     record.state = LexiconJournalState::FilesReplaced;
-    (void)DurableWrite(journalTmp, record.Serialize());
-    (void)DurableAtomicRename(journalTmp, journalPath);
+    if (!DurableWrite(journalTmp, record.Serialize()) || !DurableAtomicRename(journalTmp, journalPath)) {
+        LexiconRecovery::RecoverIfNeeded(configPath);
+        return false;
+    }
 
     // 6. Publish Generation
     if (notifySharedState) {
+        bool published = false;
+        if (sTestGenerationPublisher) {
+            published = sTestGenerationPublisher(newGeneration);
+        } else {
 #if defined(_WIN32)
-        SharedStateManager sm;
-        if (sm.Open()) {
-            sm.Write([newGeneration](SharedState& state) {
-                state.configGeneration = newGeneration;
-            });
-        }
+            SharedStateManager sm;
+            if (sm.Open()) {
+                sm.Write([newGeneration](SharedState& state) {
+                    state.configGeneration = newGeneration;
+                });
+                published = true;
+            }
+#else
+            published = true;
 #endif
+        }
+
+        if (!published) {
+            // Publishing failed! Rollback to backup files and fail transaction.
+            RollbackToBackup(record, configPath, dictPath, configBak, dictBak);
+            std::filesystem::remove(configTmp, ec);
+            std::filesystem::remove(dictTmp, ec);
+            std::filesystem::remove(configBak, ec);
+            std::filesystem::remove(dictBak, ec);
+            std::filesystem::remove(journalPath, ec);
+            std::filesystem::remove(journalTmp, ec);
+            return false;
+        }
     }
 
     // 7. Transition journal to GENERATION_PUBLISHED
@@ -536,9 +668,16 @@ bool LexiconWriter::CommitTransaction(
     (void)DurableWrite(journalTmp, record.Serialize());
     (void)DurableAtomicRename(journalTmp, journalPath);
 
-    // 8. Clean up backups and journal (COMMITTED)
+    // 8. Clean up backups
     std::filesystem::remove(configBak, ec);
     std::filesystem::remove(dictBak, ec);
+
+    // 9. Transition journal to COMMITTED
+    record.state = LexiconJournalState::Committed;
+    (void)DurableWrite(journalTmp, record.Serialize());
+    (void)DurableAtomicRename(journalTmp, journalPath);
+
+    // 10. Clean up journal
     std::filesystem::remove(journalPath, ec);
     std::filesystem::remove(journalTmp, ec);
 
