@@ -380,6 +380,12 @@ target_include_directories(VKeyCore PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/extern/tomlplusplus
 )
 target_link_libraries(VKeyCore PUBLIC VKeyEngine)
+if(VKEY_USE_RUST_ENGINE)
+    # LexiconReader's compiled Rust dictionary snapshot is available only when
+    # VKeyEngine includes RustInputEngine.cpp. Propagate this capability to
+    # VKeyCore and its consumers; Classic deliberately builds without it.
+    target_compile_definitions(VKeyCore PUBLIC VKEY_USE_RUST_ENGINE)
+endif()
 if(NOT WIN32)
     find_package(ICU COMPONENTS uc)
     if(ICU_FOUND)

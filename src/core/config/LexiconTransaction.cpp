@@ -603,15 +603,19 @@ bool LexiconRecovery::RecoverIfNeeded(const std::filesystem::path& configPath) {
                 return false;
             }
 
-            // Best-effort: re-publish wire mapping from the now-restored disk files.
-            // The journal does not store old wire data, so we re-read from the rolled-back
-            // config to rebuild the wire with the correct generation. If this fails, TSF will
-            // fall back to disk read on next hot-path allowDiskRead pass (fail-stale acceptable).
+            // Re-publish wire mapping from the now-restored disk files so TSF sees the
+            // rolled-back snapshot without needing a disk-read allowance.
+            // The journal does not persist old wire data, so we re-parse the restored
+            // config.toml to reconstruct the correct wire state.
+            // CRITICAL: read the 64-bit internal.wire_generation from TOML — do NOT cast
+            // from uint8_t oldGeneration, which is a different (smaller) counter.
+            bool wireRestored = true;
             if (sWireManager || sTestWirePublisher) {
                 try {
                     std::vector<std::wstring> recovExclusions;
                     std::vector<std::wstring> recovDictWords;
                     bool recovSpellSuggest = true;
+                    uint64_t recovWireGen = static_cast<uint64_t>(record.oldGeneration);
 
                     auto recovTbl = toml::parse(ReadFileBytes(configPath));
                     if (auto* f = recovTbl["features"].as_table()) {
@@ -625,6 +629,12 @@ bool LexiconRecovery::RecoverIfNeeded(const std::filesystem::path& configPath) {
                             if (c.Succeeded()) recovExclusions = std::move(c.entries);
                         }
                     }
+                    // Read 64-bit wire_generation from internal table (may exceed uint8_t range).
+                    if (auto* i = recovTbl["internal"].as_table()) {
+                        if (auto* wg = (*i)["wire_generation"].as_integer()) {
+                            if (wg->get() > 0) recovWireGen = static_cast<uint64_t>(wg->get());
+                        }
+                    }
                     if (std::filesystem::exists(dictPath, ec)) {
                         auto dictRes = LexiconValidator::ParseAndValidateUserDictText(
                             ReadFileBytes(dictPath));
@@ -633,23 +643,33 @@ bool LexiconRecovery::RecoverIfNeeded(const std::filesystem::path& configPath) {
                     }
 
                     std::string wireErr;
-                    if (!LexiconWriter::PublishWireMapping(
-                            recovExclusions, recovDictWords,
-                            static_cast<uint64_t>(record.oldGeneration),
-                            recovSpellSuggest, &wireErr)) {
-                        // Wire restore failed; TSF will fall back to disk on next allowDiskRead pass.
-                        // Journal is already cleaned below - acceptable fail-stale: files+generation are correct.
-                    }
+                    wireRestored = LexiconWriter::PublishWireMapping(
+                        recovExclusions, recovDictWords,
+                        recovWireGen,
+                        recovSpellSuggest, &wireErr);
+                    // If wireRestored==false: do NOT clean journal below so next startup retries.
                 } catch (...) {
-                    // Malformed restored config: skip wire restore, TSF disk fallback covers this.
+                    // Malformed restored config — treat as wire restore failure (fail-stale).
+                    wireRestored = false;
                 }
             }
 
-            std::filesystem::remove(configTmp, ec);
-            std::filesystem::remove(dictTmp, ec);
-            std::filesystem::remove(configBak, ec);
-            std::filesystem::remove(dictBak, ec);
-            std::filesystem::remove(journalPath, ec);
+            // Only clean artifacts if wire was successfully restored.
+            // If wire restore failed, leave journal in ROLLBACK_PENDING so RecoverIfNeeded()
+            // retries on next startup rather than leaving a torn wire/disk state.
+            if (wireRestored) {
+                std::filesystem::remove(configTmp, ec);
+                std::filesystem::remove(dictTmp, ec);
+                std::filesystem::remove(configBak, ec);
+                std::filesystem::remove(dictBak, ec);
+                std::filesystem::remove(journalPath, ec);
+            } else {
+                // The disk files and SharedState generation are restored, but the
+                // shared-memory snapshot is still unknown. Do not report recovery
+                // success: callers must fail-stale and the journal must remain for
+                // a later retry once the wire writer is available again.
+                return false;
+            }
             break;
         }
 
@@ -676,6 +696,14 @@ void LexiconRecovery::CleanStaleArtifacts(const std::filesystem::path& configPat
 bool LexiconReader::LoadUserDictionaryLocked(
     const std::wstring& configPath,
     std::shared_ptr<const RustUserDictionarySnapshot>& outSnapshot) {
+#if !defined(VKEY_USE_RUST_ENGINE)
+    // VKey Classic is intentionally C++-only and does not link the optional
+    // Rust adapter. Its UI uses LoadUserDictionaryWordsLocked() below, which
+    // parses the on-disk text without requiring a Rust snapshot.
+    (void)configPath;
+    outSnapshot.reset();
+    return false;
+#else
     LexiconSyncLock lock(kLexiconMutexTimeoutMs);
     if (!lock.IsLocked()) {
         // Timeout or error acquiring mutex: FAIL-STALE (do not proceed without lock)
@@ -694,6 +722,7 @@ bool LexiconReader::LoadUserDictionaryLocked(
         return true;
     }
     return false;
+#endif
 }
 
 bool LexiconReader::LoadUserDictionaryWordsLocked(
@@ -1022,4 +1051,3 @@ bool LexiconWriter::CommitTransaction(
 }
 
 } // namespace NextKey
-

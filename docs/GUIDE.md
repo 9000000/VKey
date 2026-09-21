@@ -139,14 +139,15 @@ VKey cung cấp nhiều phương thức gõ linh hoạt để đáp ứng mọi 
    - **Thêm từ:** Nhập từ cần giữ nguyên vào ô văn bản (ví dụ `soà`, `khưm`, `alo`, tên riêng, thuật ngữ...), sau đó nhấn nút **Thêm** (hoặc nhấn phím `Enter`).
    - **Sửa / Xóa:** Nhấp chọn từ trong danh sách để chỉnh sửa hoặc nhấn **Xóa** để bỏ từ đó khỏi danh sách bảo vệ.
    - **Nạp / Xuất file:** Nhấn **Nạp từ file...** để nhập hàng loạt từ file văn bản `.txt` hoặc **Xuất ra file...** để sao lưu từ điển của bạn.
-3. Nhấn **Lưu & Áp dụng**. VKey sẽ lưu dữ liệu và đồng bộ tức thì cho cả Hook Engine lẫn TSF mà không cần khởi động lại.
+
+   Mỗi thay đổi (Thêm, Sửa, Xóa, Nạp file, bật/tắt Kiểm tra chính tả nâng cao) được **áp dụng ngay lập tức** — không cần nhấn thêm nút "Lưu". VKey đồng bộ tức thì cho cả Hook Engine lẫn TSF mà không cần khởi động lại. Bản VKey Classic thuần C++ chỉ hiển thị giao diện **Loại trừ chính tả**; phần Từ điển cá nhân và chế độ Nâng cao chỉ có trong bản dùng engine nâng cao.
 
 #### Cách 2: Chỉnh sửa thủ công file `user_dictionary.txt`
 File `user_dictionary.txt` nằm cùng thư mục với `config.toml` (thường là thư mục cài đặt VKey). Nếu thư mục đó không có quyền ghi, hãy đặt file trong `%APPDATA%\VKey`. File **không được tạo tự động** — bạn phải tự tạo bằng tay hoặc dùng giao diện **Từ điển cá nhân** ở Cách 1 để VKey tạo và quản lý giúp bạn.
 
 1. Báo lỗi tự sửa tại [GitHub Issues](https://github.com/phatMT97/VKey/issues) trước khi thêm từ.
 2. Mở file bằng Notepad hoặc trình soạn thảo văn bản, thêm mỗi từ vào một dòng riêng rồi lưu dưới dạng mã hóa **UTF-8**.
-3. Nhấn chuột phải vào Tray icon chọn **Từ điển & Loại trừ chính tả** → **Nạp lại** → **Lưu & Áp dụng** (hoặc chuyển **Nâng cao → Cơ bản → Nâng cao**) để nạp lại.
+3. Khởi động lại VKey hoặc chuyển **Nâng cao → Cơ bản → Nâng cao** để nạp file mới.
 
 Dòng trống và dòng bắt đầu bằng `#` được bỏ qua. (Lưu ý: Không dùng dấu `;` làm chú thích vì engine sẽ coi là lỗi). File rỗng hoặc chỉ có comment là hợp lệ và xóa danh sách bảo vệ. File sai UTF-8, có dòng không hợp lệ, quá lớn hoặc tạm thời không đọc được sẽ không làm mất danh sách hợp lệ gần nhất. Danh sách chỉ được lưu và xử lý cục bộ trên máy tính của bạn.
 

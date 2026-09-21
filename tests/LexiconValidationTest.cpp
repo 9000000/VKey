@@ -50,11 +50,12 @@ TEST(LexiconValidationTest, SpellExclusionRejectsSingleChar) {
 }
 
 TEST(LexiconValidationTest, ParseUserDictTextWithCommentsAndLineNumbers) {
+    // Use '#' (the only valid comment prefix) for all comment lines.
     std::string text =
-        "; Header comment\n"
+        "# Header comment\n"
         "so\u00e0\n"
         "\n"
-        "; Another comment\n"
+        "# Another comment\n"
         "alo\n"
         "in4\n";
 
@@ -107,14 +108,28 @@ TEST(LexiconValidationTest, FormattingRoundTrip) {
     EXPECT_EQ(parsed.entries, words);
 }
 
-TEST(LexiconValidationTest, ParsesBothHashAndSemicolonComments) {
+// Parity test: ';' is NOT a valid comment prefix in user_dictionary.txt.
+// C++ validation must reject it so the file never reaches the Rust FFI,
+// which would silently treat ';' lines as data entries and fail the dictionary.
+TEST(LexiconValidationTest, SemicolonLineIsRejectedByValidation) {
+    std::string text =
+        "# Hash comment — valid\n"
+        "alo\n"
+        "; This is NOT a comment — must be rejected\n"
+        "kh\xc6\xb0m\n";
+
+    auto parsed = LexiconValidator::ParseAndValidateUserDictText(text);
+    EXPECT_FALSE(parsed.validation.Succeeded());
+    // The ';' line (line 3) must be the reported error line.
+    EXPECT_EQ(parsed.validation.errorLine, 3u);
+}
+
+TEST(LexiconValidationTest, ParseUserDictHashCommentIgnored) {
     std::string text =
         "# Hash comment\n"
-        "; Semicolon comment\n"
         "alo\n"
         "# Another comment\n"
         "kh\xc6\xb0m\n"
-        "; Legacy comment\n"
         "so\xc3\xa0\n";
 
     auto parsed = LexiconValidator::ParseAndValidateUserDictText(text);

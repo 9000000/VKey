@@ -1172,7 +1172,22 @@ void EngineController::RefreshUserDictionarySnapshot(uint32_t epoch,
             return;
         }
 
-        // Apply process-global spell exclusions from UTF-16 buffer.
+        // Compile user dictionary snapshot first (no global side-effect).
+        // This must happen BEFORE SetSpellExclusionsFromUtf16 because that call
+        // mutates process-global state immediately. If we applied exclusions first
+        // and the dict compile then failed, TSF would hold new exclusions + old
+        // dictionary — a torn lexicon state violating the atomic-update contract.
+        auto newSnapshot = RustInputEngine::CreateUserDictionaryFromUtf16(
+            wireView_.userDictBuf,
+            wireView_.userDictUnits);
+        if (!newSnapshot) {
+            // Rust compile failed (malformed wire data or OOM): keep reload pending (fail-stale).
+            // Exclusions have NOT been touched yet — state remains fully consistent.
+            TSF_LOG(L"UserDictionary: CreateUserDictionaryFromUtf16 returned nullptr — retaining reload flag");
+            return;
+        }
+
+        // Dictionary compiled successfully. Now apply process-global spell exclusions.
         bool exclusionsChanged = false;
         bool exclusionsOk = RustInputEngine::SetSpellExclusionsFromUtf16(
             wireView_.exclusionsBuf,
@@ -1180,6 +1195,7 @@ void EngineController::RefreshUserDictionarySnapshot(uint32_t epoch,
             &exclusionsChanged);
         if (!exclusionsOk) {
             // FFI setter failed: keep reload pending so we retry on next tick.
+            // newSnapshot is discarded; dictionary state is unchanged.
             TSF_LOG(L"UserDictionary: SetSpellExclusionsFromUtf16 failed — retaining reload flag");
             return;
         }
@@ -1187,17 +1203,8 @@ void EngineController::RefreshUserDictionarySnapshot(uint32_t epoch,
             engineNeedsRecreate_ = true;
         }
 
-        // Compile user dictionary snapshot directly from UTF-16 buffer without disk I/O.
-        auto newSnapshot = RustInputEngine::CreateUserDictionaryFromUtf16(
-            wireView_.userDictBuf,
-            wireView_.userDictUnits);
-        if (!newSnapshot) {
-            // Rust compile failed (malformed data or OOM): keep reload pending (fail-stale).
-            TSF_LOG(L"UserDictionary: CreateUserDictionaryFromUtf16 returned nullptr — retaining reload flag");
-            return;
-        }
+        // Both succeeded — commit both updates atomically.
         pendingUserDictionary_ = std::move(newSnapshot);
-
         userDictionaryNeedsReload_ = false;
         TSF_LOG(L"UserDictionary: wire reload succeeded gen=%llu entries=%u units=%u",
                 static_cast<unsigned long long>(wireView_.header->generation),

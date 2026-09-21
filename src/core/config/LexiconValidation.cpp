@@ -224,8 +224,8 @@ LexiconImportResult LexiconValidator::ParseAndValidateUserDictText(
         }
 
         u32 = SpellExclusionCanonicalizer::TrimWhitespace(u32);
-        if (u32.empty() || u32[0] == U';' || u32[0] == U'#') {
-            continue; // Ignore blank lines and comments
+        if (u32.empty() || u32[0] == U'#') {
+            continue; // Ignore blank lines and '#' comments (';' is NOT valid — Rust rejects it)
         }
 
         std::wstring lineUtf16;

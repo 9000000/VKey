@@ -249,7 +249,7 @@ TEST_F(LexiconTransactionTest, LoadUserDictionaryWordsLocked_MissingFileReturnsE
 }
 
 TEST_F(LexiconTransactionTest, LoadUserDictionaryWordsLocked_ExistingFileReturnsParsedWords) {
-    WriteFile(dictPath_, "; Header comment\nso\u00e0\n\nalo\n");
+    WriteFile(dictPath_, "# Header comment\nso\u00e0\n\nalo\n");
     std::vector<std::wstring> words;
     EXPECT_TRUE(LexiconReader::LoadUserDictionaryWordsLocked(configPath_.wstring(), words));
     EXPECT_EQ(words.size(), 2u);
@@ -259,7 +259,7 @@ TEST_F(LexiconTransactionTest, LoadUserDictionaryWordsLocked_ExistingFileReturns
 
 TEST_F(LexiconTransactionTest, CommitTransaction_ConvenienceOverload) {
     const std::string newToml = "[features]\nspell_suggest = true\n";
-    const std::string newDict = "; Dict\nalo\n";
+    const std::string newDict = "# Dict\nalo\n";
 
     EXPECT_TRUE(LexiconWriter::CommitTransaction(configPath_.wstring(), newToml, newDict, false));
     EXPECT_EQ(ReadFile(configPath_), newToml);
@@ -302,7 +302,7 @@ TEST_F(LexiconTransactionTest, PublishGenerationFailure_RollsBackFilesAndFailsTr
 
 TEST_F(LexiconTransactionTest, CorruptedJournal_FailsRecoveryAndReaderFailsStale) {
     WriteFile(configPath_, "good config");
-    WriteFile(dictPath_, "; comment\nvalidword\n");
+    WriteFile(dictPath_, "# comment\nvalidword\n");
 
     const auto journalPath = testDir_ / "lexicon_txn.journal";
     WriteFile(journalPath, "CORRUPT_HEADER_NOT_VKEY\ngarbage=123\n");
@@ -771,5 +771,50 @@ TEST_F(LexiconTransactionTest, RecoverIfNeeded_RollbackPendingDirectly) {
     LexiconWriter::SetTestGenerationPublisher(nullptr);
 }
 
-} // namespace NextKey
+TEST_F(LexiconTransactionTest, RecoverIfNeeded_RollbackPendingWireFailureFailsStaleAndRetries) {
+    const std::string originalToml =
+        "[features]\n"
+        "spell_suggest = true\n"
+        "spell_exclusions = []\n"
+        "[internal]\n"
+        "wire_generation = 6000\n";
+    const std::string originalDict = "# old dictionary\nsoà\n";
+    WriteFile(configPath_, originalToml);
+    WriteFile(dictPath_, originalDict);
 
+    LexiconJournalRecord record;
+    record.state = LexiconJournalState::RollbackPending;
+    record.configExistedBefore = true;
+    record.dictExistedBefore = true;
+    record.oldGeneration = 10;
+    record.newGeneration = 11;
+    record.oldConfigHash = LexiconJournalRecord::ComputeHash(originalToml);
+    record.oldDictHash = LexiconJournalRecord::ComputeHash(originalDict);
+    const auto journalPath = testDir_ / "lexicon_txn.journal";
+    WriteFile(journalPath, record.Serialize());
+
+    LexiconWriter::SetTestGenerationPublisher([](uint8_t) { return true; });
+    LexiconWriter::SetTestWirePublisher(
+        [](const auto&, const auto&, uint64_t, bool, std::string*) { return false; });
+
+    // A wire restore failure is not a successful recovery. The journal is retained
+    // so the next startup can retry instead of accepting a stale shared snapshot.
+    EXPECT_FALSE(LexiconRecovery::RecoverIfNeeded(configPath_));
+    EXPECT_TRUE(std::filesystem::exists(journalPath));
+
+    uint64_t recoveredWireGeneration = 0;
+    LexiconWriter::SetTestWirePublisher(
+        [&recoveredWireGeneration](const auto&, const auto&, uint64_t generation, bool, std::string*) {
+            recoveredWireGeneration = generation;
+            return true;
+        });
+
+    EXPECT_TRUE(LexiconRecovery::RecoverIfNeeded(configPath_));
+    EXPECT_FALSE(std::filesystem::exists(journalPath));
+    EXPECT_EQ(recoveredWireGeneration, 6000u);
+
+    LexiconWriter::SetTestGenerationPublisher(nullptr);
+    LexiconWriter::SetTestWirePublisher(nullptr);
+}
+
+} // namespace NextKey
