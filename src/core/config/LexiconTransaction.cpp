@@ -603,6 +603,48 @@ bool LexiconRecovery::RecoverIfNeeded(const std::filesystem::path& configPath) {
                 return false;
             }
 
+            // Best-effort: re-publish wire mapping from the now-restored disk files.
+            // The journal does not store old wire data, so we re-read from the rolled-back
+            // config to rebuild the wire with the correct generation. If this fails, TSF will
+            // fall back to disk read on next hot-path allowDiskRead pass (fail-stale acceptable).
+            if (sWireManager || sTestWirePublisher) {
+                try {
+                    std::vector<std::wstring> recovExclusions;
+                    std::vector<std::wstring> recovDictWords;
+                    bool recovSpellSuggest = true;
+
+                    auto recovTbl = toml::parse(ReadFileBytes(configPath));
+                    if (auto* f = recovTbl["features"].as_table()) {
+                        if (auto* ss = (*f)["spell_suggest"].as_boolean())
+                            recovSpellSuggest = ss->get();
+                        if (auto* arr = (*f)["spell_exclusions"].as_array()) {
+                            std::vector<std::string> raw;
+                            for (auto&& item : *arr)
+                                if (auto* s = item.as_string()) raw.push_back(s->get());
+                            auto c = SpellExclusionCanonicalizer::Canonicalize(raw);
+                            if (c.Succeeded()) recovExclusions = std::move(c.entries);
+                        }
+                    }
+                    if (std::filesystem::exists(dictPath, ec)) {
+                        auto dictRes = LexiconValidator::ParseAndValidateUserDictText(
+                            ReadFileBytes(dictPath));
+                        if (dictRes.validation.Succeeded())
+                            recovDictWords = std::move(dictRes.entries);
+                    }
+
+                    std::string wireErr;
+                    if (!LexiconWriter::PublishWireMapping(
+                            recovExclusions, recovDictWords,
+                            static_cast<uint64_t>(record.oldGeneration),
+                            recovSpellSuggest, &wireErr)) {
+                        // Wire restore failed; TSF will fall back to disk on next allowDiskRead pass.
+                        // Journal is already cleaned below - acceptable fail-stale: files+generation are correct.
+                    }
+                } catch (...) {
+                    // Malformed restored config: skip wire restore, TSF disk fallback covers this.
+                }
+            }
+
             std::filesystem::remove(configTmp, ec);
             std::filesystem::remove(dictTmp, ec);
             std::filesystem::remove(configBak, ec);
@@ -904,10 +946,13 @@ bool LexiconWriter::CommitTransaction(
             if (!TransitionJournalState(configPath, record, LexiconJournalState::RollbackPending)) {
                 return false;
             }
-            // Restore old wire mapping if wire was published
+            // Restore old wire mapping if wire was published.
+            // On failure, log and leave journal in ROLLBACK_PENDING (fail-stale).
+            bool wireRestored = true;
             if (wirePublished) {
                 std::string restoreErr;
-                (void)PublishWireMapping(oldExclusions, oldDictWords, oldWireGen, oldSpellSuggest, &restoreErr);
+                wireRestored = PublishWireMapping(oldExclusions, oldDictWords, oldWireGen, oldSpellSuggest, &restoreErr);
+                // If restore failed, journal stays ROLLBACK_PENDING; RecoverIfNeeded() will retry on next startup.
             }
             // Attempt to restore old generation in SharedState to ensure clean state
             bool oldGenRestored = false;
@@ -919,7 +964,10 @@ bool LexiconWriter::CommitTransaction(
             }
 
             bool filesRestored = RollbackToBackup(record, configPath, dictPath, configBak, dictBak);
-            if (oldGenRestored && filesRestored) {
+            // Only clean up artifacts if ALL three components were restored.
+            // If wire restore failed, keep journal so RecoverIfNeeded() can signal TSF
+            // to re-read from disk on next startup (fail-stale).
+            if (oldGenRestored && filesRestored && wireRestored) {
                 std::filesystem::remove(configTmp, ec);
                 std::filesystem::remove(dictTmp, ec);
                 std::filesystem::remove(configBak, ec);
@@ -927,8 +975,8 @@ bool LexiconWriter::CommitTransaction(
                 std::filesystem::remove(journalPath, ec);
                 std::filesystem::remove(journalTmp, ec);
             }
-            // If oldGenRestored is false (or filesRestored is false), the journal remains
-            // in ROLLBACK_PENDING state on disk so RecoverIfNeeded() can retry generation restoration.
+            // If any restore failed, the journal remains in ROLLBACK_PENDING state so
+            // RecoverIfNeeded() can retry on next startup.
             return false;
         }
     }

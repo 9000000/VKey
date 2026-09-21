@@ -1174,18 +1174,29 @@ void EngineController::RefreshUserDictionarySnapshot(uint32_t epoch,
 
         // Apply process-global spell exclusions from UTF-16 buffer.
         bool exclusionsChanged = false;
-        RustInputEngine::SetSpellExclusionsFromUtf16(
+        bool exclusionsOk = RustInputEngine::SetSpellExclusionsFromUtf16(
             wireView_.exclusionsBuf,
             wireView_.exclusionsUnits,
             &exclusionsChanged);
+        if (!exclusionsOk) {
+            // FFI setter failed: keep reload pending so we retry on next tick.
+            TSF_LOG(L"UserDictionary: SetSpellExclusionsFromUtf16 failed — retaining reload flag");
+            return;
+        }
         if (exclusionsChanged) {
             engineNeedsRecreate_ = true;
         }
 
         // Compile user dictionary snapshot directly from UTF-16 buffer without disk I/O.
-        pendingUserDictionary_ = RustInputEngine::CreateUserDictionaryFromUtf16(
+        auto newSnapshot = RustInputEngine::CreateUserDictionaryFromUtf16(
             wireView_.userDictBuf,
             wireView_.userDictUnits);
+        if (!newSnapshot) {
+            // Rust compile failed (malformed data or OOM): keep reload pending (fail-stale).
+            TSF_LOG(L"UserDictionary: CreateUserDictionaryFromUtf16 returned nullptr — retaining reload flag");
+            return;
+        }
+        pendingUserDictionary_ = std::move(newSnapshot);
 
         userDictionaryNeedsReload_ = false;
         TSF_LOG(L"UserDictionary: wire reload succeeded gen=%llu entries=%u units=%u",

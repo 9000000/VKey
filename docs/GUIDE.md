@@ -131,21 +131,24 @@ VKey cung cấp nhiều phương thức gõ linh hoạt để đáp ứng mọi 
 - ✅ **Khôi phục từ với phím sai:** *(Mặc định: Bật)* Khi bạn gõ sai chính tả tiếng Việt và nhấn phím `Space`, VKey sẽ tự động hoàn trả lại đúng các ký tự gốc đã nhập. Ví dụ: gõ nhầm `pềct` + `Space` → tự động khôi phục lại thành `perfect`.
 - ✅ **Quy tắc `đ` ở ký tự đầu (dd ↔ đ):** Khi chữ `đ` đứng ở **ký tự đầu**, gõ thêm `d` sẽ **chuyển đổi qua lại** một cách nhất quán: `d` → `đ`, rồi `đ` → `d`. Ví dụ: gõ `dm` rồi thêm `d` → `đm`; thêm `d` lần nữa → `dmd`. Nhờ vậy chữ `đ` đầu từ không bao giờ bị "kẹt" — bạn luôn quay lại được `d` gốc. *(Lưu ý: quy tắc này chỉ áp dụng cho `đ` ở ký tự đầu; các chữ `đ` ở giữa từ như trong `hđlđ` không bị ảnh hưởng.)*
 - ✅ **Loại trừ chính tả:** Cho phép bạn thêm các từ đặc biệt, viết tắt hoặc thuật ngữ chuyên ngành vào danh sách loại trừ để bộ gõ không nhận nhầm là lỗi chính tả, giúp quá trình gõ chữ trơn tru hơn. 👉 Đây cũng là cách giữ nguyên các từ viết tắt **bắt đầu bằng `đ` và có nhiều `đ` gõ liền nhau** (ví dụ `đcđt`): chỉ cần thêm từ đó vào danh sách loại trừ, VKey sẽ giữ chữ `đ` đầu thay vì tự chuyển về `d` theo quy tắc ở trên.
-- ✅ **Luôn giữ từ cá nhân (chỉ chế độ Nâng cao):** Sau lần đầu bật **Kiểm tra chính tả nâng cao**, VKey tạo `user_dictionary.txt` trong cùng thư mục với `config.toml` (thư mục cài nếu ghi được, nếu không là `%APPDATA%\VKey`). Hãy báo lỗi tại [GitHub Issues](https://github.com/phatMT97/VKey/issues) trước, rồi thêm mỗi từ cần giữ vào một dòng, ví dụ `alo`. Lưu file và chọn lại chế độ **Nâng cao** (có thể chuyển Nâng cao → Cơ bản → Nâng cao) để Hook và TSF cùng nạp lại. File trống là hợp lệ và xóa toàn bộ danh sách bảo vệ; file lỗi/không đọc được không làm mất danh sách hợp lệ đang dùng. Danh sách chỉ nằm trên máy và VKey không gửi đi đâu.
+- ✅ **Từ điển cá nhân (Luôn giữ từ riêng — chỉ chế độ Nâng cao):** Cho phép bảo vệ các từ lóng, từ riêng hoặc từ ít gặp (như `soà`, `khưm`, thuật ngữ...) không bị engine kiểm tra chính tả nâng cao tự động sửa thành từ khác.
 
-#### Cách sửa file `user_dictionary.txt`
+#### Cách 1: Sử dụng giao diện trực quan (Khuyên dùng)
+1. Nhấp chuột phải vào biểu tượng VKey ở khay hệ thống (System Tray) và chọn **Từ điển & Loại trừ chính tả** (hoặc mở từ cửa sổ Cài đặt).
+2. Chọn tab **Từ điển cá nhân**:
+   - **Thêm từ:** Nhập từ cần giữ nguyên vào ô văn bản (ví dụ `soà`, `khưm`, `alo`, tên riêng, thuật ngữ...), sau đó nhấn nút **Thêm** (hoặc nhấn phím `Enter`).
+   - **Sửa / Xóa:** Nhấp chọn từ trong danh sách để chỉnh sửa hoặc nhấn **Xóa** để bỏ từ đó khỏi danh sách bảo vệ.
+   - **Nạp / Xuất file:** Nhấn **Nạp từ file...** để nhập hàng loạt từ file văn bản `.txt` hoặc **Xuất ra file...** để sao lưu từ điển của bạn.
+3. Nhấn **Lưu & Áp dụng**. VKey sẽ lưu dữ liệu và đồng bộ tức thì cho cả Hook Engine lẫn TSF mà không cần khởi động lại.
 
-1. Bật **Kiểm tra chính tả nâng cao** để VKey tự tạo file nếu file chưa có.
-2. Báo lỗi tự sửa tại [GitHub Issues](https://github.com/phatMT97/VKey/issues)
-   trước khi thêm từ.
-3. Mở file bằng Notepad hoặc trình soạn thảo văn bản, thêm mỗi từ vào một dòng
-   riêng rồi lưu dưới dạng UTF-8.
-4. Chọn lại **Nâng cao** để nạp lại. Nếu cần, chuyển **Nâng cao → Cơ bản →
-   Nâng cao**.
+#### Cách 2: Chỉnh sửa thủ công file `user_dictionary.txt`
+File `user_dictionary.txt` nằm cùng thư mục với `config.toml` (thường là thư mục cài đặt VKey). Nếu thư mục đó không có quyền ghi, hãy đặt file trong `%APPDATA%\VKey`. File **không được tạo tự động** — bạn phải tự tạo bằng tay hoặc dùng giao diện **Từ điển cá nhân** ở Cách 1 để VKey tạo và quản lý giúp bạn.
 
-Dòng trống và dòng bắt đầu bằng `#` được bỏ qua. File rỗng hoặc chỉ có comment
-là hợp lệ và xóa danh sách bảo vệ. File sai UTF-8, có dòng không hợp lệ, quá
-lớn hoặc tạm thời không đọc được sẽ không làm mất danh sách hợp lệ gần nhất.
+1. Báo lỗi tự sửa tại [GitHub Issues](https://github.com/phatMT97/VKey/issues) trước khi thêm từ.
+2. Mở file bằng Notepad hoặc trình soạn thảo văn bản, thêm mỗi từ vào một dòng riêng rồi lưu dưới dạng mã hóa **UTF-8**.
+3. Nhấn chuột phải vào Tray icon chọn **Từ điển & Loại trừ chính tả** → **Nạp lại** → **Lưu & Áp dụng** (hoặc chuyển **Nâng cao → Cơ bản → Nâng cao**) để nạp lại.
+
+Dòng trống và dòng bắt đầu bằng `#` được bỏ qua. (Lưu ý: Không dùng dấu `;` làm chú thích vì engine sẽ coi là lỗi). File rỗng hoặc chỉ có comment là hợp lệ và xóa danh sách bảo vệ. File sai UTF-8, có dòng không hợp lệ, quá lớn hoặc tạm thời không đọc được sẽ không làm mất danh sách hợp lệ gần nhất. Danh sách chỉ được lưu và xử lý cục bộ trên máy tính của bạn.
 
 ### <span id="hotkey-mgmt">⚡ 10. Quản lý phím tắt</span>
 - 🔸 **Khôi phục từ gốc chủ động:** Cho phép thiết lập phím tắt để ngay lập tức trả lại các ký tự gốc (raw keys) mà không cần nhấn phím cách (`Space`) hoặc đợi gõ hết từ. Ví dụ: gõ `asus` → hiển thị thành `aus` → nhấn `ESC` → lập tức khôi phục lại thành `asus`.
