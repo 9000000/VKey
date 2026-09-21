@@ -25,6 +25,7 @@ enum class LexiconJournalState : uint8_t {
     FilesReplaced = 2,
     GenerationPublished = 3,
     Committed = 4,
+    RollbackPending = 5,
 };
 
 struct LexiconJournalRecord {

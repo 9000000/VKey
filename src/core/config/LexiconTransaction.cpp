@@ -284,6 +284,7 @@ std::string LexiconJournalRecord::Serialize() const {
         case LexiconJournalState::FilesReplaced: ss << "FILES_REPLACED\n"; break;
         case LexiconJournalState::GenerationPublished: ss << "GENERATION_PUBLISHED\n"; break;
         case LexiconJournalState::Committed: ss << "COMMITTED\n"; break;
+        case LexiconJournalState::RollbackPending: ss << "ROLLBACK_PENDING\n"; break;
         default: ss << "UNKNOWN\n"; break;
     }
     ss << "config_existed=" << (configExistedBefore ? "1" : "0") << "\n";
@@ -324,6 +325,7 @@ bool LexiconJournalRecord::Deserialize(std::string_view text, LexiconJournalReco
             else if (val == "FILES_REPLACED") outRecord.state = LexiconJournalState::FilesReplaced;
             else if (val == "GENERATION_PUBLISHED") outRecord.state = LexiconJournalState::GenerationPublished;
             else if (val == "COMMITTED") outRecord.state = LexiconJournalState::Committed;
+            else if (val == "ROLLBACK_PENDING") outRecord.state = LexiconJournalState::RollbackPending;
             else outRecord.state = LexiconJournalState::Unknown;
         } else if (key == "config_existed") {
             outRecord.configExistedBefore = (val == "1" || val == "true");
@@ -502,11 +504,24 @@ bool LexiconRecovery::RecoverIfNeeded(const std::filesystem::path& configPath) {
             const std::string curDictHash = ComputeFnv1aHex(ReadFileBytes(dictPath));
 
             if (curConfigHash != record.newConfigHash || curDictHash != record.newDictHash) {
-                // Hash mismatch! Files on disk are corrupted or incomplete. Rollback to backup!
-                if (!RollbackToBackup(record, configPath, dictPath, configBak, dictBak)) {
+                // Hash mismatch! Files on disk are corrupted, incomplete, or were previously rolled back.
+                bool filesRestored = false;
+                if (std::filesystem::exists(configBak, ec) || std::filesystem::exists(dictBak, ec)) {
+                    filesRestored = RollbackToBackup(record, configPath, dictPath, configBak, dictBak);
+                } else {
+                    const std::string oldCfg = ComputeFnv1aHex(ReadFileBytes(configPath));
+                    const std::string oldDic = ComputeFnv1aHex(ReadFileBytes(dictPath));
+                    filesRestored = (!record.configExistedBefore || oldCfg == record.oldConfigHash) &&
+                                    (!record.dictExistedBefore || oldDic == record.oldDictHash);
+                }
+
+                if (!filesRestored) {
                     return false;
                 }
+
                 if (!LexiconWriter::PublishGeneration(record.oldGeneration)) {
+                    // Persist in RollbackPending state so future recovery knows files are already rolled back
+                    TransitionJournalState(configPath, record, LexiconJournalState::RollbackPending);
                     return false;
                 }
                 std::filesystem::remove(configTmp, ec);
@@ -557,6 +572,35 @@ bool LexiconRecovery::RecoverIfNeeded(const std::filesystem::path& configPath) {
 
         case LexiconJournalState::Committed: {
             // Clean up left-over artifacts
+            std::filesystem::remove(configTmp, ec);
+            std::filesystem::remove(dictTmp, ec);
+            std::filesystem::remove(configBak, ec);
+            std::filesystem::remove(dictBak, ec);
+            std::filesystem::remove(journalPath, ec);
+            break;
+        }
+
+        case LexiconJournalState::RollbackPending: {
+            // Transaction was aborted and is in the process of rolling back.
+            bool filesRestored = false;
+            if (std::filesystem::exists(configBak, ec) || std::filesystem::exists(dictBak, ec)) {
+                filesRestored = RollbackToBackup(record, configPath, dictPath, configBak, dictBak);
+            } else {
+                const std::string curConfigHash = ComputeFnv1aHex(ReadFileBytes(configPath));
+                const std::string curDictHash = ComputeFnv1aHex(ReadFileBytes(dictPath));
+                filesRestored = (!record.configExistedBefore || curConfigHash == record.oldConfigHash) &&
+                                (!record.dictExistedBefore || curDictHash == record.oldDictHash);
+            }
+
+            if (!filesRestored) {
+                return false;
+            }
+
+            if (!LexiconWriter::PublishGeneration(record.oldGeneration)) {
+                // Generation restore failed: persist in RollbackPending state, fail-stale
+                return false;
+            }
+
             std::filesystem::remove(configTmp, ec);
             std::filesystem::remove(dictTmp, ec);
             std::filesystem::remove(configBak, ec);
@@ -746,6 +790,7 @@ bool LexiconWriter::CommitTransaction(
     if (notifySharedState) {
         if (!PublishGeneration(newGeneration)) {
             // Publishing failed! Rollback to backup files and fail transaction.
+            TransitionJournalState(configPath, record, LexiconJournalState::RollbackPending);
             if (RollbackToBackup(record, configPath, dictPath, configBak, dictBak)) {
                 std::filesystem::remove(configTmp, ec);
                 std::filesystem::remove(dictTmp, ec);
@@ -804,7 +849,11 @@ bool LexiconWriter::CommitTransaction(
             auto dictRes = LexiconValidator::ParseAndValidateUserDictText(newUserDictText);
             std::string wireErr;
             if (!PublishWireMapping(exclusions, dictRes.entries, wireGen, spellSuggest, &wireErr)) {
-                // SharedState generation was published at step 6; restore old generation on wire failure
+                // SharedState generation was published at step 6; transition journal to RollbackPending
+                // BEFORE attempting rollback so crash recovery knows a rollback is underway.
+                TransitionJournalState(configPath, record, LexiconJournalState::RollbackPending);
+
+                // Attempt to restore old generation in SharedState
                 bool oldGenRestored = false;
                 for (int attempt = 0; attempt < 3; ++attempt) {
                     if (PublishGeneration(oldGeneration)) {
@@ -823,8 +872,8 @@ bool LexiconWriter::CommitTransaction(
                     std::filesystem::remove(journalPath, ec);
                     std::filesystem::remove(journalTmp, ec);
                 }
-                // If oldGenRestored is false (or rollback failed), preserve backups and journal on disk
-                // so the transaction state is not falsely considered clean!
+                // If oldGenRestored is false (or rollback failed), the journal remains in ROLLBACK_PENDING state
+                // on disk. Files are safely at old hashes and RecoverIfNeeded() can retry generation restoration.
                 return false;
             }
         }

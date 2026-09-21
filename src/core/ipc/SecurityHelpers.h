@@ -95,15 +95,23 @@ inline SECURITY_ATTRIBUTES MakeAppContainerReadableSecurityAttributes() noexcept
     return sa;
 }
 
-// Temporary security attributes granting user write access, used when the creator process
-// re-attaches to a surviving mapping during Core restart.
+// Temporary security attributes granting read/write access to SYSTEM, Admins, and
+// current User SID, used strictly by the creator process during section creation and re-attachment.
+// Note on Windows NT security boundary:
+// Named kernel objects in Windows authorize SIDs (user/group credentials), not process IDs (PIDs).
+// Any write ACE for User SID technically allows processes in the same user logon session to request
+// write access during the brief creation window. To minimize this, LexiconWireManager performs
+// an immediate post-mapping DACL lockdown (MakeAppContainerReadableSecurityAttributes) via
+// SetKernelObjectSecurity immediately after MapViewOfFile, restricting User SID and IU to GENERIC_READ.
+// In addition, LexiconWireFormat enforces seqlock generation parity and CRC32 payload verification
+// so readers immediately reject any unauthorized or torn data.
 inline SECURITY_ATTRIBUTES MakeCreatorWriteSecurityAttributes() noexcept {
     std::wstring userSid;
     std::wstring sddl;
     if (GetCurrentProcessUserSidString(userSid) && !userSid.empty()) {
-        sddl = L"D:PAI(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;" + userSid + L")(A;;GR;;;IU)(A;;GR;;;AC)(A;;GR;;;RA)";
+        sddl = L"D:PAI(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;" + userSid + L")(A;;GR;;;IU)(A;;GR;;;AC)(A;;GR;;;RA)";
     } else {
-        sddl = L"D:PAI(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;CO)(A;;GR;;;IU)(A;;GR;;;AC)(A;;GR;;;RA)";
+        sddl = L"D:PAI(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;CO)(A;;GR;;;IU)(A;;GR;;;AC)(A;;GR;;;RA)";
     }
 
     PSECURITY_DESCRIPTOR pSD = nullptr;

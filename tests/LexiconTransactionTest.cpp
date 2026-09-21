@@ -660,23 +660,74 @@ TEST_F(LexiconTransactionTest, CommitTransaction_PreservesBackupsAndJournalWhenR
     EXPECT_FALSE(ok);
     EXPECT_GE(genCalls, 2);
 
-    // CRITICAL: Because restoring oldGeneration failed, the journal MUST BE PRESERVED on disk!
+    // CRITICAL: Because restoring oldGeneration failed, the journal MUST BE PRESERVED on disk in ROLLBACK_PENDING state!
     // It must NOT be deleted so that crash recovery / forensics can detect the unfinalized transaction.
     const auto journalPath = testDir_ / "lexicon_txn.journal";
     EXPECT_TRUE(std::filesystem::exists(journalPath));
 
-    // Verify journal record is preserved at FilesReplaced state
+    // Verify journal record is preserved at ROLLBACK_PENDING state
     std::string journalContent = ReadFile(journalPath);
-    EXPECT_NE(journalContent.find("state=FILES_REPLACED"), std::string::npos);
+    EXPECT_NE(journalContent.find("state=ROLLBACK_PENDING"), std::string::npos);
 
     // Disk files were rolled back to original content
     std::string currentToml = ReadFile(configPath_);
     EXPECT_NE(currentToml.find("telex"), std::string::npos);
     EXPECT_EQ(currentToml.find("vni"), std::string::npos);
 
+    // 4. Verify that subsequent RecoverIfNeeded() successfully recovers:
+    // Clear generation publisher fault-injection so restore succeeds
+    uint8_t recoveredGen = 0;
+    LexiconWriter::SetTestGenerationPublisher([&recoveredGen](uint8_t gen) {
+        recoveredGen = gen;
+        return true;
+    });
+
+    // Run recovery - MUST SUCCEED cleanly!
+    EXPECT_TRUE(LexiconRecovery::RecoverIfNeeded(configPath_));
+
+    // Journal must now be cleaned up
+    EXPECT_FALSE(std::filesystem::exists(journalPath));
+    EXPECT_EQ(recoveredGen, 2u);
+
+    // Disk files remain at old valid content
+    currentToml = ReadFile(configPath_);
+    EXPECT_NE(currentToml.find("telex"), std::string::npos);
+    EXPECT_EQ(currentToml.find("vni"), std::string::npos);
+
     // Cleanup hooks
     LexiconWriter::SetTestGenerationPublisher(nullptr);
     LexiconWriter::SetTestWirePublisher(nullptr);
+}
+
+TEST_F(LexiconTransactionTest, RecoverIfNeeded_RollbackPendingDirectly) {
+    // Write a valid existing config
+    std::string originalToml = "[input]\nmethod = \"telex\"\n";
+    WriteFile(configPath_, originalToml);
+
+    // Create journal directly in RollbackPending state where backups were already moved
+    LexiconJournalRecord record;
+    record.state = LexiconJournalState::RollbackPending;
+    record.configExistedBefore = true;
+    record.dictExistedBefore = false;
+    record.oldGeneration = 10;
+    record.newGeneration = 11;
+    record.oldConfigHash = LexiconJournalRecord::ComputeHash(originalToml);
+    record.newConfigHash = "some_new_hash";
+
+    const auto journalPath = testDir_ / "lexicon_txn.journal";
+    WriteFile(journalPath, record.Serialize());
+
+    uint8_t publishedGen = 0;
+    LexiconWriter::SetTestGenerationPublisher([&publishedGen](uint8_t gen) {
+        publishedGen = gen;
+        return true;
+    });
+
+    EXPECT_TRUE(LexiconRecovery::RecoverIfNeeded(configPath_));
+    EXPECT_FALSE(std::filesystem::exists(journalPath));
+    EXPECT_EQ(publishedGen, 10u);
+
+    LexiconWriter::SetTestGenerationPublisher(nullptr);
 }
 
 } // namespace NextKey
