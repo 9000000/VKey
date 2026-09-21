@@ -5,6 +5,7 @@
 #include "RustInputEngine.h"
 
 #include "RustEngineLoader.h"
+#include "core/config/SpellExclusionCanonicalizer.h"
 
 #include "vkey_engine.h"  // vendored C ABI (extern/vkey_engine/include)
 
@@ -13,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -516,28 +518,77 @@ bool RustInputEngine::SetUserDictionary(
 #endif
 }
 
+namespace {
+
+std::mutex s_engineCreationMutex;
+std::wstring s_activeCanonicalExclusionsText;
+bool s_activeCanonicalExclusionsInitialized = false;
+
+} // namespace
+
 RustInputEngine::RustInputEngine(const TypingConfig& config) {
     const EngineApi& api = Api();
     if (api.ok) {
-        // Process-global spell exclusions must be set before create() -- the
-        // Rust side snapshots the active set into the engine at creation time.
-        if (config.spellExclusions.empty()) {
-            api.set_spell_exclusions_utf16(nullptr, 0);
-        } else {
-            // Concatenate exclusions as newline-delimited UTF-16 text.
-            std::wstring exclusions_text;
-            for (size_t i = 0; i < config.spellExclusions.size(); ++i) {
-                if (i > 0) {
-                    exclusions_text += L'\n';
+        // Serialized engine creation: vkey_engine_set_spell_exclusions_utf16 is
+        // process-global. We must synchronize setter + create() so concurrent
+        // threads never interleave exclusions, and roll back if create() fails.
+        std::lock_guard<std::mutex> lock(s_engineCreationMutex);
+
+        std::wstring newExclusionsText;
+        if (!config.spellExclusions.empty()) {
+            auto canonical = SpellExclusionCanonicalizer::Canonicalize(config.spellExclusions);
+            if (canonical.Succeeded()) {
+                for (size_t i = 0; i < canonical.entries.size(); ++i) {
+                    if (i > 0) newExclusionsText += L'\n';
+                    newExclusionsText += canonical.entries[i];
                 }
-                exclusions_text += config.spellExclusions[i];
+            } else {
+                for (size_t i = 0; i < config.spellExclusions.size(); ++i) {
+                    if (i > 0) newExclusionsText += L'\n';
+                    newExclusionsText += config.spellExclusions[i];
+                }
             }
-            api.set_spell_exclusions_utf16(
-                reinterpret_cast<const uint16_t*>(exclusions_text.data()),
-                exclusions_text.size());
         }
+
+        const bool exclusionsChanged = !s_activeCanonicalExclusionsInitialized ||
+                                       (newExclusionsText != s_activeCanonicalExclusionsText);
+
+        if (exclusionsChanged) {
+            bool setOk = false;
+            if (newExclusionsText.empty()) {
+                setOk = api.set_spell_exclusions_utf16(nullptr, 0);
+            } else {
+                setOk = api.set_spell_exclusions_utf16(
+                    reinterpret_cast<const uint16_t*>(newExclusionsText.data()),
+                    newExclusionsText.size());
+            }
+            if (!setOk) {
+                // Setter failed: fail-stale, do not proceed with create()
+                return;
+            }
+        }
+
         handle_ = api.create(MapMethod(config.inputMethod), MapFeatures(config));
-        if (handle_ && config.inputMethod == InputMethod::UserDefined) {
+        if (!handle_) {
+            // Creation failed: roll back process-global Rust state if changed
+            if (exclusionsChanged && s_activeCanonicalExclusionsInitialized) {
+                if (s_activeCanonicalExclusionsText.empty()) {
+                    api.set_spell_exclusions_utf16(nullptr, 0);
+                } else {
+                    api.set_spell_exclusions_utf16(
+                        reinterpret_cast<const uint16_t*>(s_activeCanonicalExclusionsText.data()),
+                        s_activeCanonicalExclusionsText.size());
+                }
+            }
+            return;
+        }
+
+        if (exclusionsChanged) {
+            s_activeCanonicalExclusionsText = std::move(newExclusionsText);
+            s_activeCanonicalExclusionsInitialized = true;
+        }
+
+        if (config.inputMethod == InputMethod::UserDefined) {
             api.set_custom_keymap(
                 static_cast<VKeyEngine*>(handle_),
                 reinterpret_cast<const uint8_t*>(config.customKeyMap.data()),

@@ -841,6 +841,21 @@ TEST_F(RustUserDictionaryFileTest, AttachWaitsForAnEmptyComposition) {
     EXPECT_FALSE(engine.SetUserDictionary(loaded.snapshot));
     EXPECT_EQ(engine.Peek(), L"a");
 }
+
+TEST_F(RustInputEngineTest, SerializedCreationAndSpellExclusionCanonicalization) {
+    TypingConfig config;
+    config.spellCheckEnabled = true;
+    config.spellExclusions = {L" ZÔ ", L"rose", L"zo\u0302", L"HĐ"};
+
+    RustInputEngine engine(config);
+    EXPECT_EQ(engine.Count(), 0u);
+
+    TypingConfig emptyConfig;
+    emptyConfig.spellCheckEnabled = true;
+    RustInputEngine engine2(emptyConfig);
+    EXPECT_EQ(engine2.Count(), 0u);
+}
+
 #endif
 
 }  // namespace
