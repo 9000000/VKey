@@ -432,5 +432,53 @@ TEST_F(LexiconTransactionTest, CrashRecoveryAtPrepared_DestinationAlreadyExists_
     EXPECT_FALSE(std::filesystem::exists(dictBak));
 }
 
+TEST_F(LexiconTransactionTest, PublishGeneration_DefaultAndCustomPublisher) {
+    // 1. Custom publisher hook
+    uint8_t publishedGen = 0;
+    LexiconWriter::SetTestGenerationPublisher([&](uint8_t gen) {
+        publishedGen = gen;
+        return true;
+    });
+    EXPECT_TRUE(LexiconWriter::PublishGeneration(99));
+    EXPECT_EQ(publishedGen, 99);
+
+    // 2. Custom publisher failure
+    LexiconWriter::SetTestGenerationPublisher([](uint8_t) {
+        return false;
+    });
+    EXPECT_FALSE(LexiconWriter::PublishGeneration(100));
+
+    // 3. Reset to default publisher
+    LexiconWriter::SetTestGenerationPublisher(nullptr);
+#if !defined(_WIN32)
+    // On Linux/macOS, default returns true
+    EXPECT_TRUE(LexiconWriter::PublishGeneration(101));
+#endif
+}
+
+TEST_F(LexiconTransactionTest, RollbackToBackupFailure_PreservesBackupFilesAndJournal) {
+    // configBak exists, but dictBak is missing even though dictExistedBefore = true
+    const auto configBak = testDir_ / "config.toml.bak";
+    WriteFile(configBak, "backup config");
+
+    LexiconJournalRecord record;
+    record.state = LexiconJournalState::Prepared;
+    record.configExistedBefore = true;
+    record.dictExistedBefore = true; // but dictBak does not exist!
+    record.configBakPath = configBak.string();
+    record.dictBakPath = (testDir_ / "user_dictionary.txt.bak").string();
+
+    const auto journalPath = testDir_ / "lexicon_txn.journal";
+    WriteFile(journalPath, record.Serialize());
+
+    // Recovery must fail because rollback could not restore dict
+    EXPECT_FALSE(LexiconRecovery::RecoverIfNeeded(configPath_));
+
+    // Journal must be preserved for forensics/subsequent recovery
+    EXPECT_TRUE(std::filesystem::exists(journalPath));
+    // And config was either restored to configPath or remains as backup
+    EXPECT_TRUE(std::filesystem::exists(configPath_) || std::filesystem::exists(configBak));
+}
+
 } // namespace NextKey
 

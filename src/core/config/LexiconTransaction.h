@@ -111,6 +111,10 @@ public:
     /// Hook to override generation publishing in tests. Set to nullptr to restore default.
     static void SetTestGenerationPublisher(GenerationPublisher publisher);
 
+    /// Publish generation to SharedState (using OpenReadWrite on Windows).
+    /// Returns true if published and verified, false otherwise.
+    [[nodiscard]] static bool PublishGeneration(uint8_t newGeneration);
+
     /// Execute a paired transaction writing both config.toml and user_dictionary.txt.
     /// Prepares temp files, creates backups, writes durable journal (PREPARED),
     /// replaces files (FILES_REPLACED), bumps generation (GENERATION_PUBLISHED),
