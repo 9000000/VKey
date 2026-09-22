@@ -109,6 +109,7 @@ bool TrayIcon::Create(HINSTANCE hInstance, bool initialVietnamese) {
     // This message carries no payload or pointer; it only asks the main process
     // to re-read SystemConfig and redraw the tray icon.
     ChangeWindowMessageFilterEx(hwndMessage_, WM_VKEY_ICON_CHANGED, MSGFLT_ALLOW, nullptr);
+    ChangeWindowMessageFilterEx(hwndMessage_, WM_VKEY_LEXICON_COMMITTED, MSGFLT_ALLOW, nullptr);
 
     // Always visible
     Shell_NotifyIconW(NIM_ADD, &nid_);
@@ -729,6 +730,14 @@ LRESULT CALLBACK TrayIcon::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             msg == g_trayInstance->wmTaskbarCreated_) {
             g_trayInstance->ReAddIcon();
             return 0;
+        }
+
+        if (g_trayInstance && hwnd == g_trayInstance->hwndMessage_ &&
+            msg == WM_VKEY_LEXICON_COMMITTED) {
+            return g_trayInstance->lexiconCommittedCallback_ &&
+                           g_trayInstance->lexiconCommittedCallback_()
+                       ? TRUE
+                       : FALSE;
         }
 
         if (g_trayInstance && g_trayInstance->ProcessMessage(hwnd, msg, wParam, lParam)) {

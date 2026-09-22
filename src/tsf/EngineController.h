@@ -329,6 +329,9 @@ private:
     uint8_t userDictionaryGeneration_ = 0;
     bool userDictionaryGenerationKnown_ = false;
     bool userDictionaryNeedsReload_ = false;
+    // True while wire/disk lexicon fields and dictionary are staged but have
+    // not all crossed the word-boundary promotion gate.
+    bool pendingLexiconSnapshot_ = false;
 
     Wire::LexiconWireReader wireReader_;
     std::vector<uint8_t> wireLocalBuffer_;

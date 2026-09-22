@@ -10,9 +10,11 @@
 #include <vector>
 
 #include "core/ipc/LexiconWireFormat.h"
+#if defined(VKEY_USE_RUST_ENGINE)
 #include "core/engine/RustEngineLoader.h"
 #include "core/engine/RustInputEngine.h"
 #include <vkey_engine.h>
+#endif
 
 #if !defined(_WIN32)
 #include <dlfcn.h>
@@ -59,6 +61,27 @@ TEST(LexiconWireFormatTest, WireHeaderOffsetAndAlignment) {
     EXPECT_EQ(WIRE_USED_MAX_BYTES, 141568u);
     EXPECT_EQ(WIRE_HEADROOM_BYTES, 5888u);
     EXPECT_EQ(WIRE_TOTAL_SIZE - WIRE_USED_MAX_BYTES, WIRE_HEADROOM_BYTES);
+}
+
+TEST(LexiconWireFormatTest, RejectsOverflowingDictionaryOffset) {
+    std::vector<uint8_t> buffer(WIRE_TOTAL_SIZE, 0);
+    LexiconWireSerializeParams params;
+    params.userDictionary = {u"word"};
+    ASSERT_TRUE(LexiconWireSerializer::Serialize(params, buffer.data(), buffer.size()));
+
+    auto* header = reinterpret_cast<LexiconWireHeader*>(buffer.data());
+    auto* entries = reinterpret_cast<DictWordEntryWire*>(
+        buffer.data() + USER_DICT_INDEX_OFFSET);
+    entries[0].offsetUnits = UINT32_MAX;
+    header->crc32 = ComputeCrc32(
+        buffer.data() + header->payloadOffsetBytes,
+        header->payloadSizeBytes);
+
+    LexiconWireView view;
+    std::string error;
+    EXPECT_FALSE(LexiconWireDeserializer::ValidateAndInspect(
+        buffer.data(), buffer.size(), view, &error));
+    EXPECT_NE(error.find("bounds"), std::string::npos);
 }
 
 TEST(LexiconWireFormatTest, Crc32StandardTestVector) {
@@ -330,6 +353,7 @@ TEST(LexiconWireFormatTest, SeqlockWriterReaderConcurrency) {
     EXPECT_GE(successfulReads.load(), 200u);
 }
 
+#if defined(VKEY_USE_RUST_ENGINE)
 TEST(LexiconWireFormatTest, FfiDirectRoundTripTest) {
     if (!RustInputEngine::LibraryAvailable()) {
         GTEST_SKIP() << "vkey_engine library is not available in test environment";
@@ -338,12 +362,22 @@ TEST(LexiconWireFormatTest, FfiDirectRoundTripTest) {
     auto loadRes = LoadRustEngineLibrary();
     ASSERT_NE(loadRes.handle, nullptr);
 
+#if defined(_WIN32)
+    const auto loadSymbol = [&](const char* name) -> void* {
+        return reinterpret_cast<void*>(
+            GetProcAddress(static_cast<HMODULE>(loadRes.handle), name));
+    };
+#else
+    const auto loadSymbol = [&](const char* name) -> void* {
+        return dlsym(loadRes.handle, name);
+    };
+#endif
     auto setSpellExcl = reinterpret_cast<bool (*)(const uint16_t*, size_t)>(
-        dlsym(loadRes.handle, "vkey_engine_set_spell_exclusions_utf16"));
+        loadSymbol("vkey_engine_set_spell_exclusions_utf16"));
     auto createDict = reinterpret_cast<VKeyUserDictionary* (*)(const uint16_t*, size_t, uint32_t*, size_t*)>(
-        dlsym(loadRes.handle, "vkey_user_dictionary_create_utf16"));
+        loadSymbol("vkey_user_dictionary_create_utf16"));
     auto destroyDict = reinterpret_cast<void (*)(VKeyUserDictionary*)>(
-        dlsym(loadRes.handle, "vkey_user_dictionary_destroy"));
+        loadSymbol("vkey_user_dictionary_destroy"));
 
     ASSERT_NE(setSpellExcl, nullptr);
     ASSERT_NE(createDict, nullptr);
@@ -382,6 +416,7 @@ TEST(LexiconWireFormatTest, FfiDirectRoundTripTest) {
     setSpellExcl(nullptr, 0);
     CloseRustEngineLibrary(loadRes.handle);
 }
+#endif
 
 } // namespace
 } // namespace NextKey::Wire

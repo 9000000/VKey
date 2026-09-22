@@ -123,6 +123,12 @@ public:
     /// Set callback when hook config changes (WM_VKEY_HOOK_RELOAD) — subprocess → main eager sync
     void SetHookReloadCallback(std::function<void()> callback) noexcept { hookReloadCallback_ = std::move(callback); }
 
+    /// Set callback for a committed lexicon transaction. The callback publishes
+    /// the wire snapshot before notifying SharedState, preserving reader ordering.
+    void SetLexiconCommittedCallback(std::function<bool()> callback) noexcept {
+        lexiconCommittedCallback_ = std::move(callback);
+    }
+
     /// Non-owning pointer to the process-wide SharedStateManager. Used only to
     /// read TSF-update flags for the restart-menu item. Safe to pass &g_sharedState.
     void SetSharedState(SharedStateManager* mgr) noexcept { sharedState_ = mgr; }
@@ -163,6 +169,7 @@ private:
     MenuStateGetter menuStateGetter_;
     std::function<void(WPARAM)> iconConfigChangedCallback_;
     std::function<void()> hookReloadCallback_;
+    std::function<bool()> lexiconCommittedCallback_;
     SharedStateManager* sharedState_ = nullptr;  // non-owning; for TSF-update flag checks
 
     // Icon style configuration

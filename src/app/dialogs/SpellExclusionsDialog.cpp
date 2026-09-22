@@ -348,21 +348,23 @@ bool SpellExclusionsDialog::saveAndApply(bool showToast) {
     }
     spellExclusions_ = std::move(canon.entries);
 
-    uint64_t currentWireGen = ConfigManager::LoadWireGeneration(configPath);
-    uint64_t nextWireGen = currentWireGen + 1;
-
-    std::string newConfigToml = ConfigManager::FormatConfigTomlForLexicon(
-        configPath, spellSuggestEnabled_, spellExclusions_, nextWireGen);
-    std::string newUserDictText = LexiconValidator::FormatUserDictText(userDictWords_);
-
-    bool ok = LexiconWriter::CommitTransaction(configPath, newConfigToml, newUserDictText);
+    const bool ok = LexiconWriter::CommitLexiconUpdate(
+        configPath, spellSuggestEnabled_, spellExclusions_, userDictWords_);
     if (!ok) {
         MessageBoxW(get_hwnd(), L"Lỗi khi thực hiện giao dịch lưu từ điển và cấu hình.", L"Lỗi giao dịch", MB_OK | MB_ICONERROR);
         return false;
     }
 
     modified_ = false;
-    SignalConfigChange();
+
+    if (!ApplyCommittedLexicon()) {
+        MessageBoxW(
+            get_hwnd(),
+            L"Đã lưu dữ liệu nhưng chưa thể áp dụng ngay. Vui lòng khởi động lại VKey.",
+            L"Chưa thể áp dụng",
+            MB_OK | MB_ICONWARNING);
+        return false;
+    }
 
     populateList(0);
     populateList(1);
@@ -373,4 +375,3 @@ bool SpellExclusionsDialog::saveAndApply(bool showToast) {
 }
 
 }  // namespace NextKey
-

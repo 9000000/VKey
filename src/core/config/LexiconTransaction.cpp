@@ -54,6 +54,22 @@ std::string ReadFileBytes(const std::filesystem::path& path) {
                        std::istreambuf_iterator<char>());
 }
 
+bool TryReadFileBytes(const std::filesystem::path& path, std::string& out) {
+    try {
+        std::ifstream file(path, std::ios::binary);
+        if (!file.is_open()) return false;
+
+        std::string content((std::istreambuf_iterator<char>(file)),
+                            std::istreambuf_iterator<char>());
+        if (file.bad()) return false;
+
+        out = std::move(content);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 bool DurableWrite(const std::filesystem::path& path, std::string_view data) {
 #if defined(_WIN32)
     HANDLE hFile = ::CreateFileW(
@@ -165,12 +181,25 @@ bool RollbackToBackup(
     std::error_code ec;
     bool ok = true;
 
+    const auto alreadyRestored = [&](const std::filesystem::path& path,
+                                     bool existedBefore,
+                                     const std::string& oldHash) {
+        const bool exists = std::filesystem::exists(path, ec);
+        if (ec) {
+            ec.clear();
+            return false;
+        }
+        if (!existedBefore) return !exists;
+        return exists && !oldHash.empty() &&
+               ComputeFnv1aHex(ReadFileBytes(path)) == oldHash;
+    };
+
     if (record.configExistedBefore) {
         if (std::filesystem::exists(configBak, ec)) {
             if (!DurableAtomicRename(configBak, configPath)) {
                 ok = false;
             }
-        } else {
+        } else if (!alreadyRestored(configPath, true, record.oldConfigHash)) {
             ok = false;
         }
     } else {
@@ -184,7 +213,7 @@ bool RollbackToBackup(
             if (!DurableAtomicRename(dictBak, dictPath)) {
                 ok = false;
             }
-        } else {
+        } else if (!alreadyRestored(dictPath, true, record.oldDictHash)) {
             ok = false;
         }
     } else {
@@ -289,6 +318,7 @@ std::string LexiconJournalRecord::Serialize() const {
     }
     ss << "config_existed=" << (configExistedBefore ? "1" : "0") << "\n";
     ss << "dict_existed=" << (dictExistedBefore ? "1" : "0") << "\n";
+    ss << "notify_shared_state=" << (notifySharedState ? "1" : "0") << "\n";
     ss << "old_gen=" << static_cast<unsigned>(oldGeneration) << "\n";
     ss << "new_gen=" << static_cast<unsigned>(newGeneration) << "\n";
     ss << "old_config_hash=" << oldConfigHash << "\n";
@@ -331,6 +361,8 @@ bool LexiconJournalRecord::Deserialize(std::string_view text, LexiconJournalReco
             outRecord.configExistedBefore = (val == "1" || val == "true");
         } else if (key == "dict_existed") {
             outRecord.dictExistedBefore = (val == "1" || val == "true");
+        } else if (key == "notify_shared_state") {
+            outRecord.notifySharedState = (val == "1" || val == "true");
         } else if (key == "old_gen") {
             outRecord.oldGeneration = static_cast<uint8_t>(std::stoul(val));
         } else if (key == "new_gen") {
@@ -372,7 +404,7 @@ LexiconSyncLock::LexiconSyncLock(uint32_t timeoutMs) {
     }
 #else
     // POSIX lock file for tests / Linux builds
-    std::string lockPath = "/tmp/vkey_lexicon_sync.lock";
+    std::string lockPath = "/tmp/vkey_config.lock";
     int fd = ::open(lockPath.c_str(), O_CREAT | O_RDWR, 0666);
     if (fd < 0) return;
     handle_ = reinterpret_cast<void*>(static_cast<intptr_t>(fd));
@@ -519,7 +551,8 @@ bool LexiconRecovery::RecoverIfNeeded(const std::filesystem::path& configPath) {
                     return false;
                 }
 
-                if (!LexiconWriter::PublishGeneration(record.oldGeneration)) {
+                if (record.notifySharedState &&
+                    !LexiconWriter::PublishGeneration(record.oldGeneration)) {
                     // Persist in RollbackPending state so future recovery knows files are already rolled back
                     if (!TransitionJournalState(configPath, record, LexiconJournalState::RollbackPending)) {
                         return false;
@@ -535,7 +568,8 @@ bool LexiconRecovery::RecoverIfNeeded(const std::filesystem::path& configPath) {
             }
 
             // Hashes verified: roll-forward
-            if (!LexiconWriter::PublishGeneration(record.newGeneration)) {
+            if (record.notifySharedState &&
+                !LexiconWriter::PublishGeneration(record.newGeneration)) {
                 // Generation publishing failed! Keep backups and journal, fail-stale.
                 return false;
             }
@@ -598,7 +632,8 @@ bool LexiconRecovery::RecoverIfNeeded(const std::filesystem::path& configPath) {
                 return false;
             }
 
-            if (!LexiconWriter::PublishGeneration(record.oldGeneration)) {
+            if (record.notifySharedState &&
+                !LexiconWriter::PublishGeneration(record.oldGeneration)) {
                 // Generation restore failed: persist in RollbackPending state, fail-stale
                 return false;
             }
@@ -740,12 +775,15 @@ bool LexiconReader::LoadUserDictionaryWordsLocked(
 
     const std::filesystem::path dictPath = configPath.parent_path() / "user_dictionary.txt";
     std::error_code ec;
-    if (!std::filesystem::exists(dictPath, ec)) {
+    const bool dictExists = std::filesystem::exists(dictPath, ec);
+    if (ec) return false;
+    if (!dictExists) {
         outWords.clear();
         return true;
     }
 
-    std::string content = ReadFileBytes(dictPath);
+    std::string content;
+    if (!TryReadFileBytes(dictPath, content)) return false;
     auto res = LexiconValidator::ParseAndValidateUserDictText(content);
     if (!res.validation.Succeeded()) {
         return false;
@@ -757,16 +795,18 @@ bool LexiconReader::LoadUserDictionaryWordsLocked(
 // ─── LexiconWriter Implementation ───────────────────────────────────────────
 
 
-bool LexiconWriter::CommitTransaction(
+static bool CommitTransactionImpl(
     const std::wstring& configPathStr,
     const std::string& newConfigToml,
     const std::string& newUserDictText,
     uint8_t oldGeneration,
     uint8_t newGeneration,
-    bool notifySharedState) {
-    LexiconSyncLock lock(kLexiconMutexTimeoutMs);
-    if (!lock.IsLocked()) {
-        return false;
+    bool notifySharedState,
+    bool acquireLock) {
+    std::unique_ptr<LexiconSyncLock> ownedLock;
+    if (acquireLock) {
+        ownedLock = std::make_unique<LexiconSyncLock>(kLexiconMutexTimeoutMs);
+        if (!ownedLock->IsLocked()) return false;
     }
 
     const std::filesystem::path configPath(configPathStr);
@@ -906,6 +946,7 @@ bool LexiconWriter::CommitTransaction(
     record.state = LexiconJournalState::Prepared;
     record.configExistedBefore = configExisted;
     record.dictExistedBefore = dictExisted;
+    record.notifySharedState = notifySharedState;
     record.oldGeneration = oldGeneration;
     record.newGeneration = newGeneration;
     record.newConfigHash = ComputeFnv1aHex(newConfigToml);
@@ -949,7 +990,8 @@ bool LexiconWriter::CommitTransaction(
     bool wirePublished = false;
     if (notifySharedState && (sWireManager || sTestWirePublisher)) {
         std::string wireErr;
-        if (!PublishWireMapping(parsedExclusions, dictRes.entries, wireGen, spellSuggest, &wireErr)) {
+        if (!LexiconWriter::PublishWireMapping(
+                parsedExclusions, dictRes.entries, wireGen, spellSuggest, &wireErr)) {
             // Publishing wire mapping failed! Transition journal to RollbackPending.
             // SharedState generation was NOT published, so SharedState remains clean at oldGeneration.
             if (!TransitionJournalState(configPath, record, LexiconJournalState::RollbackPending)) {
@@ -970,7 +1012,7 @@ bool LexiconWriter::CommitTransaction(
 
     // 7. Publish Generation to SharedState (bumping SharedState epoch)
     if (notifySharedState) {
-        if (!PublishGeneration(newGeneration)) {
+        if (!LexiconWriter::PublishGeneration(newGeneration)) {
             // Publishing generation failed! Transition journal to RollbackPending.
             if (!TransitionJournalState(configPath, record, LexiconJournalState::RollbackPending)) {
                 return false;
@@ -980,13 +1022,14 @@ bool LexiconWriter::CommitTransaction(
             bool wireRestored = true;
             if (wirePublished) {
                 std::string restoreErr;
-                wireRestored = PublishWireMapping(oldExclusions, oldDictWords, oldWireGen, oldSpellSuggest, &restoreErr);
+                wireRestored = LexiconWriter::PublishWireMapping(
+                    oldExclusions, oldDictWords, oldWireGen, oldSpellSuggest, &restoreErr);
                 // If restore failed, journal stays ROLLBACK_PENDING; RecoverIfNeeded() will retry on next startup.
             }
             // Attempt to restore old generation in SharedState to ensure clean state
             bool oldGenRestored = false;
             for (int attempt = 0; attempt < 3; ++attempt) {
-                if (PublishGeneration(oldGeneration)) {
+                if (LexiconWriter::PublishGeneration(oldGeneration)) {
                     oldGenRestored = true;
                     break;
                 }
@@ -1035,6 +1078,23 @@ bool LexiconWriter::CommitTransaction(
     const std::wstring& configPath,
     const std::string& newConfigToml,
     const std::string& newUserDictText,
+    uint8_t oldGeneration,
+    uint8_t newGeneration,
+    bool notifySharedState) {
+    return CommitTransactionImpl(
+        configPath,
+        newConfigToml,
+        newUserDictText,
+        oldGeneration,
+        newGeneration,
+        notifySharedState,
+        true);
+}
+
+bool LexiconWriter::CommitTransaction(
+    const std::wstring& configPath,
+    const std::string& newConfigToml,
+    const std::string& newUserDictText,
     bool notifySharedState) {
     uint8_t oldGen = 0;
 #if defined(_WIN32)
@@ -1048,6 +1108,99 @@ bool LexiconWriter::CommitTransaction(
 #endif
     uint8_t newGen = static_cast<uint8_t>(oldGen + 1);
     return CommitTransaction(configPath, newConfigToml, newUserDictText, oldGen, newGen, notifySharedState);
+}
+
+bool LexiconWriter::CommitLexiconUpdate(
+    const std::wstring& configPath,
+    bool spellSuggestEnabled,
+    const std::vector<std::wstring>& spellExclusions,
+    const std::vector<std::wstring>& userDictionary) {
+    LexiconSyncLock lock(kLexiconMutexTimeoutMs);
+    if (!lock.IsLocked()) return false;
+
+    const std::filesystem::path path(configPath);
+    // The merge must be based on the last committed config, not on files left
+    // behind by a crashed PREPARED transaction. CommitTransactionImpl also
+    // recovers, but doing it there is too late because this function has
+    // already parsed and modified the config by then.
+    if (!LexiconRecovery::RecoverIfNeeded(path)) return false;
+
+    std::string newConfigToml;
+    try {
+        toml::table table;
+        std::error_code ec;
+        const bool configExists = std::filesystem::exists(path, ec);
+        if (ec) return false;
+        if (configExists) {
+            std::string configBytes;
+            if (!TryReadFileBytes(path, configBytes)) return false;
+            table = toml::parse(configBytes);
+        }
+
+        uint64_t currentWireGeneration = 1;
+        if (auto* internal = table["internal"].as_table()) {
+            if (auto* value = (*internal)["wire_generation"].as_integer();
+                value && value->get() > 0) {
+                currentWireGeneration = static_cast<uint64_t>(value->get());
+            }
+        }
+        if (currentWireGeneration >= static_cast<uint64_t>(INT64_MAX)) return false;
+
+        toml::array exclusions;
+        for (const auto& entry : spellExclusions) {
+            std::u32string scalars;
+            std::string utf8;
+            if (!SpellExclusionCanonicalizer::Utf16ToUtf32(entry, scalars) ||
+                !SpellExclusionCanonicalizer::Utf32ToUtf8(scalars, utf8)) {
+                return false;
+            }
+            exclusions.push_back(std::move(utf8));
+        }
+
+        auto* features = table["features"].as_table();
+        if (!features) {
+            table.insert_or_assign("features", toml::table{});
+            features = table["features"].as_table();
+        }
+        features->insert_or_assign("spell_suggest", spellSuggestEnabled);
+        features->insert_or_assign("spell_exclusions", std::move(exclusions));
+
+        auto* internal = table["internal"].as_table();
+        if (!internal) {
+            table.insert_or_assign("internal", toml::table{});
+            internal = table["internal"].as_table();
+        }
+        internal->insert_or_assign(
+            "wire_generation", static_cast<int64_t>(currentWireGeneration + 1));
+
+        std::ostringstream stream;
+        stream << table;
+        newConfigToml = stream.str();
+    } catch (...) {
+        return false;
+    }
+
+    const std::string newUserDictText = LexiconValidator::FormatUserDictText(userDictionary);
+    uint8_t oldGeneration = 0;
+#if defined(_WIN32)
+    SharedStateManager sm;
+    if (sm.Open()) {
+        const SharedState state = sm.Read();
+        if (state.IsValid()) oldGeneration = state.configGeneration;
+    }
+#endif
+    const uint8_t newGeneration = static_cast<uint8_t>(oldGeneration + 1);
+
+    // The main process owns the wire mapping. It publishes the committed disk
+    // snapshot and only then announces this generation through SharedState.
+    return CommitTransactionImpl(
+        configPath,
+        newConfigToml,
+        newUserDictText,
+        oldGeneration,
+        newGeneration,
+        false,
+        false);
 }
 
 } // namespace NextKey

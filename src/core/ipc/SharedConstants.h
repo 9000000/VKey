@@ -35,6 +35,7 @@ constexpr UINT WM_VKEY_TRAY_TSF_SYNC = WM_USER + 118;     // Deferred: sync tray
 constexpr UINT WM_VKEY_OPEN_ICON_SETTINGS = WM_USER + 119; // Deferred: open icon customization dialog
 constexpr UINT WM_VKEY_ICON_SETTINGS_CHANGED = WM_USER + 120; // Icon dialog → Settings: refresh cached SystemConfig only
 constexpr UINT WM_VKEY_TRAY_APP_SYNC = WM_USER + 121;     // Deferred: consume latest tray app-context snapshot
+constexpr UINT WM_VKEY_LEXICON_COMMITTED = WM_USER + 122; // Lexicon dialog → Main: publish wire, then signal generation
 
 }  // namespace NextKey
 

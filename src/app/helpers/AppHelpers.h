@@ -12,6 +12,7 @@
 #include <cwctype>
 #include <istream>
 #include <iterator>
+#include <optional>
 #include <string>
 
 #ifndef _WIN32
@@ -45,12 +46,17 @@ namespace NextKey {
 /// Called from dialog persistence methods after ConfigManager::Save*().
 /// Increments configGeneration in SharedState — HookEngine detects on next keystroke.
 /// Also signals ConfigEvent for TSF DLL which still uses the Named Event path.
-inline void SignalConfigChange() noexcept {
+inline void SignalConfigChange(
+    bool postHookReload = true,
+    std::optional<SpellCheckLevel> committedSpellLevel = std::nullopt) noexcept {
     // Bump configGeneration in SharedState (HookEngine reads this)
     SharedStateManager sm;
     if (sm.OpenReadWrite()) {
         SharedState state = sm.Read();
         if (state.IsValid()) {
+            if (committedSpellLevel) {
+                state.spellCheck = static_cast<uint8_t>(*committedSpellLevel);
+            }
             state.configGeneration++;
             sm.Write(state);
         }
@@ -63,9 +69,32 @@ inline void SignalConfigChange() noexcept {
 #ifdef _WIN32
     // Eager hook reload: tell main EXE to QuickSync now so new list applies
     // without waiting for the next keystroke / focus change in the target app.
-    if (HWND trayWnd = FindWindowW(L"VKeyTrayClass", nullptr)) {
-        PostMessageW(trayWnd, WM_VKEY_HOOK_RELOAD, 0, 0);
+    if (postHookReload) {
+        if (HWND trayWnd = FindWindowW(L"VKeyTrayClass", nullptr)) {
+            PostMessageW(trayWnd, WM_VKEY_HOOK_RELOAD, 0, 0);
+        }
     }
+#endif
+}
+
+/// Ask the main process to publish the committed lexicon snapshot to its
+/// single-writer mapping, then signal SharedState/TSF. Send synchronously so
+/// readers can never observe the generation before the wire contents.
+inline bool ApplyCommittedLexicon() noexcept {
+#ifdef _WIN32
+    const HWND trayWnd = FindWindowW(L"VKeyTrayClass", nullptr);
+    if (!trayWnd) return false;
+    DWORD_PTR result = 0;
+    return SendMessageTimeoutW(
+               trayWnd,
+               WM_VKEY_LEXICON_COMMITTED,
+               0,
+               0,
+               SMTO_ABORTIFHUNG | SMTO_BLOCK,
+               5000,
+               &result) != 0 && result != 0;
+#else
+    return false;
 #endif
 }
 

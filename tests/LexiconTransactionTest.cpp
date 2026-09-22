@@ -182,7 +182,108 @@ TEST_F(LexiconTransactionTest, CrashRecoveryAtPreparedRollsBackToOriginalFiles) 
     EXPECT_FALSE(std::filesystem::exists(dictBak));
 }
 
+TEST_F(LexiconTransactionTest, PreparedRecoveryRetriesAfterPartialRollback) {
+    const std::string oldConfig = "old config";
+    const std::string oldDictionary = "old dictionary";
+    WriteFile(configPath_, "new config");
+
+    const auto configBak = testDir_ / "config.toml.bak";
+    const auto dictBak = testDir_ / "user_dictionary.txt.bak";
+    WriteFile(configBak, oldConfig);
+    WriteFile(dictBak, oldDictionary);
+
+    // A non-empty directory at the destination makes the dictionary rename
+    // fail after config restoration has already consumed configBak.
+    std::filesystem::create_directory(dictPath_);
+    WriteFile(dictPath_ / "block", "x");
+
+    LexiconJournalRecord record;
+    record.state = LexiconJournalState::Prepared;
+    record.configExistedBefore = true;
+    record.dictExistedBefore = true;
+    record.oldConfigHash = LexiconJournalRecord::ComputeHash(oldConfig);
+    record.oldDictHash = LexiconJournalRecord::ComputeHash(oldDictionary);
+    WriteFile(testDir_ / "lexicon_txn.journal", record.Serialize());
+
+    EXPECT_FALSE(LexiconRecovery::RecoverIfNeeded(configPath_));
+    EXPECT_EQ(ReadFile(configPath_), oldConfig);
+    EXPECT_FALSE(std::filesystem::exists(configBak));
+
+    std::filesystem::remove(dictPath_ / "block");
+    std::filesystem::remove(dictPath_);
+    EXPECT_TRUE(LexiconRecovery::RecoverIfNeeded(configPath_));
+    EXPECT_EQ(ReadFile(configPath_), oldConfig);
+    EXPECT_EQ(ReadFile(dictPath_), oldDictionary);
+    EXPECT_FALSE(std::filesystem::exists(testDir_ / "lexicon_txn.journal"));
+}
+
+TEST_F(LexiconTransactionTest, CommitLexiconUpdatePreservesUnrelatedConfig) {
+    WriteFile(
+        configPath_,
+        "[other]\nkeep = 42\n[features]\nspell_suggest = false\nspell_exclusions = []\n");
+
+    ASSERT_TRUE(LexiconWriter::CommitLexiconUpdate(
+        configPath_.wstring(), true, {L"hđ"}, {L"soà"}));
+
+    const std::string saved = ReadFile(configPath_);
+    EXPECT_NE(saved.find("keep = 42"), std::string::npos);
+    EXPECT_NE(saved.find("spell_suggest = true"), std::string::npos);
+    EXPECT_NE(saved.find("hđ"), std::string::npos);
+    EXPECT_NE(ReadFile(dictPath_).find("soà"), std::string::npos);
+}
+
+TEST_F(LexiconTransactionTest, CommitLexiconUpdateRecoversBeforeMergingConfig) {
+    const std::string committedConfig =
+        "[other]\nkeep = 42\n[features]\nspell_suggest = false\nspell_exclusions = []\n";
+    const std::string committedDictionary = "oldword\n";
+    WriteFile(configPath_, "[other]\nstale = 99\n");
+    WriteFile(dictPath_, "uncommitted\n");
+    WriteFile(testDir_ / "config.toml.bak", committedConfig);
+    WriteFile(testDir_ / "user_dictionary.txt.bak", committedDictionary);
+
+    LexiconJournalRecord record;
+    record.state = LexiconJournalState::Prepared;
+    record.configExistedBefore = true;
+    record.dictExistedBefore = true;
+    record.oldConfigHash = LexiconJournalRecord::ComputeHash(committedConfig);
+    record.oldDictHash = LexiconJournalRecord::ComputeHash(committedDictionary);
+    WriteFile(testDir_ / "lexicon_txn.journal", record.Serialize());
+
+    ASSERT_TRUE(LexiconWriter::CommitLexiconUpdate(
+        configPath_.wstring(), true, {L"hđ"}, {L"soà"}));
+
+    const std::string saved = ReadFile(configPath_);
+    EXPECT_NE(saved.find("keep = 42"), std::string::npos);
+    EXPECT_EQ(saved.find("stale = 99"), std::string::npos);
+    EXPECT_NE(saved.find("spell_suggest = true"), std::string::npos);
+}
+
+TEST_F(LexiconTransactionTest, DeferredTransactionRecoveryDoesNotPublishGeneration) {
+    const std::string newConfig = "[internal]\nwire_generation = 12\n";
+    const std::string newDictionary = "word\n";
+    WriteFile(configPath_, newConfig);
+    WriteFile(dictPath_, newDictionary);
+
+    LexiconJournalRecord record;
+    record.state = LexiconJournalState::FilesReplaced;
+    record.notifySharedState = false;
+    record.newGeneration = 9;
+    record.newConfigHash = LexiconJournalRecord::ComputeHash(newConfig);
+    record.newDictHash = LexiconJournalRecord::ComputeHash(newDictionary);
+    WriteFile(testDir_ / "lexicon_txn.journal", record.Serialize());
+
+    int publishCalls = 0;
+    LexiconWriter::SetTestGenerationPublisher([&](uint8_t) {
+        ++publishCalls;
+        return true;
+    });
+    EXPECT_TRUE(LexiconRecovery::RecoverIfNeeded(configPath_));
+    EXPECT_EQ(publishCalls, 0);
+    EXPECT_FALSE(std::filesystem::exists(testDir_ / "lexicon_txn.journal"));
+}
+
 TEST_F(LexiconTransactionTest, CrashRecoveryAtFilesReplacedRollsForward) {
+    LexiconWriter::SetTestGenerationPublisher([](uint8_t) { return true; });
     // Setup state: both files were replaced with new content, crash happened before commit
     WriteFile(configPath_, "new replaced config");
     WriteFile(dictPath_, "new replaced dict");
@@ -257,6 +358,15 @@ TEST_F(LexiconTransactionTest, LoadUserDictionaryWordsLocked_ExistingFileReturns
     EXPECT_EQ(words[1], L"so\u00e0");
 }
 
+TEST_F(LexiconTransactionTest, LoadUserDictionaryWordsLocked_ReadFailureIsNotEmptyDictionary) {
+    std::filesystem::create_directory(dictPath_);
+    std::vector<std::wstring> words{L"keep-stale"};
+
+    EXPECT_FALSE(LexiconReader::LoadUserDictionaryWordsLocked(configPath_.wstring(), words));
+    ASSERT_EQ(words.size(), 1u);
+    EXPECT_EQ(words.front(), L"keep-stale");
+}
+
 TEST_F(LexiconTransactionTest, CommitTransaction_ConvenienceOverload) {
     const std::string newToml = "[features]\nspell_suggest = true\n";
     const std::string newDict = "# Dict\nalo\n";
@@ -326,6 +436,7 @@ TEST_F(LexiconTransactionTest, CorruptedJournal_FailsRecoveryAndReaderFailsStale
 }
 
 TEST_F(LexiconTransactionTest, FilesReplaced_HashMismatchRollsBackToBackup) {
+    LexiconWriter::SetTestGenerationPublisher([](uint8_t) { return true; });
     // Original files backed up
     const auto configBak = testDir_ / "config.toml.bak";
     const auto dictBak = testDir_ / "user_dictionary.txt.bak";
@@ -550,6 +661,9 @@ TEST_F(LexiconTransactionTest, CommitTransaction_PublishesWireMappingWhenConfigu
     Wire::LexiconWireManager wireManager;
     ASSERT_TRUE(wireManager.Create());
     LexiconWriter::SetWireManager(&wireManager);
+    // Keep the test independent of a live VKey process on Windows. Generation
+    // publication itself is covered by the dedicated publisher tests below.
+    LexiconWriter::SetTestGenerationPublisher([](uint8_t) { return true; });
 
     std::string newConfigToml = R"(
 [input]
@@ -588,6 +702,7 @@ TEST_F(LexiconTransactionTest, CommitTransaction_RollsBackWhenWirePublishingFail
     // 1. Initial valid commit
     std::string validToml = "[input]\nmethod = \"telex\"\n";
     std::string validDict = "ban\n";
+    LexiconWriter::SetTestGenerationPublisher([](uint8_t) { return true; });
     ASSERT_TRUE(LexiconWriter::CommitTransaction(configPath_.wstring(), validToml, validDict));
 
     // 2. Setup mock wire publisher hook that fails
@@ -635,6 +750,7 @@ TEST_F(LexiconTransactionTest, CommitTransaction_PreservesBackupsAndJournalWhenR
     // 1. Initial valid commit
     std::string validToml = "[input]\nmethod = \"telex\"\n";
     std::string validDict = "ban\n";
+    LexiconWriter::SetTestGenerationPublisher([](uint8_t) { return true; });
     ASSERT_TRUE(LexiconWriter::CommitTransaction(configPath_.wstring(), validToml, validDict, 1, 2, true));
 
     // 2. Setup mock wire publisher hook that succeeds

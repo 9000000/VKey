@@ -311,7 +311,7 @@ TEST(LexiconWireManagerTest, FastPathCacheIdentityVerification) {
     EXPECT_EQ(reader.GetCachedIdentity().sharedStateEpoch, 100u);
     EXPECT_EQ(reader.GetCachedIdentity().wireGeneration, 10u);
 
-    // 2. Same epoch: epoch = 100 -> true zero-cost fast path (< 1 ns, wasUpdated == false)
+    // 2. Same epoch with unchanged wire identity skips the 144 KiB copy.
     wasUpdated = true;
     ASSERT_TRUE(reader.ReadSnapshotFast(localBuf, view, 100, &wasUpdated));
     EXPECT_FALSE(wasUpdated);
@@ -333,6 +333,30 @@ TEST(LexiconWireManagerTest, FastPathCacheIdentityVerification) {
     EXPECT_TRUE(wasUpdated);
     EXPECT_EQ(reader.GetCachedIdentity().sharedStateEpoch, 104u);
     EXPECT_EQ(reader.GetCachedIdentity().wireGeneration, 20u);
+
+    reader.Close();
+    manager.Close();
+}
+
+TEST(LexiconWireManagerTest, FastPathDetectsLatePublishAtSameEpoch) {
+    LexiconWireManager manager;
+    ASSERT_TRUE(manager.Create());
+    ASSERT_TRUE(manager.Publish({}, {L"old"}, 100, true));
+
+    LexiconWireReader reader;
+    ASSERT_TRUE(reader.Open());
+    std::vector<uint8_t> localBuffer;
+    LexiconWireView view;
+    bool updated = false;
+    ASSERT_TRUE(reader.ReadSnapshotFast(localBuffer, view, 7, &updated));
+    ASSERT_TRUE(updated);
+
+    ASSERT_TRUE(manager.Publish({}, {L"new"}, 101, true));
+    updated = false;
+    ASSERT_TRUE(reader.ReadSnapshotFast(localBuffer, view, 7, &updated));
+    EXPECT_TRUE(updated);
+    ASSERT_NE(view.header, nullptr);
+    EXPECT_EQ(view.header->generation, 101u);
 
     reader.Close();
     manager.Close();

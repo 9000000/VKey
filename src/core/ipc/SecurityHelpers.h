@@ -61,15 +61,17 @@ inline bool GetCurrentProcessUserSidString(std::wstring& outSid) noexcept {
 }
 
 // Returns a SECURITY_ATTRIBUTES that grants full access (write) strictly to SYSTEM and Admins.
-// Interactive User (IU), current user, and AppContainer sandbox packages (AC, RA) receive ONLY read access (GENERIC_READ).
-// This enforces the single-writer invariant and prevents any other process of the same user from opening the mapping for write.
+// Interactive User (IU), current user, and AppContainer sandbox packages (AC, RA)
+// receive read access. The current user also receives WRITE_DAC so a restarted
+// writer holding the exclusive writer mutex can reopen a section kept alive by
+// readers and restore its write DACL. FILE_MAP_WRITE remains denied here.
 // Call LocalFree(sa.lpSecurityDescriptor) after the handle is created.
 //
 // SDDL breakdown:
 //   D:PAI              — DACL, protected, auto-inherited
 //   (A;;GA;;;SY)       — Allow GENERIC_ALL to SYSTEM
 //   (A;;GA;;;BA)       — Allow GENERIC_ALL to Built-in Administrators
-//   (A;;GR;;;<UserSID>)— Allow GENERIC_READ to Current User SID (read-only)
+//   (A;;GRWD;;;<UserSID>)— Read plus WRITE_DAC to Current User SID (no section write)
 //   (A;;GR;;;IU)       — Allow GENERIC_READ to Interactively logged-on User (read-only)
 //   (A;;GR;;;AC)       — Allow GENERIC_READ to ALL APPLICATION PACKAGES (S-1-15-2-1)
 //   (A;;GR;;;RA)       — Allow GENERIC_READ to ALL RESTRICTED APPLICATION PACKAGES (S-1-15-2-2)
@@ -77,9 +79,9 @@ inline SECURITY_ATTRIBUTES MakeAppContainerReadableSecurityAttributes() noexcept
     std::wstring userSid;
     std::wstring sddl;
     if (GetCurrentProcessUserSidString(userSid) && !userSid.empty()) {
-        sddl = L"D:PAI(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;" + userSid + L")(A;;GR;;;IU)(A;;GR;;;AC)(A;;GR;;;RA)";
+        sddl = L"D:PAI(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRWD;;;" + userSid + L")(A;;GR;;;IU)(A;;GR;;;AC)(A;;GR;;;RA)";
     } else {
-        sddl = L"D:PAI(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;IU)(A;;GR;;;AC)(A;;GR;;;RA)";
+        sddl = L"D:PAI(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRWD;;;CO)(A;;GR;;;IU)(A;;GR;;;AC)(A;;GR;;;RA)";
     }
 
     PSECURITY_DESCRIPTOR pSD = nullptr;
@@ -95,8 +97,9 @@ inline SECURITY_ATTRIBUTES MakeAppContainerReadableSecurityAttributes() noexcept
     return sa;
 }
 
-// Temporary security attributes granting read/write access to SYSTEM, Admins, and
-// current User SID, used strictly by the creator process during section creation and re-attachment.
+// Temporary security attributes granting section read/write plus WRITE_DAC to
+// SYSTEM, Admins, and the current User SID, used strictly by the creator process
+// during section creation and re-attachment.
 // Note on Windows NT security boundary:
 // Named kernel objects in Windows authorize SIDs (user/group credentials), not process IDs (PIDs).
 // Any write ACE for User SID technically allows processes in the same user logon session to request
@@ -109,9 +112,9 @@ inline SECURITY_ATTRIBUTES MakeCreatorWriteSecurityAttributes() noexcept {
     std::wstring userSid;
     std::wstring sddl;
     if (GetCurrentProcessUserSidString(userSid) && !userSid.empty()) {
-        sddl = L"D:PAI(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;" + userSid + L")(A;;GR;;;IU)(A;;GR;;;AC)(A;;GR;;;RA)";
+        sddl = L"D:PAI(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGWWD;;;" + userSid + L")(A;;GR;;;IU)(A;;GR;;;AC)(A;;GR;;;RA)";
     } else {
-        sddl = L"D:PAI(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;CO)(A;;GR;;;IU)(A;;GR;;;AC)(A;;GR;;;RA)";
+        sddl = L"D:PAI(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGWWD;;;CO)(A;;GR;;;IU)(A;;GR;;;AC)(A;;GR;;;RA)";
     }
 
     PSECURITY_DESCRIPTOR pSD = nullptr;

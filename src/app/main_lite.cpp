@@ -79,46 +79,72 @@ static SharedStateManager g_sharedState;
 static Wire::LexiconWireManager g_wireManager;
 static std::unique_ptr<QuickConvert> g_quickConvert;
 
-static void PublishCurrentLexiconToWire() {
-    if (!g_wireManager.IsWritable()) return;
+static bool PublishCurrentLexiconToWire() {
+    if (!g_wireManager.IsWritable()) return false;
     const std::wstring configPath = ConfigManager::GetConfigPath();
+    LexiconSyncLock snapshotLock;
+    if (!snapshotLock.IsLocked() || !LexiconRecovery::RecoverIfNeeded(configPath)) {
+        NEXTKEY_LOG(L"PublishCurrentLexiconToWire: paired snapshot lock/recovery failed");
+        return false;
+    }
     auto diskConfig = ConfigManager::LoadFromFile(configPath);
-    if (!diskConfig) return;
+    if (!diskConfig) return false;
+
+    std::vector<std::wstring> dictWords;
+    if (!LexiconReader::LoadUserDictionaryWordsLocked(configPath, dictWords)) {
+        NEXTKEY_LOG(L"PublishCurrentLexiconToWire: dictionary read failed; retaining prior snapshot");
+        return false;
+    }
 
     uint64_t wireGen = ConfigManager::LoadWireGeneration(configPath);
     if (wireGen <= g_wireManager.GetWireGeneration()) {
         wireGen = g_wireManager.GetWireGeneration() + 1;
-        static_cast<void>(ConfigManager::SaveWireGeneration(configPath, wireGen));
+        if (!ConfigManager::SaveWireGeneration(configPath, wireGen)) {
+            NEXTKEY_LOG(L"PublishCurrentLexiconToWire: failed to persist generation");
+            return false;
+        }
     }
     g_wireManager.SetWireGeneration(wireGen);
-
-    std::vector<std::wstring> dictWords;
-    LexiconReader::LoadUserDictionaryWordsLocked(configPath, dictWords);
 
     std::string err;
     if (!g_wireManager.Publish(diskConfig->spellExclusions, dictWords, wireGen, diskConfig->spellSuggestEnabled, &err)) {
         NEXTKEY_LOG(L"PublishCurrentLexiconToWire failed: %hs", err.c_str());
+        return false;
     } else {
         NEXTKEY_LOG(L"PublishCurrentLexiconToWire: published gen=%llu dictWords=%zu exclusions=%zu",
                     static_cast<unsigned long long>(wireGen), dictWords.size(), diskConfig->spellExclusions.size());
     }
+    return true;
 }
 
-static void InitLexiconWireMapping(const TypingConfig& config) {
+static void InitLexiconWireMapping() {
     if (g_wireManager.Create()) {
         LexiconWriter::SetWireManager(&g_wireManager);
         const std::wstring configPath = ConfigManager::GetConfigPath();
+        LexiconSyncLock snapshotLock;
+        if (!snapshotLock.IsLocked() || !LexiconRecovery::RecoverIfNeeded(configPath)) {
+            NEXTKEY_LOG(L"InitLexiconWireMapping: paired snapshot lock/recovery failed");
+            return;
+        }
         uint64_t wireGen = ConfigManager::LoadWireGeneration(configPath);
         g_wireManager.SetWireGeneration(wireGen);
 
         std::vector<std::wstring> initialDict;
-        LexiconReader::LoadUserDictionaryWordsLocked(configPath, initialDict);
+        if (!LexiconReader::LoadUserDictionaryWordsLocked(configPath, initialDict)) {
+            NEXTKEY_LOG(L"InitLexiconWireMapping: dictionary read failed; wire remains unpublished");
+            return;
+        }
         std::string err;
-        if (!g_wireManager.Publish(config.spellExclusions, initialDict, wireGen, config.spellSuggestEnabled, &err)) {
+        const auto diskConfig = ConfigManager::LoadFromFile(configPath);
+        if (!diskConfig) {
+            NEXTKEY_LOG(L"InitLexiconWireMapping: config read failed; wire remains unpublished");
+            return;
+        }
+        if (!g_wireManager.Publish(diskConfig->spellExclusions, initialDict, wireGen, diskConfig->spellSuggestEnabled, &err)) {
             NEXTKEY_LOG(L"InitLexiconWireMapping: failed to publish initial wire snapshot: %hs", err.c_str());
         } else {
             NEXTKEY_LOG(L"InitLexiconWireMapping: published wire snapshot gen=%llu dictWords=%zu exclusions=%zu",
-                        static_cast<unsigned long long>(wireGen), initialDict.size(), config.spellExclusions.size());
+                        static_cast<unsigned long long>(wireGen), initialDict.size(), diskConfig->spellExclusions.size());
         }
     } else {
         NEXTKEY_LOG(L"InitLexiconWireMapping: failed to create wire manager");
@@ -684,7 +710,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
         g_sharedState.SetOrClearFlag(SharedFlags::TSF_POST_UPDATE_REBOOT,
             tsfInUse && pendingDllState == PendingDllState::SwapDoneNeedsReboot);
 
-        InitLexiconWireMapping(config);
+        InitLexiconWireMapping();
     }
 
     // ── Tray Icon ──
@@ -753,6 +779,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     // tray-window thread, pre-empts hook QuickSync slow path).
     g_trayIcon.SetHookReloadCallback([]() {
         g_mainThreadWorker.Signal();
+    });
+    g_trayIcon.SetLexiconCommittedCallback([]() {
+        if (!PublishCurrentLexiconToWire()) return false;
+        const auto committedConfig = ConfigManager::LoadFromFile(ConfigManager::GetConfigPath());
+        if (!committedConfig) return false;
+        SignalConfigChange(false, committedConfig->GetSpellCheckLevel());
+        g_mainThreadWorker.Signal();
+        return true;
     });
 
     // Wire menu state getter

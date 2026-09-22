@@ -20,6 +20,10 @@
 #ifdef _WIN32
 #include "core/WinStrings.h"
 #include <ShlObj.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 #endif
 
 namespace NextKey {
@@ -162,10 +166,9 @@ public:
     ConfigFileLock() noexcept {
         hMutex_ = CreateMutexW(nullptr, FALSE, L"Local\\VKeyConfigLock");
         if (hMutex_) {
-            DWORD result = WaitForSingleObject(hMutex_, 5000);
+            DWORD result = WaitForSingleObject(hMutex_, INFINITE);
             // WAIT_OBJECT_0: acquired normally
             // WAIT_ABANDONED: previous owner crashed — we now own it
-            // WAIT_TIMEOUT/WAIT_FAILED: proceed without lock (better than blocking user)
             owned_ = (result == WAIT_OBJECT_0 || result == WAIT_ABANDONED);
         }
     }
@@ -182,7 +185,23 @@ private:
     bool owned_ = false;
 };
 #else
-struct ConfigFileLock {};  // No-op on Linux (test builds)
+class ConfigFileLock {
+public:
+    ConfigFileLock() noexcept {
+        fd_ = ::open("/tmp/vkey_config.lock", O_CREAT | O_RDWR, 0666);
+        if (fd_ >= 0) owned_ = (::flock(fd_, LOCK_EX) == 0);
+    }
+    ~ConfigFileLock() noexcept {
+        if (fd_ < 0) return;
+        if (owned_) (void)::flock(fd_, LOCK_UN);
+        (void)::close(fd_);
+    }
+    ConfigFileLock(const ConfigFileLock&) = delete;
+    ConfigFileLock& operator=(const ConfigFileLock&) = delete;
+private:
+    int fd_ = -1;
+    bool owned_ = false;
+};
 #endif
 
 /// Load existing TOML file or return empty table (for merge-and-save pattern)
@@ -1507,4 +1526,3 @@ bool ConfigManager::SaveWireGeneration(const std::wstring& path, uint64_t genera
 }
 
 }  // namespace NextKey
-

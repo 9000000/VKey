@@ -63,6 +63,23 @@ public:
     }
 };
 
+bool DecodeWireExclusions(
+    const NextKey::Wire::LexiconWireView& view,
+    std::vector<std::wstring>& out) {
+    out.clear();
+    if (view.exclusionsUnits == 0) return view.exclusionsRowCount == 0;
+
+    const auto* chars = reinterpret_cast<const char16_t*>(view.exclusionsBuf);
+    size_t rowStart = 0;
+    for (size_t i = 0; i < view.exclusionsUnits; ++i) {
+        if (chars[i] != u'\n') continue;
+        out.push_back(NextKey::Wire::U16ToWString(
+            std::u16string_view(chars + rowStart, i - rowStart)));
+        rowStart = i + 1;
+    }
+    return rowStart == view.exclusionsUnits && out.size() == view.exclusionsRowCount;
+}
+
 }  // namespace
 namespace NextKey {
 namespace TSF {
@@ -1095,7 +1112,12 @@ bool EngineController::CheckConfigEvent(bool allowMacroDiskRead) {
     uint32_t currentEpoch = sharedState_.ReadEpoch();
     if (!recoveredAbi && currentEpoch == lastEpoch_) {
 #ifdef VKEY_USE_RUST_ENGINE
-        if (userDictionaryNeedsReload_) {
+        // Once the wire mapping has been observed, keep checking its tiny
+        // seqlock-protected identity even when SharedState's epoch is stable.
+        // The writer publishes wire contents before/around the generation
+        // notification, and a reader can legitimately observe either side of
+        // that handoff first.
+        if (userDictionaryNeedsReload_ || wireReaderActive_) {
             RefreshUserDictionarySnapshot(currentEpoch, userDictionaryGeneration_, allowMacroDiskRead);
         }
         const bool dictionaryAttached = TryAttachUserDictionary();
@@ -1148,25 +1170,18 @@ void EngineController::RefreshUserDictionarySnapshot(uint32_t epoch,
         userDictionaryGenerationKnown_ = true;
         userDictionaryGeneration_ = generation;
         userDictionaryNeedsReload_ = true;
-        pendingUserDictionary_.reset();
+        const auto pendingDecision = DecidePendingTsfLexicon({
+            .hasPendingConfig = pendingConfig_.has_value(),
+            .lexiconSnapshotStaged = pendingLexiconSnapshot_,
+        });
+        if (!pendingDecision.keepPendingDictionary) pendingUserDictionary_.reset();
     }
-    const bool spellSuggest = pendingConfig_ ? pendingConfig_->spellSuggestEnabled
-                                             : activeConfig_.spellSuggestEnabled;
-    if (!spellSuggest || !userDictionaryNeedsReload_) {
-        return;
-    }
-
     // Step 1: Zero-disk-I/O fast path via shared memory wire mapping (lock-free seqlock).
     bool wireUpdated = false;
     std::string wireErr;
     if (wireReader_.ReadSnapshotFast(wireLocalBuffer_, wireView_, epoch, &wireUpdated, &wireErr)) {
         wireReaderActive_ = true;
         if (!wireUpdated) {
-            // If reload was requested due to generation change, but wire mapping has not
-            // caught up to the expected generation yet, keep reload pending to retry.
-            if (wireView_.header && wireView_.header->generation < generation) {
-                return;
-            }
             // Snapshot has not changed on the wire; cache hit.
             userDictionaryNeedsReload_ = false;
             return;
@@ -1184,27 +1199,34 @@ void EngineController::RefreshUserDictionarySnapshot(uint32_t epoch,
             // Rust compile failed (malformed wire data or OOM): keep reload pending (fail-stale).
             // Exclusions have NOT been touched yet — state remains fully consistent.
             TSF_LOG(L"UserDictionary: CreateUserDictionaryFromUtf16 returned nullptr — retaining reload flag");
+            wireReader_.ResetCachedIdentity();
             return;
         }
 
-        // Dictionary compiled successfully. Now apply process-global spell exclusions.
-        bool exclusionsChanged = false;
-        bool exclusionsOk = RustInputEngine::SetSpellExclusionsFromUtf16(
-            wireView_.exclusionsBuf,
-            wireView_.exclusionsUnits,
-            &exclusionsChanged);
-        if (!exclusionsOk) {
-            // FFI setter failed: keep reload pending so we retry on next tick.
-            // newSnapshot is discarded; dictionary state is unchanged.
-            TSF_LOG(L"UserDictionary: SetSpellExclusionsFromUtf16 failed — retaining reload flag");
+        std::vector<std::wstring> wireExclusions;
+        if (!DecodeWireExclusions(wireView_, wireExclusions)) {
+            TSF_LOG(L"UserDictionary: exclusion decode failed — retaining reload flag");
+            wireReader_.ResetCachedIdentity();
             return;
         }
-        if (exclusionsChanged) {
+
+        if (!pendingConfig_) pendingConfig_ = activeConfig_;
+        const bool wireSpellSuggest =
+            (wireView_.header->flags & Wire::LexiconWireFlags::SPELL_SUGGEST_ENABLED) != 0;
+        if (pendingConfig_->spellSuggestEnabled != wireSpellSuggest) {
+            pendingConfig_->spellSuggestEnabled = wireSpellSuggest;
+            engineNeedsRecreate_ = true;
+        }
+        if (pendingConfig_->spellExclusions != wireExclusions) {
+            pendingConfig_->spellExclusions = std::move(wireExclusions);
             engineNeedsRecreate_ = true;
         }
 
-        // Both succeeded — commit both updates atomically.
+        // Both payloads are now staged. Engine construction applies exclusions
+        // under RustInputEngine's process-global lock at the promotion boundary,
+        // so it cannot overwrite the wire exclusions with stale config values.
         pendingUserDictionary_ = std::move(newSnapshot);
+        pendingLexiconSnapshot_ = true;
         userDictionaryNeedsReload_ = false;
         TSF_LOG(L"UserDictionary: wire reload succeeded gen=%llu entries=%u units=%u",
                 static_cast<unsigned long long>(wireView_.header->generation),
@@ -1220,16 +1242,30 @@ void EngineController::RefreshUserDictionarySnapshot(uint32_t epoch,
     }
 
     const std::wstring configPath = ConfigManager::GetConfigPath(g_hInstance);
-    std::shared_ptr<const RustUserDictionarySnapshot> lockedSnapshot;
-    const bool ok = LexiconReader::LoadUserDictionaryLocked(configPath, lockedSnapshot);
-    userDictionaryNeedsReload_ = false;
-    if (ok) {
-        pendingUserDictionary_ = std::move(lockedSnapshot);
+    LexiconSyncLock snapshotLock;
+    if (!snapshotLock.IsLocked() || !LexiconRecovery::RecoverIfNeeded(configPath)) {
+        return;
+    }
+    const auto diskConfig = ConfigManager::LoadFromFile(configPath);
+    auto loaded = RustInputEngine::LoadUserDictionary(configPath);
+    if (diskConfig && loaded.Succeeded()) {
+        if (!pendingConfig_) pendingConfig_ = activeConfig_;
+        if (pendingConfig_->spellSuggestEnabled != diskConfig->spellSuggestEnabled) {
+            pendingConfig_->spellSuggestEnabled = diskConfig->spellSuggestEnabled;
+            engineNeedsRecreate_ = true;
+        }
+        if (pendingConfig_->spellExclusions != diskConfig->spellExclusions) {
+            pendingConfig_->spellExclusions = diskConfig->spellExclusions;
+            engineNeedsRecreate_ = true;
+        }
+        pendingUserDictionary_ = std::move(loaded.snapshot);
+        pendingLexiconSnapshot_ = true;
+        userDictionaryNeedsReload_ = false;
         TSF_LOG(L"UserDictionary: disk locked reload succeeded path='%ls' generation=%u",
                 configPath.c_str(), static_cast<unsigned>(generation));
     } else {
-        // Fail-stale: malformed or unreadable edits never clear a previously
-        // valid dictionary. A later config-generation bump retries.
+        // Fail-stale and retain the reload flag so a later disk-allowed tick
+        // retries instead of accepting the cached wire identity as applied.
         TSF_LOG(L"UserDictionary: wire failed ('%ls') and disk reload rejected; retaining prior snapshot path='%ls'",
                 std::wstring(wireErr.begin(), wireErr.end()).c_str(), configPath.c_str());
     }
@@ -1244,6 +1280,9 @@ bool EngineController::TryAttachUserDictionary() {
                               ->SetUserDictionary(pendingUserDictionary_);
     if (attached) {
         activeUserDictionary_ = std::move(pendingUserDictionary_);
+        if (!pendingConfig_ && !userDictionaryNeedsReload_) {
+            pendingLexiconSnapshot_ = false;
+        }
         TSF_LOG(L"UserDictionary: attached at word boundary");
     }
     return attached;
@@ -1399,6 +1438,22 @@ void EngineController::ApplySharedState(const SharedState& state,
     newConfig.optimizeLevel = optimizeLevel;
     DecodeFeatureFlags(state.GetFeatureFlags(), newConfig);
 
+#ifdef VKEY_USE_RUST_ENGINE
+    const auto pendingLexiconDecision = DecidePendingTsfLexicon({
+        .hasPendingConfig = pendingConfig_.has_value(),
+        .lexiconSnapshotStaged = pendingLexiconSnapshot_,
+    });
+    const TypingConfig& lexiconConfig = pendingLexiconDecision.preserveConfigFields
+        ? *pendingConfig_
+        : activeConfig_;
+    // Advanced spell mode, exclusions and dictionary are one atomic lexicon
+    // snapshot. SharedState can arrive before the wire publish, so retain the
+    // last complete lexicon here; RefreshUserDictionarySnapshot replaces it
+    // only after the corresponding wire/disk payload validates.
+    newConfig.spellSuggestEnabled = lexiconConfig.spellSuggestEnabled;
+    newConfig.spellExclusions = lexiconConfig.spellExclusions;
+#endif
+
     pendingConfig_ = newConfig;
     engineNeedsRecreate_ = true;
     pendingSnapshotSerial_ = (static_cast<uint64_t>(state.epoch) << 8) | state.configGeneration;
@@ -1505,6 +1560,9 @@ bool EngineController::TryPromotePendingConfig() {
 #ifdef VKEY_USE_RUST_ENGINE
     else if (pendingUserDictionary_) {
         static_cast<void>(TryAttachUserDictionary());
+    }
+    if (!pendingConfig_ && !pendingUserDictionary_ && !userDictionaryNeedsReload_) {
+        pendingLexiconSnapshot_ = false;
     }
 #endif
 

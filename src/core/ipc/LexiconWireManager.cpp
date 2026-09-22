@@ -198,7 +198,10 @@ bool LexiconWireManager::Create() {
                 return false;
             }
 
-            pImpl_->hMapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, LEXICON_WIRE_MAPPING_NAME);
+            pImpl_->hMapping = OpenFileMappingW(
+                FILE_MAP_READ | FILE_MAP_WRITE | WRITE_DAC,
+                FALSE,
+                LEXICON_WIRE_MAPPING_NAME);
         }
     }
 
@@ -557,14 +560,10 @@ bool LexiconWireReader::ReadSnapshotFast(
         }
     }
 
-    // Path 1: Zero-cost fast path (< 1 ns): SharedState epoch has not changed since last read
-    if (pImpl_->cachedIdentity.wireGeneration > 0 &&
-        !HasEpochChanged(currentSharedStateEpoch)) {
-        if (outWasUpdated) *outWasUpdated = false;
-        return true;
-    }
-
-    // Path 2: SharedState epoch changed, but wire mapping generation & CRC32 might be identical
+    // Fast path: inspect the seqlock-protected identity even when SharedState's
+    // epoch is unchanged. The single writer may publish immediately after a
+    // reader observes the generation message; blindly trusting the epoch would
+    // pin the old snapshot indefinitely.
     if (pImpl_->cachedIdentity.wireGeneration > 0 && pImpl_->pMapping != nullptr) {
         uint32_t seq1 = SeqlockBeginRead(pImpl_->pMapping->seqlock);
         if ((seq1 & 1) == 0 && pImpl_->pMapping->magic == WIRE_MAGIC) {
@@ -581,7 +580,7 @@ bool LexiconWireReader::ReadSnapshotFast(
         }
     }
 
-    // Path 3: Wire content changed or initial read: perform full seqlock copy and validation
+    // Wire content changed or initial read: perform full seqlock copy and validation.
     if (!ReadSnapshot(localBuffer, outView, currentSharedStateEpoch, outError)) {
         return false;
     }

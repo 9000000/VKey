@@ -69,5 +69,23 @@ TEST(TsfPromotionDecisionTest, MultipleBlocksReturnFalse) {
     EXPECT_FALSE(CanPromoteTsfConfig(in));
 }
 
+TEST(TsfPromotionDecisionTest, StagedLexiconSurvivesAnotherSharedStateUpdate) {
+    const auto decision = DecidePendingTsfLexicon({
+        .hasPendingConfig = true,
+        .lexiconSnapshotStaged = true,
+    });
+    EXPECT_TRUE(decision.preserveConfigFields);
+    EXPECT_TRUE(decision.keepPendingDictionary);
+}
+
+TEST(TsfPromotionDecisionTest, UnstagedLexiconDoesNotOverrideSharedState) {
+    const auto decision = DecidePendingTsfLexicon({
+        .hasPendingConfig = true,
+        .lexiconSnapshotStaged = false,
+    });
+    EXPECT_FALSE(decision.preserveConfigFields);
+    EXPECT_FALSE(decision.keepPendingDictionary);
+}
+
 }  // namespace
 }  // namespace NextKey

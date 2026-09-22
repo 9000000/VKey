@@ -718,7 +718,7 @@ spell_exclusions = [ "old" ]
     EXPECT_NE(formatted.find("macro_enabled = true"), std::string::npos);
     // Verify exclusions array updated
     EXPECT_NE(formatted.find("h\xc4\x91"), std::string::npos);
-    EXPECT_NE(formatted.find("\xc4\x91c\xc4\x91t"), std::string::npos);
+    EXPECT_NE(formatted.find("\xc4\x91" "c" "\xc4\x91" "t"), std::string::npos);
 }
 
 TEST_F(ConfigManagerTest, FormatConfigTomlForLexicon_WithWireGeneration) {

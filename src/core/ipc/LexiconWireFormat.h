@@ -149,8 +149,11 @@ inline void SeqlockEndWrite(volatile uint32_t& seqlock) noexcept {
 
 inline uint32_t SeqlockBeginRead(const volatile uint32_t& seqlock) noexcept {
 #if defined(_WIN32)
-    uint32_t seq = static_cast<uint32_t>(::InterlockedCompareExchange(
-        const_cast<volatile LONG*>(reinterpret_cast<const volatile LONG*>(&seqlock)), 0, 0));
+    // Readers map the section with FILE_MAP_READ, so an interlocked RMW (even
+    // one that writes the same value) faults on the read-only view. Aligned
+    // 32-bit loads are atomic on supported Windows targets; the full barrier
+    // supplies the acquire ordering required by the seqlock protocol.
+    const uint32_t seq = seqlock;
     MemoryBarrier();
     return seq;
 #else
@@ -164,8 +167,7 @@ inline uint32_t SeqlockBeginRead(const volatile uint32_t& seqlock) noexcept {
 inline bool SeqlockValidateRead(const volatile uint32_t& seqlock, uint32_t startSeq) noexcept {
 #if defined(_WIN32)
     MemoryBarrier();
-    uint32_t currentSeq = static_cast<uint32_t>(::InterlockedCompareExchange(
-        const_cast<volatile LONG*>(reinterpret_cast<const volatile LONG*>(&seqlock)), 0, 0));
+    const uint32_t currentSeq = seqlock;
     return (startSeq == currentSeq) && !(startSeq & 1);
 #else
     std::atomic_thread_fence(std::memory_order_acquire);

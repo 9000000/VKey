@@ -16,7 +16,9 @@ namespace NextKey {
 class RustUserDictionarySnapshot;
 struct TypingConfig;
 
-constexpr const wchar_t* kLexiconSyncMutexName = L"Local\\VKeyLexiconSyncMutex";
+// Shared with ConfigManager's read-modify-write lock so lexicon transactions
+// cannot race ordinary config.toml saves.
+constexpr const wchar_t* kLexiconSyncMutexName = L"Local\\VKeyConfigLock";
 constexpr uint32_t kLexiconMutexTimeoutMs = 5000; // 5,000 ms
 
 enum class LexiconJournalState : uint8_t {
@@ -32,6 +34,7 @@ struct LexiconJournalRecord {
     LexiconJournalState state = LexiconJournalState::Unknown;
     bool configExistedBefore = false;
     bool dictExistedBefore = false;
+    bool notifySharedState = true;
     uint8_t oldGeneration = 0;
     uint8_t newGeneration = 0;
     std::string oldConfigHash;
@@ -48,7 +51,7 @@ struct LexiconJournalRecord {
     static bool Deserialize(std::string_view text, LexiconJournalRecord& outRecord);
 };
 
-/// Cross-process synchronization lock using named mutex Local\VKeyLexiconSyncMutex.
+/// Cross-process synchronization lock shared with all config.toml writers.
 class LexiconSyncLock {
 public:
     explicit LexiconSyncLock(uint32_t timeoutMs = kLexiconMutexTimeoutMs);
@@ -160,7 +163,15 @@ public:
         const std::string& newConfigToml,
         const std::string& newUserDictText,
         bool notifySharedState = true);
+
+    /// Merge and persist only lexicon-owned fields while holding the shared
+    /// config lock across read, format, journaling, and replacement. Generation
+    /// publication is deliberately left to the main process after wire publish.
+    static bool CommitLexiconUpdate(
+        const std::wstring& configPath,
+        bool spellSuggestEnabled,
+        const std::vector<std::wstring>& spellExclusions,
+        const std::vector<std::wstring>& userDictionary);
 };
 
 } // namespace NextKey
-

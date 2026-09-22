@@ -33,4 +33,26 @@ struct TsfPromotionInputs {
            in.pendingReviveEmpty;
 }
 
+struct TsfPendingLexiconInputs {
+    bool hasPendingConfig = false;
+    bool lexiconSnapshotStaged = false;
+};
+
+struct TsfPendingLexiconDecision {
+    bool preserveConfigFields = false;
+    bool keepPendingDictionary = false;
+};
+
+// A lexicon wire snapshot can be staged while composition prevents promotion,
+// so a later SharedState update must select its lexicon fields instead of the
+// active snapshot and must retain its compiled dictionary until the
+// word-boundary promotion.
+[[nodiscard]] constexpr TsfPendingLexiconDecision DecidePendingTsfLexicon(
+    const TsfPendingLexiconInputs& in) noexcept {
+    return {
+        .preserveConfigFields = in.hasPendingConfig && in.lexiconSnapshotStaged,
+        .keepPendingDictionary = in.lexiconSnapshotStaged,
+    };
+}
+
 }  // namespace NextKey

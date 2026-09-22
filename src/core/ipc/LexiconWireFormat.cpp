@@ -410,7 +410,11 @@ bool LexiconWireDeserializer::ValidateAndInspect(
     std::u16string_view prevWord;
     for (size_t i = 0; i < header->userDictWordCount; ++i) {
         const auto& entry = indexTable[i];
-        if (entry.offsetUnits + entry.lengthUtf16Units >= header->userDictUtf16Units) {
+        // Subtraction-based bounds checks avoid uint32_t wraparound from a
+        // hostile offset such as UINT32_MAX. One trailing unit is required for
+        // the newline delimiter.
+        if (entry.offsetUnits >= header->userDictUtf16Units ||
+            entry.lengthUtf16Units >= header->userDictUtf16Units - entry.offsetUnits) {
             if (outError) *outError = "Index entry bounds exceed text pool units";
             return false;
         }
