@@ -90,6 +90,30 @@ TEST_F(LexiconTransactionTest, JournalSerializationAndDeserialization) {
     EXPECT_EQ(deserialized.dictTmpPath, "/tmp/test/user_dictionary.txt.tmp");
 }
 
+TEST_F(LexiconTransactionTest, TruncatedJournalCannotDeleteExistingFiles) {
+    WriteFile(configPath_, "original config");
+    WriteFile(dictPath_, "original dictionary");
+    WriteFile(testDir_ / "lexicon_txn.journal",
+              "VKEY_LEXICON_JOURNAL_V1\nstate=PREPARED\n");
+
+    EXPECT_FALSE(LexiconRecovery::RecoverIfNeeded(configPath_));
+    EXPECT_EQ(ReadFile(configPath_), "original config");
+    EXPECT_EQ(ReadFile(dictPath_), "original dictionary");
+    EXPECT_TRUE(std::filesystem::exists(testDir_ / "lexicon_txn.journal.corrupt"));
+}
+
+TEST_F(LexiconTransactionTest, MalformedJournalGenerationFailsWithoutThrowing) {
+    LexiconJournalRecord record;
+    record.state = LexiconJournalState::Prepared;
+    std::string journal = record.Serialize();
+    const auto position = journal.find("old_gen=0");
+    ASSERT_NE(position, std::string::npos);
+    journal.replace(position, sizeof("old_gen=0") - 1, "old_gen=invalid");
+
+    LexiconJournalRecord parsed;
+    EXPECT_FALSE(LexiconJournalRecord::Deserialize(journal, parsed));
+}
+
 TEST_F(LexiconTransactionTest, LexiconSyncLockBasicAcquisition) {
     LexiconSyncLock lock(1000);
     EXPECT_TRUE(lock.IsLocked());
@@ -146,6 +170,28 @@ TEST_F(LexiconTransactionTest, CommitTransactionReplacesExistingFilesAtomically)
     EXPECT_EQ(ReadFile(configPath_), updatedToml);
     EXPECT_EQ(ReadFile(dictPath_), updatedDict);
     EXPECT_FALSE(std::filesystem::exists(testDir_ / "lexicon_txn.journal"));
+}
+
+TEST_F(LexiconTransactionTest, BackupFailureLeavesBothOriginalFilesUntouched) {
+    const std::string originalConfig = "[general]\nmethod = 0\n";
+    const std::string originalDict = "ban\n";
+    WriteFile(configPath_, originalConfig);
+    WriteFile(dictPath_, originalDict);
+
+    for (const auto& backupName : {"config.toml.bak", "user_dictionary.txt.bak"}) {
+        const auto blockedBackup = testDir_ / backupName;
+        std::filesystem::create_directory(blockedBackup);
+        WriteFile(blockedBackup / "block", "keep directory nonempty");
+
+        EXPECT_FALSE(LexiconWriter::CommitTransaction(
+            configPath_.wstring(), "[general]\nmethod = 1\n", "moi\n", 5, 6, false));
+        EXPECT_EQ(ReadFile(configPath_), originalConfig);
+        EXPECT_EQ(ReadFile(dictPath_), originalDict);
+        EXPECT_FALSE(std::filesystem::exists(testDir_ / "lexicon_txn.journal"));
+
+        std::filesystem::remove(blockedBackup / "block");
+        std::filesystem::remove(blockedBackup);
+    }
 }
 
 TEST_F(LexiconTransactionTest, CrashRecoveryAtPreparedRollsBackToOriginalFiles) {

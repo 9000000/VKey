@@ -11,6 +11,7 @@
 #include "sciter-x-dom.hpp"
 #include "DialogUtils.h"
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 
 using namespace sciter::dom;
@@ -35,15 +36,30 @@ LRESULT SpellExclusionsDialog::onCustomMessage(HWND hwnd, UINT msg, WPARAM wPara
     return -1;
 }
 
-void SpellExclusionsDialog::loadData() {
-    auto configPath = ConfigManager::GetConfigPath();
-    auto config = ConfigManager::LoadFromFile(configPath).value_or(TypingConfig{});
-    spellSuggestEnabled_ = config.spellSuggestEnabled;
-    spellExclusions_ = std::move(config.spellExclusions);
+bool SpellExclusionsDialog::loadData() {
+    dataLoaded_ = false;
+    const auto configPath = ConfigManager::GetConfigPath();
+    LexiconSyncLock lock;
+    if (!lock.IsLocked() || !LexiconRecovery::RecoverIfNeeded(configPath)) return false;
 
-    userDictWords_.clear();
-    (void)LexiconReader::LoadUserDictionaryWordsLocked(configPath, userDictWords_);
+    std::error_code ec;
+    const bool configExists = std::filesystem::exists(configPath, ec);
+    if (ec) return false;
+    auto loadedConfig = ConfigManager::LoadFromFile(configPath);
+    if (configExists && !loadedConfig) return false;
+
+    std::vector<std::wstring> loadedWords;
+    // Windows named mutexes are recursive for the owning thread; both reads
+    // remain under the same outer lock while the reader acquires its own lock.
+    if (!LexiconReader::LoadUserDictionaryWordsLocked(configPath, loadedWords)) return false;
+
+    const TypingConfig config = loadedConfig.value_or(TypingConfig{});
+    spellSuggestEnabled_ = config.spellSuggestEnabled;
+    spellExclusions_ = config.spellExclusions;
+    userDictWords_ = std::move(loadedWords);
+    dataLoaded_ = true;
     modified_ = false;
+    return true;
 }
 
 void SpellExclusionsDialog::populateUI() {
@@ -58,6 +74,9 @@ void SpellExclusionsDialog::populateUI() {
     }
 
     call_function("setInitialData", sciter::value(spellSuggestEnabled_), userWordsArr, exclArr);
+    if (!dataLoaded_) {
+        call_function("showFieldError", sciter::value(L"Không thể nạp từ điển và cấu hình. Hãy đóng và mở lại cửa sổ."));
+    }
 }
 
 void SpellExclusionsDialog::populateList(int listIndex) {
@@ -332,12 +351,19 @@ void SpellExclusionsDialog::reloadData() {
         );
         if (choice != IDYES) return;
     }
-    loadData();
-    populateUI();
-    call_function("showSuccessToast", sciter::value(L"Đã nạp lại dữ liệu từ đĩa."));
+    if (loadData()) {
+        populateUI();
+        call_function("showSuccessToast", sciter::value(L"Đã nạp lại dữ liệu từ đĩa."));
+    } else {
+        MessageBoxW(get_hwnd(), L"Không thể nạp từ điển và cấu hình.", L"Lỗi đọc dữ liệu", MB_OK | MB_ICONERROR);
+    }
 }
 
 bool SpellExclusionsDialog::saveAndApply(bool showToast) {
+    if (!dataLoaded_) {
+        MessageBoxW(get_hwnd(), L"Chưa nạp được từ điển và cấu hình. Hãy đóng và mở lại cửa sổ.", L"Lỗi đọc dữ liệu", MB_OK | MB_ICONERROR);
+        return false;
+    }
     auto configPath = ConfigManager::GetConfigPath();
 
     auto canon = SpellExclusionCanonicalizer::Canonicalize(spellExclusions_);

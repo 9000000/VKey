@@ -23,6 +23,8 @@
 #endif
 
 #include <chrono>
+#include <array>
+#include <charconv>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -336,56 +338,90 @@ bool LexiconJournalRecord::Deserialize(std::string_view text, LexiconJournalReco
     const std::string textStr(text);
     std::istringstream ss(textStr);
     std::string header;
-    if (!std::getline(ss, header) || header.find("VKEY_LEXICON_JOURNAL_V1") == std::string::npos) {
+    if (!std::getline(ss, header) || header != "VKEY_LEXICON_JOURNAL_V1") {
         return false;
     }
 
+    constexpr std::array<std::string_view, 14> requiredKeys = {
+        "state", "config_existed", "dict_existed", "notify_shared_state",
+        "old_gen", "new_gen", "old_config_hash", "new_config_hash",
+        "old_dict_hash", "new_dict_hash", "config_bak_path", "dict_bak_path",
+        "config_tmp_path", "dict_tmp_path"
+    };
+    uint32_t seenKeys = 0;
+    LexiconJournalRecord record;
+    auto parseBoolean = [](std::string_view value, bool& target) {
+        if (value == "1") { target = true; return true; }
+        if (value == "0") { target = false; return true; }
+        return false;
+    };
+    auto parseGeneration = [](std::string_view value, uint8_t& target) {
+        unsigned parsed = 0;
+        const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), parsed);
+        if (error != std::errc{} || end != value.data() + value.size() || parsed > UINT8_MAX) {
+            return false;
+        }
+        target = static_cast<uint8_t>(parsed);
+        return true;
+    };
+
     std::string line;
     while (std::getline(ss, line)) {
-        if (line.empty() || line.back() == '\r') {
-            if (!line.empty()) line.pop_back();
-        }
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         auto eq = line.find('=');
         if (eq == std::string::npos) continue;
         std::string key = line.substr(0, eq);
         std::string val = line.substr(eq + 1);
 
+        for (size_t i = 0; i < requiredKeys.size(); ++i) {
+            if (key != requiredKeys[i]) continue;
+            const uint32_t bit = uint32_t{1} << i;
+            if ((seenKeys & bit) != 0) return false;
+            seenKeys |= bit;
+            break;
+        }
+
         if (key == "state") {
-            if (val == "PREPARED") outRecord.state = LexiconJournalState::Prepared;
-            else if (val == "FILES_REPLACED") outRecord.state = LexiconJournalState::FilesReplaced;
-            else if (val == "GENERATION_PUBLISHED") outRecord.state = LexiconJournalState::GenerationPublished;
-            else if (val == "COMMITTED") outRecord.state = LexiconJournalState::Committed;
-            else if (val == "ROLLBACK_PENDING") outRecord.state = LexiconJournalState::RollbackPending;
-            else outRecord.state = LexiconJournalState::Unknown;
+            if (val == "PREPARED") record.state = LexiconJournalState::Prepared;
+            else if (val == "FILES_REPLACED") record.state = LexiconJournalState::FilesReplaced;
+            else if (val == "GENERATION_PUBLISHED") record.state = LexiconJournalState::GenerationPublished;
+            else if (val == "COMMITTED") record.state = LexiconJournalState::Committed;
+            else if (val == "ROLLBACK_PENDING") record.state = LexiconJournalState::RollbackPending;
+            else return false;
         } else if (key == "config_existed") {
-            outRecord.configExistedBefore = (val == "1" || val == "true");
+            if (!parseBoolean(val, record.configExistedBefore)) return false;
         } else if (key == "dict_existed") {
-            outRecord.dictExistedBefore = (val == "1" || val == "true");
+            if (!parseBoolean(val, record.dictExistedBefore)) return false;
         } else if (key == "notify_shared_state") {
-            outRecord.notifySharedState = (val == "1" || val == "true");
+            if (!parseBoolean(val, record.notifySharedState)) return false;
         } else if (key == "old_gen") {
-            outRecord.oldGeneration = static_cast<uint8_t>(std::stoul(val));
+            if (!parseGeneration(val, record.oldGeneration)) return false;
         } else if (key == "new_gen") {
-            outRecord.newGeneration = static_cast<uint8_t>(std::stoul(val));
+            if (!parseGeneration(val, record.newGeneration)) return false;
         } else if (key == "old_config_hash") {
-            outRecord.oldConfigHash = val;
+            record.oldConfigHash = val;
         } else if (key == "new_config_hash") {
-            outRecord.newConfigHash = val;
+            record.newConfigHash = val;
         } else if (key == "old_dict_hash") {
-            outRecord.oldDictHash = val;
+            record.oldDictHash = val;
         } else if (key == "new_dict_hash") {
-            outRecord.newDictHash = val;
+            record.newDictHash = val;
         } else if (key == "config_bak_path") {
-            outRecord.configBakPath = val;
+            record.configBakPath = val;
         } else if (key == "dict_bak_path") {
-            outRecord.dictBakPath = val;
+            record.dictBakPath = val;
         } else if (key == "config_tmp_path") {
-            outRecord.configTmpPath = val;
+            record.configTmpPath = val;
         } else if (key == "dict_tmp_path") {
-            outRecord.dictTmpPath = val;
+            record.dictTmpPath = val;
         }
     }
-    return outRecord.state != LexiconJournalState::Unknown;
+    if (seenKeys != (uint32_t{1} << requiredKeys.size()) - 1 ||
+        record.state == LexiconJournalState::Unknown) {
+        return false;
+    }
+    outRecord = std::move(record);
+    return true;
 }
 
 // ─── LexiconSyncLock Implementation ─────────────────────────────────────────
@@ -935,10 +971,18 @@ static bool CommitTransactionImpl(
 
     // 2. Create backups of existing files
     if (configExisted) {
-        std::filesystem::copy_file(configPath, configBak, std::filesystem::copy_options::overwrite_existing, ec);
+        if (!std::filesystem::copy_file(
+                configPath, configBak, std::filesystem::copy_options::overwrite_existing, ec) || ec) {
+            LexiconRecovery::CleanStaleArtifacts(configPath);
+            return false;
+        }
     }
     if (dictExisted) {
-        std::filesystem::copy_file(dictPath, dictBak, std::filesystem::copy_options::overwrite_existing, ec);
+        if (!std::filesystem::copy_file(
+                dictPath, dictBak, std::filesystem::copy_options::overwrite_existing, ec) || ec) {
+            LexiconRecovery::CleanStaleArtifacts(configPath);
+            return false;
+        }
     }
 
     // 3. Prepare Journal Record (PREPARED state)

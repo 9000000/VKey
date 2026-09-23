@@ -21,7 +21,7 @@ protected:
     LRESULT onCustomMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) override;
 
 private:
-    void loadData();
+    bool loadData();
     void populateUI();
     void populateList(int listIndex);
 
@@ -36,8 +36,8 @@ private:
     bool spellSuggestEnabled_ = true;
     std::vector<std::wstring> userDictWords_;
     std::vector<std::wstring> spellExclusions_;
+    bool dataLoaded_ = false;
     bool modified_ = false;
 };
 
 }  // namespace NextKey
-
