@@ -20,6 +20,26 @@
 namespace NextKey::Wire {
 namespace {
 
+#if defined(_WIN32)
+// True when BUILTIN\Administrators is enabled in the effective token, i.e. exactly when
+// the kernel's access check honours an Administrators ACE. A non-elevated admin runs on a
+// filtered token and correctly reports false here.
+bool IsEffectivelyAdministrator() {
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+    PSID adminsSid = nullptr;
+    if (!AllocateAndInitializeSid(&ntAuthority, 2, SECURITY_BUILTIN_DOMAIN_RID,
+                                  DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminsSid)) {
+        return false;
+    }
+    BOOL isMember = FALSE;
+    if (!CheckTokenMembership(nullptr, adminsSid, &isMember)) {
+        isMember = FALSE;
+    }
+    FreeSid(adminsSid);
+    return isMember == TRUE;
+}
+#endif
+
 TEST(LexiconWireManagerTest, ManagerLifecycleAndCreation) {
     LexiconWireManager manager;
     EXPECT_FALSE(manager.IsWritable());
@@ -470,11 +490,22 @@ TEST(LexiconWireManagerTest, SameUserWriteOpenDenied_ReadOnlyAllowed) {
     ASSERT_TRUE(manager.Publish({ L"msword" }, { L"viet" }, 1, true));
 
 #if defined(_WIN32)
-    // On Windows: Any subsequent open with FILE_MAP_WRITE (even within the exact same process
+    // On Windows: any subsequent open with FILE_MAP_WRITE (even within the exact same process
     // and user security token) MUST be rejected by the kernel with ERROR_ACCESS_DENIED.
+    // Exception: the lockdown DACL deliberately keeps (A;;GA;;;BA), so a caller running with
+    // Administrators enabled in its effective token is still granted write. That is by design
+    // (an admin can take ownership / rewrite the DACL anyway) and is the state of a
+    // GitHub-hosted Windows runner, which executes elevated.
     HANDLE hWrite = OpenFileMappingW(FILE_MAP_WRITE, FALSE, LEXICON_WIRE_MAPPING_NAME);
-    EXPECT_EQ(hWrite, nullptr);
-    EXPECT_EQ(GetLastError(), ERROR_ACCESS_DENIED);
+    if (IsEffectivelyAdministrator()) {
+        EXPECT_NE(hWrite, nullptr);
+    } else {
+        EXPECT_EQ(hWrite, nullptr);
+        EXPECT_EQ(GetLastError(), ERROR_ACCESS_DENIED);
+    }
+    if (hWrite) {
+        CloseHandle(hWrite);
+    }
 
     // Opening with FILE_MAP_READ MUST succeed for interactive users and AppContainers
     HANDLE hRead = OpenFileMappingW(FILE_MAP_READ, FALSE, LEXICON_WIRE_MAPPING_NAME);
