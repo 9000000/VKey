@@ -911,6 +911,7 @@ set(NEXTKEY_TEST_SOURCES
     tests/PerfHistogramTest.cpp
     tests/HookCommandMailboxTest.cpp
     tests/FocusApplyDecisionTest.cpp
+    tests/FocusTargetDecisionTest.cpp
     tests/BrowserContextStateTest.cpp
     tests/NativeMessagingTest.cpp
     src/browser_host/NativeMessaging.cpp

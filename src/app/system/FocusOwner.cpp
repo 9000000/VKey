@@ -7,6 +7,7 @@
 #include "core/AutoCapDecision.h"
 #include "core/CrashLog.h"
 #include "core/Debug.h"
+#include "core/FocusTargetDecision.h"
 #include "core/Logger.h"
 #include "core/PerAppModeDecision.h"
 #include "core/WebView2CacheDecision.h"
@@ -563,29 +564,31 @@ FocusClassification FocusOwner::Classify(HWND triggerHwnd,
     PERF_SCOPE(::NextKey::Perf::Stage::FocusClassify);
     FocusClassification cls;
 
-    HWND fg = GetForegroundWindow();
-    // Prefer triggerHwnd (captured at WinEventProc event time): GetForegroundWindow
-    // is async-stale by the time WINEVENT_OUTOFCONTEXT dispatches, often returning
-    // a transient JumpList / taskbar HWND instead of the app the user switched to.
-    HWND activeHwnd = triggerHwnd ? triggerHwnd : fg;
-    if (!activeHwnd) return cls;  // empty cls = "nothing to apply" sentinel
-
-    cls.hwndOpaque = reinterpret_cast<std::uintptr_t>(activeHwnd);
-
     // Hidden helpers, tray, zero-size, tool windows — still classify (so
     // dispatch flags stay consistent when focus transits through one) but
     // skip the smart-switch / currentExe_ update.
-    if (!IsWindowVisible(activeHwnd) || IsIconic(activeHwnd) || IsTrayOrTaskbarWindow(activeHwnd)) {
-        cls.skipAppTracking = true;
-    } else {
+    const auto isHelper = [](HWND hwnd) noexcept {
+        if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || IsTrayOrTaskbarWindow(hwnd)) return true;
         RECT rect;
-        if (GetWindowRect(activeHwnd, &rect) &&
+        if (GetWindowRect(hwnd, &rect) &&
             (rect.right - rect.left <= 0 || rect.bottom - rect.top <= 0 || rect.left <= -20000)) {
-            cls.skipAppTracking = true;  // trick message-pump windows (IDM et al.)
-        } else if (GetWindowLongW(activeHwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) {
-            cls.skipAppTracking = true;  // tooltips, context menus, floating helpers
+            return true;  // trick message-pump windows (IDM et al.)
         }
+        return (GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0;  // tooltips, menus
+    };
+
+    HWND fg = GetForegroundWindow();
+    const bool fgIsHelper = fg && isHelper(fg);
+    HWND activeHwnd = reinterpret_cast<HWND>(ChooseFocusTarget(
+        reinterpret_cast<std::uintptr_t>(triggerHwnd),
+        reinterpret_cast<std::uintptr_t>(fg), fgIsHelper));
+    if (!activeHwnd) return cls;  // empty cls = "nothing to apply" sentinel
+    if (triggerHwnd && activeHwnd != triggerHwnd) {
+        FOCUS_LOG(L"  Classify: stale trigger %p — using foreground %p", triggerHwnd, fg);
     }
+
+    cls.hwndOpaque = reinterpret_cast<std::uintptr_t>(activeHwnd);
+    cls.skipAppTracking = activeHwnd == fg ? fgIsHelper : isHelper(activeHwnd);
 
     // Cache lookup: skip ClassifyWindow + GetExeNameForHwnd + IsWebView2App
     // when (HWND, PID) already classified. PID re-check inside LookupAppProfile
