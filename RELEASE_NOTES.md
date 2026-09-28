@@ -33,6 +33,7 @@ Bản cập nhật này mang đến cải tiến đột phá về khả năng t�
     * **Gõ từ tiếng Anh & thương hiệu mượt mà**: Có thể viết các từ như `asus` mà không cần gõ 3 chữ `s` (`assus`) hay thao tác phục hồi phức tạp — chỉ cần gõ đúng thứ tự `a-s-u-s` là engine tự nhận diện và xuất đúng từ.
     * **Hoạt động theo lựa chọn của người dùng**: Tính năng mặc định được tắt và chỉ được kích hoạt khi bạn chủ động bật trong cài đặt.
     * **Tương thích với engine mã nguồn mở**: Nếu engine nâng cao không có hoặc bị gỡ bỏ, VKey sẽ tự động sử dụng engine C++ mã nguồn mở đi kèm mà không ảnh hưởng đến các chức năng gõ tiếng Việt thông thường.
+    * 🎬 **[Xem video demo tính năng tự sửa lỗi gõ](docs/videos/DemoTypo.mp4)**
 
 > ℹ️ **Tìm hiểu thêm**
 >
