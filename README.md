@@ -80,9 +80,7 @@ Engine mới, kiến trúc mới, C++20, hiệu năng cao, giao diện Glassmorp
   Hỗ trợ gõ song song cả Telex và VNI mà không cần chuyển đổi
 
 * **Spell Check + Free Typing**
-  Kiểm tra chính tả tiếng Việt + cho phép override khi cần gõ tự do
-
-  <video src="docs/videos/DemoTypo.mp4" controls title="Demo tự sửa lỗi gõ — VKey" width="600"></video>
+  Kiểm tra chính tả tiếng Việt + cho phép override khi cần gõ tự do — [🎬 Xem demo](https://www.vkey.qd.je/#demo)
 
 * **Powerful Convert Tool**
   Bôi đen → chuyển mã nhanh, hỗ trợ nhiều kiểu chuyển đổi (HOA, thường, bỏ dấu…)
