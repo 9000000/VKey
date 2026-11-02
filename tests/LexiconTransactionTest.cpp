@@ -379,9 +379,16 @@ TEST_F(LexiconTransactionTest, LockedReaderRecoversUnfinishedTransactionAndLoads
     const auto journalPath = testDir_ / "lexicon_txn.journal";
     WriteFile(journalPath, record.Serialize());
 
+#if defined(VKEY_USE_RUST_ENGINE)
     std::shared_ptr<const RustUserDictionarySnapshot> snapshot;
     EXPECT_TRUE(LexiconReader::LoadUserDictionaryLocked(configPath_.wstring(), snapshot));
     ASSERT_NE(snapshot, nullptr);
+#else
+    std::vector<std::wstring> words;
+    ASSERT_TRUE(LexiconReader::LoadUserDictionaryWordsLocked(configPath_.wstring(), words));
+    ASSERT_EQ(words.size(), 1u);
+    EXPECT_EQ(words.front(), L"so\u00e0");
+#endif
 
     // Verify recovery rolled back to dictBak
     EXPECT_EQ(ReadFile(configPath_), "restored config");
@@ -683,8 +690,15 @@ TEST_F(LexiconTransactionTest, RecoveryAtFilesReplaced_PublishGenerationFailure_
     EXPECT_TRUE(std::filesystem::exists(dictBak));
 
     // Reader must fail-stale because journal recovery failed
+#if defined(VKEY_USE_RUST_ENGINE)
     std::shared_ptr<const RustUserDictionarySnapshot> snapshot;
     EXPECT_FALSE(LexiconReader::LoadUserDictionaryLocked(configPath_.wstring(), snapshot));
+#else
+    std::vector<std::wstring> words{L"keep-stale"};
+    EXPECT_FALSE(LexiconReader::LoadUserDictionaryWordsLocked(configPath_.wstring(), words));
+    ASSERT_EQ(words.size(), 1u);
+    EXPECT_EQ(words.front(), L"keep-stale");
+#endif
 
     // Retry recovery with working publisher -> must roll-forward and clean up
     LexiconWriter::SetTestGenerationPublisher([](uint8_t) {
@@ -697,7 +711,13 @@ TEST_F(LexiconTransactionTest, RecoveryAtFilesReplaced_PublishGenerationFailure_
     EXPECT_FALSE(std::filesystem::exists(dictBak));
 
     // Now reader succeeds
+#if defined(VKEY_USE_RUST_ENGINE)
     EXPECT_TRUE(LexiconReader::LoadUserDictionaryLocked(configPath_.wstring(), snapshot));
+#else
+    ASSERT_TRUE(LexiconReader::LoadUserDictionaryWordsLocked(configPath_.wstring(), words));
+    ASSERT_EQ(words.size(), 1u);
+    EXPECT_EQ(words.front(), L"so\u00e0");
+#endif
 
     LexiconWriter::SetTestGenerationPublisher(nullptr);
 }

@@ -42,9 +42,12 @@ namespace NextKey {
 
 // Timer IDs for async operations
 static constexpr UINT_PTR TIMER_RESIZE_WINDOW = 1001;
+static constexpr UINT_PTR TIMER_READY_FALLBACK = 1003;
 
 // Private self-posted message for coalescing rapid V/E mode changes
 static constexpr UINT WM_SETTINGS_MODE_SYNC = WM_APP + 1;
+// Finish startup outside Sciter's DOCUMENT_READY callback and the constructor.
+static constexpr UINT WM_SETTINGS_INITIALIZE = WM_APP + 2;
 
 // DWM constants for dark mode
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
@@ -80,10 +83,6 @@ SettingsDialog::SettingsDialog()
     (void)sharedState_.OpenReadWrite();
     (void)configEvent_.Initialize();
 
-    // ═══════════════════════════════════════════════════════════
-    // ORDER IS CRITICAL - Do not rearrange these steps!
-    // ═══════════════════════════════════════════════════════════
-
     // 0. Set up UI base path for Debug mode (file system loading)
 #ifndef SCITER_USE_PACKFOLDER
     wchar_t exeDir[MAX_PATH] = {};
@@ -95,7 +94,14 @@ SettingsDialog::SettingsDialog()
     }
 #endif
 
-    // 1. Set transparent BEFORE load() - enables blur effect
+    // Install the native handlers before load(), which can deliver document
+    // events synchronously. Keep the window offscreen until DOCUMENT_READY.
+    SetWindowSubclass(get_hwnd(), SubclassProc, 1, reinterpret_cast<DWORD_PTR>(this));
+    SetWindowTextW(get_hwnd(), L"VKey Settings");
+    BOOL disableTransitions = TRUE;
+    DwmSetWindowAttribute(get_hwnd(), 3, &disableTransitions, sizeof(disableTransitions));
+
+    // Transparency must be enabled before loading the document.
     SciterSetOption(get_hwnd(), SCITER_TRANSPARENT_WINDOW, 1);
 
     // 2. Load HTML using this://app/ scheme (works for both Debug and Release)
@@ -103,76 +109,69 @@ SettingsDialog::SettingsDialog()
     // In Release: on_load_data() loads from packed archive
     if (!load(WSTR("this://app/settings/settings.html"))) {
         NEXTKEY_LOG(L"Failed to load settings.html");
+        PostMessageW(get_hwnd(), WM_CLOSE, 0, 0);
+    }
+
+    // Fallback: reveal window if DOCUMENT_READY never fires (avoids holding VKey_Settings_Mutex forever)
+    SetTimer(get_hwnd(), TIMER_READY_FALLBACK, 1500, nullptr);
+}
+
+void SettingsDialog::applyDocumentSettings() {
+    sciter::dom::element root = get_root();
+    if (!root.is_valid()) return;
+
+    root.set_attribute("lang", GetLanguage() == Language::English ? L"en" : L"vi");
+    sciter::dom::element body = root.find_first("body");
+    if (body.is_valid()) {
+        const bool dark = !forceLightTheme_ && DarkModeHelper::IsWindowsDarkMode();
+        body.set_attribute("class", DarkModeHelper::BuildBodyClasses(dark).c_str());
+    }
+}
+
+void SettingsDialog::initializeWindow() {
+    if (uiInitialized_) return;
+    HWND hwnd = get_hwnd();
+    if (!hwnd) return;
+    KillTimer(hwnd, TIMER_READY_FALLBACK);
+    sciter::dom::element root = get_root();
+    if (!root.is_valid() || !root.find_first("#main-container")) {
+        NEXTKEY_LOG(L"Settings document ready without its main container");
+        PostMessageW(hwnd, WM_CLOSE, 0, 0);
         return;
     }
+    uiInitialized_ = true;
 
-    // 2b. Set UI language (before scripts run)
-    if (GetLanguage() == Language::English) {
-        sciter::dom::element root = get_root();
-        root.set_attribute("lang", L"en");
-    }
-
-    // 3. Show window offscreen to initialize DWM and Sciter rendering state
-    // (Required for transparency/blur to work correctly)
-    expand();
-    // 4. Set title (icon is set at end of constructor after all Sciter calls)
-    SetWindowTextW(get_hwnd(), L"VKey Settings");
-
-    // 8. Subclass for window dragging and close
-    SetWindowSubclass(get_hwnd(), SubclassProc, 1, reinterpret_cast<DWORD_PTR>(this));
-
-    // 9. Initialize UI with loaded settings
+    applyDocumentSettings();
     initializeUI();
+    // initializeUI schedules a resize for later config refreshes. Startup sizes
+    // the complete document here before bringing the window onscreen.
+    KillTimer(hwnd, TIMER_RESIZE_WINDOW);
 
-    // 10. Temporarily disable DWM transitions (animations) to avoid seeing the window jump
-    // DWMWA_TRANSITIONS_FORCEDISABLE = 3 in dwmapi.h
-    BOOL disableTransitions = TRUE;
-    DwmSetWindowAttribute(get_hwnd(), 3, &disableTransitions, sizeof(disableTransitions));
+    const bool dark = !forceLightTheme_ && DarkModeHelper::IsWindowsDarkMode();
+    DarkModeHelper::SetWindowDarkMode(hwnd, dark);
 
-    // 11. Apply theme-aware DWM mode and Windows API blur
-    HWND hwnd = get_hwnd();
-    if (hwnd) {
-        bool dark = forceLightTheme_ ? false : DarkModeHelper::IsWindowsDarkMode();
-        DarkModeHelper::SetWindowDarkMode(hwnd, dark);
-
-        // Set body class based on detected theme (get_root() = <html>, need <body>)
-        sciter::dom::element htmlRoot(get_root());
-        sciter::dom::element body = htmlRoot.find_first("body");
-        if (body.is_valid()) {
-            body.set_attribute("class", DarkModeHelper::BuildBodyClasses(dark).c_str());
-        }
-
-        // Enable rounded corners on Windows 11
-        int cornerPreference = DwmConstants::DWMWCP_ROUND;
-        DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
-                              &cornerPreference, sizeof(cornerPreference));
-
-        // Enable Windows API blur effect (more beautiful than Sciter's native blur)
-        SciterHelper::enableWindowBlur(hwnd, BlurMode::Blur);
-    }
-
-    // 12. Expand (show) the window offscreen first.
-    // This is REQUIRED so that DWM Composition and Sciter rendering state become active.
-    // Without this, the background stays solid black instead of blurred/transparent.
+    // An offscreen show activates DWM/Sciter rendering before measuring content.
     expand();
-
-    // Calculate actual dimensions before centering (handles Advanced Settings width)
     recalcWindowSize();
+    SciterHelper::enableWindowBlur(hwnd, BlurMode::Blur);
 
-    // 13. Finally, move the initialized, rendered, and themed window onscreen
+    // Reveal only the initialized document at its measured size.
     RECT rc;
     GetWindowRect(get_hwnd(), &rc);
     int winWidth = rc.right - rc.left;
     int winHeight = rc.bottom - rc.top;
     POINT pt = NextKey::GetCenteredPos(get_hwnd(), winWidth, winHeight);
-    SetWindowPos(get_hwnd(), HWND_NOTOPMOST, pt.x, pt.y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+    // initializeUI() already applied the saved pin state. Centering must keep
+    // that z-order, otherwise reopening leaves a yellow icon on an unpinned HWND.
+    SetWindowPos(get_hwnd(), nullptr, pt.x, pt.y, 0, 0,
+                 SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOZORDER);
     SetForegroundWindow(get_hwnd());
 
     // Force taskbar presence while DWM transitions are still disabled (avoids flicker)
     SciterHelper::ForceTaskbarPresence(get_hwnd(), IDI_APP);
 
     // Re-enable DWM transitions for subsequent show/hide animations
-    disableTransitions = FALSE;
+    BOOL disableTransitions = FALSE;
     DwmSetWindowAttribute(get_hwnd(), 3, &disableTransitions, sizeof(disableTransitions));
 }
 
@@ -260,9 +259,15 @@ LRESULT CALLBACK SettingsDialog::SubclassProc(
         (void)SciterHelper::GuardTaskbarStyle(wParam, lParam);
     }
 
-    // WM_CLOSE: terminate child subdialogs, flush deferred save, then destroy
-    // (MUST use DestroyWindow, not PostQuitMessage — Sciter assertion failures)
+    if (msg == WM_SETTINGS_INITIALIZE) {
+        if (s_instance) s_instance->initializeWindow();
+        return 0;
+    }
+
+    // WM_CLOSE: terminate child subdialogs, flush deferred save, then destroy & exit
+    // (MUST use ExitProcess — avoids Sciter assertion failures during normal teardown)
     if (msg == WM_CLOSE) {
+        KillTimer(hwnd, TIMER_READY_FALLBACK);
         // Terminate any subdialogs we spawned (they run as separate processes)
         TerminateAllSubprocesses();
 
@@ -270,8 +275,9 @@ LRESULT CALLBACK SettingsDialog::SubclassProc(
             KillTimer(hwnd, TIMER_DEFERRED_SAVE);
             s_instance->saveToToml();
         }
+        ShowWindow(hwnd, SW_HIDE);
         DestroyWindow(hwnd);
-        return 0;
+        ExitProcess(0);
     }
 
     if (msg == WM_DESTROY) {
@@ -310,7 +316,7 @@ LRESULT CALLBACK SettingsDialog::SubclassProc(
     if (msg == WM_VKEY_CONFIG_CHANGED) {
         if (s_instance) {
             s_instance->loadSettings();
-            s_instance->initializeUI();
+            if (s_instance->uiInitialized_) s_instance->initializeUI();
         }
         return 0;
     }
@@ -321,6 +327,21 @@ LRESULT CALLBACK SettingsDialog::SubclassProc(
     if (msg == WM_VKEY_ICON_SETTINGS_CHANGED) {
         if (s_instance) {
             s_instance->systemConfig_ = ConfigManager::LoadSystemConfigOrDefault();
+        }
+        return 0;
+    }
+
+    // Handle window restore from minimized: force Sciter to repaint (#258)
+    if (s_instance
+        && SciterHelper::ConsumeRestoreFromMinimized(msg, wParam, s_instance->wasMinimized_)) {
+        SciterHelper::RepaintAfterRestore(hwnd);
+    }
+
+    // Handle fallback timer if DOCUMENT_READY never arrived
+    if (msg == WM_TIMER && wParam == TIMER_READY_FALLBACK) {
+        KillTimer(hwnd, TIMER_READY_FALLBACK);
+        if (s_instance && !s_instance->uiInitialized_) {
+            s_instance->initializeWindow();
         }
         return 0;
     }
@@ -421,13 +442,8 @@ LRESULT CALLBACK SettingsDialog::SubclassProc(
                 sciter::dom::element container = htmlRoot.find_first("#main-container");
                 if (container.is_valid()) {
                     double opacity = s_instance->backgroundOpacity_ / 100.0;
-                    wchar_t bgColor[64];
-                    if (dark) {
-                        swprintf_s(bgColor, L"rgba(18, 20, 28, %.2f)", opacity);
-                    } else {
-                        swprintf_s(bgColor, L"rgba(255, 255, 255, %.2f)", opacity);
-                    }
-                    container.set_style_attribute("background-color", bgColor);
+                    container.set_style_attribute("background-color",
+                        SciterHelper::FormatBackgroundColor(dark, opacity).c_str());
                 }
             }
         }
@@ -473,18 +489,27 @@ void SettingsDialog::SetVietnameseMode(bool vietnamese) {
 }
 
 void SettingsDialog::Show() {
-    // Message loop until window is closed
-    MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-
-        if (!IsWindow(get_hwnd())) break;
-    }
+    // Sciter's loop advances deferred mouse/idle events as well as Win32
+    // messages. GetMessageW alone leaves native hover tooltips pending.
+    // WM_CLOSE still flushes settings and exits this subprocess explicitly.
+    sciter::application::run();
 }
 
 bool SettingsDialog::handle_event(HELEMENT he, BEHAVIOR_EVENT_PARAMS& params) {
     UNREFERENCED_PARAMETER(he);
+
+    if (params.cmd == DOCUMENT_PARSED && params.heTarget == get_root()) {
+        // Preserve Sciter's own document handling, then set language/theme for
+        // the JavaScript ready handlers (translations and blur tint).
+        const bool handled = sciter::window::handle_event(he, params);
+        applyDocumentSettings();
+        return handled;
+    }
+    if (params.cmd == DOCUMENT_READY && params.heTarget == get_root()) {
+        KillTimer(get_hwnd(), TIMER_READY_FALLBACK);
+        if (!uiInitialized_) PostMessageW(get_hwnd(), WM_SETTINGS_INITIALIZE, 0, 0);
+        return sciter::window::handle_event(he, params);
+    }
 
     // Handle BUTTON_CLICK events
     if (params.cmd == BUTTON_CLICK) {
@@ -745,6 +770,7 @@ void SettingsDialog::handleToggleChange(const std::wstring& id, bool value) {
     }
     else if (id == L"use-macro") {
         config_.macroEnabled = value;
+        call_function("updateMacroChildren", sciter::value(value));
     }
     else if (id == L"macro-english") {
         config_.macroInEnglish = value;
@@ -760,6 +786,13 @@ void SettingsDialog::handleToggleChange(const std::wstring& id, bool value) {
     }
     else if (id == L"auto-caps-macro") {
         config_.autoCapsMacro = value;
+        call_function("updateMacroCapsChildren", sciter::value(value));
+    }
+    else if (id == L"macro-title-case") {
+        config_.macroTitleCase = value;
+    }
+    else if (id == L"macro-undo-backspace") {
+        config_.macroUndoOnBackspace = value;
     }
     // Show-advanced toggle: UI-only setting (expand/collapse panel)
     else if (id == L"show-advanced") {
@@ -853,13 +886,8 @@ void SettingsDialog::handleToggleChange(const std::wstring& id, bool value) {
         double opacity = backgroundOpacity_ / 100.0;
         sciter::dom::element container = htmlRoot.find_first("#main-container");
         if (container.is_valid()) {
-            wchar_t bgColor[64];
-            if (dark) {
-                swprintf_s(bgColor, L"rgba(18, 20, 28, %.2f)", opacity);
-            } else {
-                swprintf_s(bgColor, L"rgba(255, 255, 255, %.2f)", opacity);
-            }
-            container.set_style_attribute("background-color", bgColor);
+            container.set_style_attribute("background-color",
+                SciterHelper::FormatBackgroundColor(dark, opacity).c_str());
         }
         return;
     }
@@ -1021,6 +1049,15 @@ void SettingsDialog::handleButtonClick(const std::wstring& id) {
     }
 }
 
+void SettingsDialog::notifySubdialogPinState() {
+    EnumWindows([](HWND child, LPARAM parent) -> BOOL {
+        if (GetPropW(child, VKEY_SUBDIALOG_PARENT_PROP) == reinterpret_cast<HANDLE>(parent)) {
+            PostMessageW(child, WM_VKEY_PARENT_PIN_CHANGED, 0, parent);
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(get_hwnd()));
+}
+
 void SettingsDialog::togglePin() {
     HWND hwnd = get_hwnd();
     if (!hwnd) return;
@@ -1030,6 +1067,7 @@ void SettingsDialog::togglePin() {
     // Set window topmost state
     SetWindowPos(hwnd, isPinned_ ? HWND_TOPMOST : HWND_NOTOPMOST,
                  0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    notifySubdialogPinState();
 
     // Update button visual state
     sciter::dom::element root = get_root();
@@ -1314,6 +1352,10 @@ void SettingsDialog::initializeUI() {
     setToggleState(L"quick-start", config_.quickStartConsonant);
     setToggleState(L"quick-end", config_.quickEndConsonant);
     setToggleState(L"auto-caps-macro", config_.autoCapsMacro);
+    setToggleState(L"macro-undo-backspace", config_.macroUndoOnBackspace);
+    call_function("updateMacroChildren", sciter::value(config_.macroEnabled));
+    setToggleState(L"macro-title-case", config_.macroTitleCase);
+    call_function("updateMacroCapsChildren", sciter::value(config_.autoCapsMacro));
     // esc-restore-raw / temp-off-openkey / temp-off-macro toggles were removed
     // when the unified Hotkey Rebind dialog took over their behavior. Per-intent
     // enable now lives in HotkeyRegistry (hotkey_state TOML section).
@@ -1413,22 +1455,19 @@ void SettingsDialog::initializeUI() {
         double opacity = backgroundOpacity_ / 100.0;
         sciter::dom::element container = root.find_first("#main-container");
         if (container.is_valid()) {
-            wchar_t bgColor[64];
-            if (dark) {
-                swprintf_s(bgColor, L"rgba(18, 20, 28, %.2f)", opacity);
-            } else {
-                swprintf_s(bgColor, L"rgba(255, 255, 255, %.2f)", opacity);
-            }
-            container.set_style_attribute("background-color", bgColor);
+            container.set_style_attribute("background-color",
+                SciterHelper::FormatBackgroundColor(dark, opacity).c_str());
         }
     }
 
-    // Apply pinned state if saved
-    if (isPinned_) {
-        SetWindowPos(get_hwnd(), HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    // Apply both states: config reloads can also turn pinning off.
+    SetWindowPos(get_hwnd(), isPinned_ ? HWND_TOPMOST : HWND_NOTOPMOST,
+                 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    notifySubdialogPinState();
+    {
         sciter::dom::element pinBtn = root.find_first("#btn-pin");
         if (pinBtn.is_valid()) {
-            pinBtn.set_attribute("class", L"btn-pin pinned");
+            pinBtn.set_attribute("class", isPinned_ ? L"btn-pin pinned" : L"btn-pin");
         }
     }
 
@@ -1702,7 +1741,7 @@ void SettingsDialog::startUpdate(const UpdateInfo& info) {
     HWND hwnd = get_hwnd();
     if (!hwnd || info.downloadUrl.empty()) return;
 
-    if (!UpdateChecker::DownloadWithProgress(hwnd, info.downloadUrl)) return;
+    if (!UpdateChecker::DownloadWithProgress(hwnd, info.downloadUrl, info.packedVersion)) return;
 
     // Success — signal main process to exit
     HWND trayWnd = FindWindowW(L"VKeyTrayClass", nullptr);

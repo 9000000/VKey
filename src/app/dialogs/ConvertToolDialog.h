@@ -12,12 +12,17 @@ namespace NextKey {
 /// Dialog for Vietnamese text encoding conversion (Sciter subdialog)
 class ConvertToolDialog : public SciterSubDialog {
 public:
+    static constexpr int kBaseWidth  = 420;
+    static constexpr int kBaseHeight = 520;
+
     ConvertToolDialog(HWND parent);
 
     // Override event handler for VALUE_CHANGED, BUTTON_CLICK, and DOCUMENT_COMPLETE
     bool handle_event(HELEMENT he, BEHAVIOR_EVENT_PARAMS& params) override;
 
 private:
+    LRESULT onCustomMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) override;
+    void fitContent();
     void doConvert();
     void togglePin();
     void browseFile(bool isSource);
@@ -34,7 +39,6 @@ private:
     void setDropdownUI(const char* id, int value);
 
     ConvertConfig config_;
-    bool isPinned_ = false;
 };
 
 }  // namespace NextKey

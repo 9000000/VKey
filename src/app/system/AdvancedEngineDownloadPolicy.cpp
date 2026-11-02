@@ -4,6 +4,7 @@
 #include "AdvancedEngineDownloadPolicy.h"
 
 #include "core/Version.h"
+#include "core/engine/EngineSignature.h"
 
 #include <array>
 
@@ -30,9 +31,24 @@ bool EqualsAsciiIgnoreCase(std::wstring_view left, std::wstring_view right) noex
 
 } // namespace
 
+AdvancedEngineDownloadBudget::AdvancedEngineDownloadBudget(
+    AdvancedEngineDownloadAsset asset, std::uint64_t engineBytes) noexcept
+    : expected_(asset == AdvancedEngineDownloadAsset::Signature ? EngineSignature::kFileBytes : engineBytes) {}
+
+bool AdvancedEngineDownloadBudget::AcceptChunk(std::uint64_t bytes) noexcept {
+    if (bytes > expected_ - received_) return false;
+    received_ += bytes;
+    return true;
+}
+
 std::wstring BuildAdvancedEngineReleaseUrl() {
     return L"https://github.com/phatMT97/VKey/releases/download/"
            L"v" VKEY_VERSION_WSTR L"/vkey_engine.dll";
+}
+
+std::wstring BuildAdvancedEngineReleasePageUrl() {
+    return L"https://github.com/phatMT97/VKey/releases/tag/"
+           L"v" VKEY_VERSION_WSTR;
 }
 
 std::wstring BuildAdvancedEngineSignatureUrl() {

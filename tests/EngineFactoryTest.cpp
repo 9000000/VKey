@@ -72,7 +72,7 @@ TEST_F(EngineFactoryTest, RuntimeSwitch_TelexToVNI) {
     telexEngine->PushChar(L'a');
     EXPECT_EQ(telexEngine->Peek(), L"â");
     
-    // Simulate commit before switch
+    // Bare â nucleus commits composed form in Basic spell checking (matches Rust parity).
     std::wstring committed = telexEngine->Commit();
     EXPECT_EQ(committed, L"â");
     

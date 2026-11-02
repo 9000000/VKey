@@ -21,6 +21,7 @@
 #include "core/CommitUndoArmDecision.h"
 #include "core/DigitLedWordDecision.h"
 #include "core/DorionHookReclaimSequence.h"
+#include "core/ExternalInjectedKeyDecision.h"
 #include "core/FocusApplyDecision.h"
 #include "core/LeakedKeyDuringSendDecision.h"
 #include "core/MacroCase.h"
@@ -39,6 +40,7 @@
 #include "core/pipeline/gates/EnglishBiasGate.h"
 #include "core/pipeline/gates/SpellCheckGate.h"
 #include "core/pipeline/gates/ToneEscapeGate.h"
+#include "HookEngineInternal.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
@@ -60,37 +62,6 @@ namespace NextKey {
 // and Start() legitimately runs composition setup on main before the
 // hook thread spawns.
 // ═══════════════════════════════════════════════════════════
-#ifdef NDEBUG
-  #define VKEY_ASSERT_HOOK_THREAD() ((void)0)
-#else
-  #define VKEY_ASSERT_HOOK_THREAD()                                            \
-      do {                                                                     \
-          const DWORD _expected = lifecycle_.ThreadId();                        \
-          if (_expected != 0) {                                                 \
-              const DWORD _current = GetCurrentThreadId();                      \
-              if (_current != _expected) {                                      \
-                  HOOK_LOG(L"VKEY_ASSERT_HOOK_THREAD violated: tid=%lu, expected hook tid=%lu — %hs", \
-                           _current, _expected, __func__);                      \
-                  assert(_current == _expected &&                               \
-                         "composition-state mutation must run on the hook thread"); \
-              }                                                                 \
-          }                                                                     \
-      } while (0)
-#endif
-
-// ═══════════════════════════════════════════════════════════
-// HOOK_LOG → unified runtime-gated Logger (core/Logger.h).
-// Enable from Settings → System → "Bật debug log". Output file is shared
-// with NEXTKEY_LOG / TSF_LOG: VKey_<process>_<pid>.log next to
-// VKeyApp.exe (falls back to %APPDATA%\VKey\logs\ if install dir is
-// read-only). Flushing/closing is owned by the Logger (DLL detach + EXE
-// process exit) — hook Start/Stop does NOT toggle the logger lifecycle.
-// ═══════════════════════════════════════════════════════════
-#define HOOK_LOG(fmt, ...) do {                                              \
-    if (::NextKey::Logger::IsEnabled())                                      \
-        ::NextKey::Logger::Log(L"[Hook] " fmt, ##__VA_ARGS__);               \
-} while (0)
-
 std::atomic<HookEngine*> HookEngine::s_instance{nullptr};
 
 HookEngine::HookEngine() {
@@ -166,7 +137,6 @@ void HookEngine::ApplyConfig(const TypingConfig& config) {
     autoCaps_.store(config.autoCaps, std::memory_order_release);
     macroEnabled_.store(config.macroEnabled, std::memory_order_release);
     macroInEnglish_.store(config.macroInEnglish, std::memory_order_release);
-    autoCapsMacro_.store(config.autoCapsMacro, std::memory_order_release);
     // Push the suggestKeepChars flag to the live injector so ShouldEmitBait
     // sees the latest user choice without needing a focus change to swap
     // injectors. Focus-change paths re-apply this from the config snapshot.
@@ -261,6 +231,10 @@ bool HookEngine::Start(HINSTANCE hInstance, const TypingConfig& config,
     ApplyHotkeyRegistry(ConfigManager::MigrateLegacyHotkeysIfNeeded(
         ConfigManager::GetConfigPath()));
     autoCapState_ = AutoCapState::Idle;
+    lastAppliedHwnd_ = 0;
+    lastAppliedEffectiveFocusHwnd_ = 0;
+    lastDispatchedHwnd_ = 0;
+    lastDispatchedTargetHwnd_ = 0;
 #ifdef VKEY_USE_RUST_ENGINE
     if (config.spellSuggestEnabled) {
         auto loaded = RustInputEngine::LoadUserDictionary(ConfigManager::GetConfigPath());
@@ -479,6 +453,10 @@ void HookEngine::Stop() {
         s_instance = nullptr;
     }
     focus_.ResetLayoutState();
+    lastAppliedHwnd_ = 0;
+    lastAppliedEffectiveFocusHwnd_ = 0;
+    lastDispatchedHwnd_ = 0;
+    lastDispatchedTargetHwnd_ = 0;
     NEXTKEY_LOG(L"HookEngine stopped");
 }
 
@@ -516,7 +494,7 @@ void HookEngine::SetCodeTable(CodeTable ct) {
     std::lock_guard<std::mutex> _lock(stateMutex_);
     // Commit any pending composition before switching
     if (ct != currentCodeTable_.load(std::memory_order_acquire) && engine_->Count() > 0) {
-        CommitComposition();
+        CommitComposition(true);
     }
 
     currentCodeTable_.store(ct, std::memory_order_release);
@@ -980,6 +958,70 @@ LRESULT HookEngine::LowLevelKeyboardProcImpl(int nCode, WPARAM wParam, LPARAM lP
             const bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
             const bool isUp = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
 
+            // Issue #274 & #275: Handle synthetic/injected events from other software.
+            // External snippet expanders (PhraseExpress, AHK hotstrings) send injected
+            // Backspace / Delete to delete trigger abbreviations directly in the host app.
+            // VKey must NOT intercept, eat, or synthesize diffs for these deletion keys.
+            //
+            // Remote desktop and on-screen keyboards (TeamViewer, osk) send injected
+            // Backspace while typing. If the deletion is a pure one-char deletion matching the
+            // engine's composition in Unicode table, sync the engine to keep composition alive.
+            // Otherwise (re-render needed, VK_DELETE, empty composition, or non-Unicode),
+            // reset unconditionally to disarm undo state.
+            //
+            // Ordering risk / re-entrancy (#274, CODING_RULES 11-hook-system-rules.md): bypass runs before
+            // dispatcher_.IsSending() check below; SendMessageTimeoutW in synchronous
+            // edit/RichEdit injectors can re-enter this hook. If isSending is true, pass through
+            // untouched without modifying composition state.
+            //
+            // Normal printable keys (alpha, digits, space, punctuation) injected by
+            // automation tools (AutoHotkey, Auto Keyboard, UI tests) MUST continue to
+            // ProcessKeyDown so Vietnamese diacritics are applied correctly (#275).
+            const bool isExternalInjected =
+                IsExternalInjectedKey(pKey->flags, pKey->dwExtraInfo, VKEY_EXTRA_INFO);
+            if (ShouldBypassAndResetOnInjected(isExternalInjected, pKey->vkCode)) {
+                const bool isSending = self->dispatcher_.IsSending();
+                const bool isUnicode =
+                    self->currentCodeTable_.load(std::memory_order_acquire) == CodeTable::Unicode;
+                const bool hasComposition =
+                    self->engine_->Count() > 0 && !self->previousComposition_.empty();
+
+                std::wstring newComposition;
+                if (isDown && !isSending && pKey->vkCode == VK_BACK && isUnicode && hasComposition) {
+                    self->engine_->Backspace();
+                    newComposition = self->engine_->Peek();
+                }
+
+                const InjectedDeletionAction action = DecideInjectedDeletionAction(
+                    hasComposition ? std::wstring_view{self->previousComposition_} : std::wstring_view{},
+                    newComposition,
+                    isUnicode,
+                    isSending,
+                    pKey->vkCode,
+                    isDown);
+
+                if (action == InjectedDeletionAction::SyncEngine) {
+                    HOOK_LOG(L"  EXTERNAL INJECTED BACKSPACE -> SyncEngine (prev='%s' new='%s')",
+                             self->previousComposition_.c_str(),
+                             newComposition.c_str());
+                    self->previousComposition_ = std::move(newComposition);
+                    self->CancelCommitUndo();
+                    self->ClearMacroUndo();
+                    if (!self->rawMacroBuffer_.empty()) {
+                        self->rawMacroBuffer_.pop_back();
+                        if (self->rawMacroBuffer_.empty()) self->ClearMacroBuffer();
+                    }
+                    if (self->engine_->Count() == 0) {
+                        self->digitLedWord_ = false;
+                    }
+                } else if (action == InjectedDeletionAction::Reset) {
+                    HOOK_LOG(L"  EXTERNAL INJECTED DELETION (vk=0x%02X flags=0x%08X) -> ResetComposition",
+                             pKey->vkCode, pKey->flags);
+                    self->ResetComposition();
+                }
+                return CallNextHookEx(nullptr, nCode, wParam, lParam);
+            }
+
             // Application hotkeys share this sole dedicated keyboard hook.
             // Match every real DOWN/UP event after VKey-tagged synthetic
             // filtering and before sending/activity/engine work. Match() only
@@ -1225,6 +1267,15 @@ static bool IsIncompatibleLayout(HKL hkl);
 bool HookEngine::ProcessKeyDown(DWORD vkCode, DWORD /*scanCode*/, DWORD /*flags*/,
                                  bool preDrainShift, bool preDrainCapsLock, bool preDrainCtrl,
                                  bool preDrainAlt, bool preDrainWin) {
+    // Invalidate before pipeline features or routing guards can return early.
+    if (macroUndoState_.active) {
+        const auto macroCfg = config_.load(std::memory_order_acquire);
+        if (vkCode != VK_BACK || preDrainCtrl || preDrainAlt || preDrainWin
+            || !macroCfg || !macroCfg->macroEnabled || !macroCfg->macroUndoOnBackspace
+            || GetTickCount() - macroUndoState_.timestamp > kMacroUndoTimeoutMs) {
+            ClearMacroUndo();
+        }
+    }
     // Replay-context boundary (Enter / Tab) — the ONE choke point enforcing
     // "a commit-undo replay window must never survive leaving the editing
     // context". Runs before every guard, independent of engine emptiness, of
@@ -1294,7 +1345,11 @@ bool HookEngine::ProcessKeyDown(DWORD vkCode, DWORD /*scanCode*/, DWORD /*flags*
     const bool macroEng = macroInEnglish_.load(std::memory_order_acquire);
     if (!vnMode &&
         commitState_.IsIdle() &&
+        !macroUndoState_.active &&
         !(macroOn && macroEng)) {
+        if (IsCaretNavigationKey(vkCode) && engine_) {
+            engine_->ClearContext();
+        }
         return false;
     }
 
@@ -1470,302 +1525,8 @@ HookEngine::KeyOutcome HookEngine::RunTopGuards(DWORD vkCode) {
     return KeyOutcome::Fallthrough;
 }
 
-// H1a: commit-undo state machine extracted from ProcessKeyDown step 2d.
-// Supports multi-word backward — stack holds up to CommitState::kMaxStack committed words.
-// Ready:  set after commit with space/enter, or when engine empties after BS with stack non-empty.
-// Primed: BS in Ready deletes the space; next alpha/BS triggers replay.
-//
-// Behavior is byte-identical to the pre-extraction inline block. Returns:
-//   Eat         → ProcessKeyDown returns true (key consumed by undo machinery).
-//   Pass        → ProcessKeyDown returns false (key passes through to app).
-//   Fallthrough → no decision; ProcessKeyDown continues with subsequent steps.
-HookEngine::KeyOutcome HookEngine::HandleCommitUndoFsm(DWORD vkCode, bool vnMode,
-                                                       bool cachedShift, bool cachedCapsLock,
-                                                       bool cachedCtrl, bool cachedAlt,
-                                                       bool cachedWin) {
-    // Ctrl/Alt/Win invalidate commit-undo: Ctrl+BS deletes entire word (not just the
-    // space), Ctrl+A/C/Z change cursor/selection — all make saved commit state stale.
-    // Must check BEFORE the state machine to prevent ghost key replay.
-    if (!commitState_.IsIdle() &&
-        (cachedCtrl || cachedAlt || cachedWin)) {
-        HOOK_LOG(L"  commit-undo: cancel — modifier key held");
-        CancelCommitUndo();
-        // Fall through — Ctrl check at ProcessKeyDown step 5 will handle ResetComposition
-    }
-
-    // Enter (VK_RETURN) doesn't move focus in chat/form inputs — cursor
-    // stays in the same input box on message-send / line-break. That
-    // bypasses the focus-event safety net that Tab + mouse-click rely on
-    // to clear commitStack_ via ResetComposition. Without this explicit
-    // cancel, the stack survives across message-send boundaries: user
-    // sends "không," then starts a new message with "vaf"; the BS chain
-    // they use to correct a typo in the new message replays the phantom
-    // "không" prefix into the engine; IsHardEnglishToneContext sees the
-    // concat-buffer V-CC-V pattern and blocks tone on the new word.
-    // Existing line ~1319 already cancels Enter while state==Ready;
-    // this branch guards the gap where a prior non-exempt key (e.g.
-    // SPACE) downgraded state to Idle but left the stack populated.
-    // Idempotent — no-op when state==Idle && stack already empty.
-    if (vkCode == VK_RETURN &&
-        (!commitState_.IsIdle() || !commitState_.StackEmpty())) {
-        HOOK_LOG(L"  commit-undo: cancel — VK_RETURN (stack=%zu state=%d)",
-                 commitState_.StackSize(), static_cast<int>(commitState_.Current()));
-        CancelCommitUndo();
-        // Fall through — Enter still passes through to the app normally.
-    }
-    //
-    // Auto-expire Ready after kCommitUndoTimeoutMs: cheap insurance against any cursor-movement
-    // event that bypasses ResetComposition (e.g. external text change, rare edge cases).
-    if (commitState_.IsReady()) {
-        DWORD elapsed = GetTickCount() - commitState_.ReadyTime();
-        if (elapsed > kCommitUndoTimeoutMs) {
-            HOOK_LOG(L"  commit-undo: Ready state expired after %u ms → Idle", elapsed);
-            CancelCommitUndo();
-        }
-    }
-    if (commitState_.IsReady() && vkCode == VK_BACK && engine_->Count() == 0) {
-        if (commitState_.PendingTriggerCount() > 0) {
-            // Extra trigger chars still on screen (e.g., "a==" → need to delete both '=' before undo)
-            commitState_.DecrementPendingTriggers();
-            HOOK_LOG(L"  commit-undo: BS in Ready, pendingTriggers=%u — stay Ready", commitState_.PendingTriggerCount());
-            return KeyOutcome::Pass;  // Let BS pass through to delete the extra trigger char
-        }
-        // Backspace deletes the commit trigger (space/etc.)
-        commitState_.SetPrimed();
-        // Any accumulated multi-word-macro state is stale once replay begins —
-        // the phrase buffer no longer mirrors what's on screen.
-        macroCrossCommit_ = false;
-        ClearMacroBuffer();
-        if (dispatcher_.SynthEventsPending() > 0) {
-            // Synthetic events still in flight (word corrections, injected commit trigger).
-            // If we pass BS through now it arrives at the app BEFORE those synthetics,
-            // deleting the wrong character and permanently desynchronising previousComposition_.
-            // Re-inject so BS is placed AFTER the pending synthetics in the queue.
-            HOOK_LOG(L"  commit-undo: BS after commit → Primed, re-inject after synthetics (pending=%d)", dispatcher_.SynthEventsPending());
-            InjectKey(VK_BACK);
-            return KeyOutcome::Eat;
-        }
-        // Sprint 1 Fix C/2026-05-05: editMsg apps need this BS via the sent
-        // EM_REPLACESEL channel — passing the physical BS through goes via the
-        // posted message queue and is pre-empted by the next sent EM_REPLACESEL
-        // (the 's' in chaos 5.3), leaving the pre-replace BS to drain after
-        // the replacement and eat the just-inserted chars.
-        //
-        // The synchronous-channel injector (RichEditEm) handles commit-undo BS
-        // via sent message. Default hosts let physical BS pass through naturally —
-        // synthesizing would just add latency.
-        if (dispatcher_.IsSyncReplaceChannel()) {
-            auto inj = dispatcher_.GetInjector();
-            bool injOk;
-            { PERF_SCOPE(::NextKey::Perf::Stage::Injector);
-              injOk = inj->Replace(/*bs=*/1, std::wstring_view{}); }
-            if (injOk) {
-                HOOK_LOG(L"  commit-undo: BS after commit via injector → Primed");
-                return KeyOutcome::Eat;
-            }
-            HOOK_LOG(L"  commit-undo: BS after commit injector failed, passthrough");
-        }
-        HOOK_LOG(L"  commit-undo: BS after commit → Primed (ready to replay)");
-        return KeyOutcome::Pass;  // Let backspace pass through to delete the space
-    }
-    if (commitState_.IsPrimed() && engine_->Count() == 0 && vnMode) {
-        // Synth guard: if synthetic events were sent recently and are likely still
-        // in the OS input queue, replaying now would set previousComposition_ to stale
-        // committed text while the screen hasn't caught up — causing diff miscalculation
-        // and permanent engine-screen desync.  Cancel commit-undo and fall through to
-        // normal key processing.
-        // Time check is essential: on Qt apps, synthEventsPending_ has a persistent
-        // baseline leak (counter never reaches 0 due to event counting mismatch).
-        // Checking counter alone would permanently disable commit-undo.  The 100ms
-        // threshold covers DispatchSendInput Sleep (10-20ms) + Qt processing (~30ms)
-        // with margin, while allowing replay at normal typing speed (>100ms between keys).
-        //
-        // Sprint 2 D1/2026-05-05: tone modifiers (Telex s/f/r/x/j; VNI 1-5) are
-        // EXEMPT from the synth guard. Reason: by definition they only modify the
-        // previous word — no other linguistic meaning. ReplaceComposition's diff
-        // (prev=committed, new=committed-with-tone) computes BS correctly relative
-        // to the post-drain screen state, and SendInput appends our events AFTER
-        // any pending synth, so screen-engine sync is preserved across the gap.
-        // Without this exemption, chaos 5.3 (`viejtnam BS×4 s` on non-EditMsg apps
-        // like Chrome) cancels the replay and produces `việts` instead of `viết`.
-        // See docs/baselines/perf-baseline-d12-chrome-cross-app.md and the
-        // S2D0_ChromeBug53_* engine-isolation tests.
-        // Exemption rule shared by the synth-guard and catch-all cancel
-        // branches: modifier letters (Telex/SimpleTelex/Combined
-        // s/f/r/x/j/z/a/e/o/w/d), VNI digits 0-9, UserDefined keys whose
-        // customKeyMap action passes IsCommitUndoExemptAction, and ESC
-        // restore-raw all semantically "modify the previous word" — they
-        // must not demote / cancel commit-undo state. Extracted to
-        // core/CommitUndoExemption.h for Linux GTest coverage (HookEngine.cpp
-        // is Win32-only). See design 2026-05-17 + 2026-05-21b broadening.
-        const auto methodForExempt = currentMethod_.load(std::memory_order_acquire);
-        const bool shiftHeld = cachedShift;
-        // Source of truth: registry snapshot — Esc only exempts when bound to
-        // CancelComposition AND the intent is enabled. Removed in v3 cleanup:
-        // legacy `escRestoreRawEnabled_` atomic. Matches() rejects modifier-vk
-        // on DOWN so passing keyUp=false is safe for plain Esc.
-        const auto hotkeysForExempt = hotkeys_.load(std::memory_order_acquire);
-        const bool escIsCancelTrigger =
-            hotkeysForExempt &&
-            hotkeysForExempt->Matches(Intent::CancelComposition, VK_ESCAPE,
-                                       /*mods=*/0, /*isDoubleTap=*/false,
-                                       /*keyUp=*/false);
-        // UserDefined modifier lookup: customKeyMap can bind any key to
-        // a tone/modifier action, so the hardcoded letter/digit lists
-        // don't apply. Resolve vk → ASCII via VkToMacroChar (same path
-        // step 6d uses) and ask IsCommitUndoExemptAction whether the
-        // mapped action belongs to the "modifies previous word" class.
-        bool isCustomModifier = false;
-        if (methodForExempt == InputMethod::UserDefined) {
-            const wchar_t ch = VkToMacroChar(vkCode);
-            if (ch && ch < 128) {
-                const TypingAction action =
-                    config_.load(std::memory_order_acquire)
-                        ->customKeyMap[static_cast<uint8_t>(ch)];
-                isCustomModifier = IsCommitUndoExemptAction(action);
-            }
-        }
-        const bool isCommitUndoExempt = IsCommitUndoExemptKey(
-            vkCode, methodForExempt, shiftHeld, escIsCancelTrigger,
-            isCustomModifier);
-        // Second exemption class, wider than the semantic one above: a literal
-        // coda the engine says keeps the committed word a live Vietnamese shape
-        // ('n' after 'nghieej'). It is safe under the same synth-guard argument
-        // for a *weaker* reason — an append diffs to zero BS plus one char, so
-        // it cannot mis-BS against a screen that has not drained yet, whereas a
-        // tone modifier rewrites in place and needs the exact post-drain state.
-        bool isValidCommittedContinuation = false;
-        if (!isCommitUndoExempt && vkCode >= 0x41 && vkCode <= 0x5A &&
-            !commitState_.StackEmpty()) {
-            wchar_t continuation = static_cast<wchar_t>(vkCode);
-            if (cachedShift == cachedCapsLock) continuation = towlower(continuation);
-            isValidCommittedContinuation = engine_->ShouldReplayCommittedKey(
-                commitState_.StackTop().rawInput, continuation);
-        }
-        const bool shouldReplayCommittedWord =
-            isCommitUndoExempt || isValidCommittedContinuation;
-        // Sprint 2 D5: settle window is now per-host. RichEdit (0 ms) lets
-        // commit-undo replay immediately; Win32 (30 ms) tightens the gate
-        // ~3× vs the legacy 100 ms hardcode; Electron/Console (100 ms) keeps
-        // the original budget where IPC reorder margin still matters. Read
-        // here, not cached, so a focus change between commit and the next
-        // BS uses the new injector's budget.
-        const DWORD settleMs = static_cast<DWORD>(
-            dispatcher_.GetInjector()->SettleBudget().count());
-        if (dispatcher_.SynthEventsPending() > 0 && (GetTickCount() - dispatcher_.LastRealSynthTime()) < settleMs
-            && !shouldReplayCommittedWord) {
-            HOOK_LOG(L"  commit-undo: cancel Primed — synthPending=%d, vk=0x%02X",
-                     dispatcher_.SynthEventsPending(), vkCode);
-            CancelCommitUndo();
-            // Fall through — ProcessKeyDown step 10 re-injects BS if needed; alpha → step 6 HandleAlphaKey
-        } else if (vkCode >= 0x41 && vkCode <= 0x5A) {
-            // Discriminate alpha intent at Primed: a semantic modifier or an
-            // engine-approved literal continuation of the committed raw input
-            // reopens the word. Other alphas mean the user started a new word;
-            // DROP stack-top to prevent a later BS-into-empty from re-priming
-            // Ready for it, then let the alpha enter fresh composition. Without
-            // this, catch-all replay concatenated an older stack entry into the
-            // new word (engine/screen divergence).
-            if (!shouldReplayCommittedWord) {
-                HOOK_LOG(L"  commit-undo: drop stack-top '%s' for non-tone alpha '%c' → fresh composition",
-                         commitState_.StackEmpty() ? L"<empty>" : commitState_.StackTop().text.c_str(),
-                         static_cast<char>(vkCode));
-                if (!commitState_.StackEmpty()) {
-                    commitState_.PopStackTop();
-                }
-                commitState_.SetIdle();
-                return KeyOutcome::Fallthrough;
-            }
-            // MUST return HandleAlphaKey's value: if it triggers passthrough (return false),
-            // the original key must reach the app — ignoring it would swallow the keystroke.
-            HOOK_LOG(L"  commit-undo: replaying + eligible alpha '%c' (stack_top='%s' stackSize=%zu prevComp='%s' synthPending=%d)",
-                     static_cast<char>(vkCode),
-                     commitState_.StackEmpty() ? L"<empty>" : commitState_.StackTop().text.c_str(),
-                     commitState_.StackSize(),
-                     previousComposition_.c_str(),
-                     dispatcher_.SynthEventsPending());
-            if (!ReplayCommittedChars()) {
-                return KeyOutcome::Pass;
-            }
-            {
-                bool shift = cachedShift;
-                bool caps = cachedCapsLock;
-                return HandleAlphaKey(vkCode, shift, caps)
-                    ? KeyOutcome::Eat
-                    : KeyOutcome::Pass;
-            }
-        } else if (const InputMethod method = currentMethod_.load(std::memory_order_acquire);
-                   (method == InputMethod::VNI || method == InputMethod::Combined ||
-                    method == InputMethod::UserDefined) &&
-                   vkCode >= 0x30 && vkCode <= 0x39 &&
-                   !cachedShift) {
-            // VNI/Combined/UserDefined digit key (0-9) → replay saved chars, then process
-            // as tone/modifier. Without this, "cá " + BS + '2' would produce "cá2" instead
-            // of "cà". '0' is VNI clear-tone; UserDefined may map any digit via customKeyMap.
-            HOOK_LOG(L"  commit-undo: replaying + VNI digit '%c' (stack_top='%s' stackSize=%zu prevComp='%s')",
-                     static_cast<char>(vkCode),
-                     commitState_.StackEmpty() ? L"<empty>" : commitState_.StackTop().text.c_str(),
-                     commitState_.StackSize(),
-                     previousComposition_.c_str());
-            if (!ReplayCommittedChars() || engine_->Count() == 0) {
-                commitState_.SetIdle();
-                return KeyOutcome::Pass;  // Replay failed — let digit pass through
-            }
-            return HandleVniDigitKey(vkCode)
-                ? KeyOutcome::Eat
-                : KeyOutcome::Pass;
-        } else if (vkCode == VK_BACK) {
-            // Backspace → replay saved chars, then backspace into the word
-            HOOK_LOG(L"  commit-undo: replaying + backspace (stack_top='%s' stackSize=%zu prevComp='%s' synthPending=%d)",
-                     commitState_.StackEmpty() ? L"<empty>" : commitState_.StackTop().text.c_str(),
-                     commitState_.StackSize(),
-                     previousComposition_.c_str(),
-                     dispatcher_.SynthEventsPending());
-            if (!ReplayCommittedChars(/*preferVisibleText=*/true)) {
-                return KeyOutcome::Pass;
-            }
-            HandleBackspace();
-            return KeyOutcome::Eat;
-        } else if (!isCommitUndoExempt) {
-            // Any other key → cancel commit-undo.
-            // Exempt keys (tone modifiers, ESC restore-raw) keep state Primed
-            // so the downstream replay / restore handlers can read commitStack_.
-            commitState_.SetIdle();
-        }
-    }
-    if (commitState_.IsReady()) {
-        // Navigation keys move cursor → stack entries become stale, clear everything.
-        if ((vkCode >= VK_LEFT && vkCode <= VK_DOWN) ||
-            vkCode == VK_HOME || vkCode == VK_END ||
-            vkCode == VK_PRIOR || vkCode == VK_NEXT ||
-            vkCode == VK_DELETE) {
-            HOOK_LOG(L"  commit-undo: cancel — navigation key vk=0x%02X", vkCode);
-            CancelCommitUndo();
-        } else if (IsCommitTrigger(vkCode) && engine_->Count() == 0) {
-            // Printable commit trigger with engine empty (e.g., second '=' in "a==",
-            // second ' ' in "a  "): stay Ready so subsequent BS sequence can reach Primed.
-            // `>=` (not `>`) keeps SPACE in the printable branch — MapVirtualKeyW(VK_SPACE)
-            // returns L' ', which would otherwise fall into the cancel branch.
-            wchar_t ch = VkToMacroChar(vkCode);
-            if (ch >= L' ') {
-                commitState_.IncrementPendingTriggers();
-                HOOK_LOG(L"  commit-undo: extra trigger '%c' in Ready, pendingTriggers=%u", ch, commitState_.PendingTriggerCount());
-            } else {
-                // Non-printable trigger (Esc, Tab, Enter) → cancel undo
-                CancelCommitUndo();
-            }
-        } else {
-            // Alpha, digit, or other key → start new word, preserve stack for multi-word backward.
-            // Carry the pending trigger count onto the in-progress word so it travels with the
-            // CommitEntry when the word commits — without this, "chịu :D " then BS×3 + 'a' would
-            // forget the ':' and cause engine/screen desync (replay fires before ':' is deleted).
-            commitState_.SetLeadingTriggersForCurrentWord(commitState_.PendingTriggerCount());
-            commitState_.ResetPendingTriggers();
-            commitState_.SetIdle();
-        }
-    }
-    return KeyOutcome::Fallthrough;
-}
+// H1a: commit-undo state machine (HandleCommitUndoFsm) extracted to
+// HookEngineCommitUndo.cpp — preserves byte-identical FSM logic.
 
 // H1c: English-mode short-circuit + Vietnamese pre-dispatch tracking
 // (extracted from ProcessKeyDown steps 3 / 3a-3d).
@@ -1846,7 +1607,7 @@ HookEngine::KeyOutcome HookEngine::HandlePreDispatch(DWORD vkCode, bool vnMode,
     if (!IsModifierKey(CanonicalModifierVk(vkCode))
         && hotkeysSnap->Matches(Intent::ToggleEnabled, vkCode, currentMods,
                                  /*isDoubleTap=*/false, /*keyUp=*/false)) {
-        if (engine_->Count() > 0) CommitComposition();
+        if (engine_->Count() > 0) CommitComposition(true);
         tempEngineOff_ = !tempEngineOff_;
         CancelCommitUndo();
         HOOK_LOG(L"  TOGGLE-DOWN (vk=0x%02X mods=0x%02X): tempEngineOff_=%d",
@@ -1911,6 +1672,9 @@ HookEngine::KeyOutcome HookEngine::DispatchKeyAction(DWORD vkCode, bool cachedSh
             tempEngineOff_ = false;
             digitLedWord_ = false;
             HOOK_LOG(L"  tempEngineOff: reset on backspace (engine empty)");
+        }
+        if (IsCaretNavigationKey(vkCode) && engine_) {
+            engine_->ClearContext();
         }
         HOOK_LOG(L"  skip: tempEngineOff_ active=%d", tempEngineOff_ ? 1 : 0);
         return KeyOutcome::Pass;  // Pass through as English
@@ -2047,16 +1811,10 @@ HookEngine::KeyOutcome HookEngine::DispatchKeyAction(DWORD vkCode, bool cachedSh
 
     // 7. Backspace → engine backspace if we have content
     if (vkCode == VK_BACK && engine_->Count() > 0) {
-        if (macroOn && !rawMacroBuffer_.empty()) rawMacroBuffer_.pop_back();
+        // HandleMacro already removed this key from rawMacroBuffer_.
         HOOK_LOG(L"  backspace (engine count=%zu)", engine_->Count());
         HandleBackspace();
         return KeyOutcome::Eat;  // Eat backspace
-    }
-
-    // 7b. Backspace with cross-commit macro buffer: update tracking, pass through
-    if (vkCode == VK_BACK && macroCrossCommit_ && !rawMacroBuffer_.empty()) {
-        rawMacroBuffer_.pop_back();
-        if (rawMacroBuffer_.empty()) macroCrossCommit_ = false;
     }
 
     // 7c. Escape: modal interrupt / cancel. Finalize composition verbatim
@@ -2068,6 +1826,8 @@ HookEngine::KeyOutcome HookEngine::DispatchKeyAction(DWORD vkCode, bool cachedSh
         if (engine_->Count() > 0) {
             HOOK_LOG(L"  VK_ESCAPE with active composition → ResetComposition (verbatim preserve)");
             ResetComposition();
+        } else if (engine_) {
+            engine_->ClearContext();
         }
         if (pending > 0) {
             InjectKey(vkCode);
@@ -2088,7 +1848,7 @@ HookEngine::KeyOutcome HookEngine::DispatchKeyAction(DWORD vkCode, bool cachedSh
         // ClearWordState() inside CommitComposition() resets the auto-cap flag, so it
         // has to ride along with the buffer — otherwise a space/punctuation macro typed
         // at sentence start expands lowercase in the hook while TSF (which gates the
-        // reset on macroCrossCommit_) title-cases it.
+        // reset on macroCrossCommit_) capitalizes it.
         const bool savedAutoCapped = wasFirstCharAutoCapped_;
         // Phase 3c: macro presence + spaceMacroKeys come from the RCU
         // snapshot. Local shared_ptr keeps both alive through the branch.
@@ -2100,12 +1860,17 @@ HookEngine::KeyOutcome HookEngine::DispatchKeyAction(DWORD vkCode, bool cachedSh
                 savedMacroBuffer = rawMacroBuffer_;
             } else if (ch == L' '
                        && IsSpaceMacroPrefix(rawMacroBuffer_ + L' ',
-                                             cfgSnap->spaceMacroKeys)) {
+                                             cfgSnap->macroPrefixIndex)) {
                 savedMacroBuffer = rawMacroBuffer_ + L' ';
             }
         }
 
-        bool restored = CommitComposition();
+        bool restored = CommitComposition(
+            Macro::IsVerbatimCommitTrigger(VkToMacroChar(vkCode)));
+
+        if (IsCaretNavigationKey(vkCode) && engine_) {
+            engine_->ClearContext();
+        }
 
         if (!savedMacroBuffer.empty()) {
             rawMacroBuffer_ = std::move(savedMacroBuffer);
@@ -2124,7 +1889,20 @@ HookEngine::KeyOutcome HookEngine::DispatchKeyAction(DWORD vkCode, bool cachedSh
         //           desync: "2 words stuck" → tones blocked until full delete).
         if (commitState_.PushedToStack()) {
             switch (DecideCommitUndoArm(static_cast<uint32_t>(vkCode))) {
-                case CommitUndoArm::Arm:   SetCommitUndoReady(); break;
+                case CommitUndoArm::Arm: {
+                    // ":smile:" — the host swaps the whole run, word included,
+                    // for one emoji, so there is nothing left to replay.
+                    const wchar_t open = commitState_.WordOpenGlyph();
+                    if (open != L'\0' && IsHostReplacedWord(open, VkToMacroChar(vkCode))) {
+                        HOOK_LOG(L"  commit-undo: not armed — host-replaced word opened by '%c'",
+                                 open);
+                        CancelCommitUndo();
+                        break;
+                    }
+                    SetCommitUndoReady();
+                    commitState_.SetGapEndsInGlyph(vkCode != VK_SPACE);
+                    break;
+                }
                 case CommitUndoArm::Clear: CancelCommitUndo();   break;
                 case CommitUndoArm::Skip:                        break;
             }
@@ -2182,6 +1960,10 @@ HookEngine::KeyOutcome HookEngine::DispatchKeyAction(DWORD vkCode, bool cachedSh
         }
     }
 
+    if (IsCaretNavigationKey(vkCode) && engine_) {
+        engine_->ClearContext();
+    }
+
     // 10. BS with engine empty but synthetic events pending: re-inject to preserve ordering.
     // Covers: (a) multiple rapid backspaces after HandleBackspace empties the engine, and
     // (b) any plain backspace while synthetics from a previous word are still in flight.
@@ -2225,7 +2007,7 @@ bool HookEngine::ProcessKeyUp(DWORD vkCode, DWORD /*flags*/) {
 
         auto fireToggleEnabled = [&](const wchar_t* reason) {
             if (engine_->Count() > 0) {
-                CommitComposition();
+                CommitComposition(true);
             }
             tempEngineOff_ = !tempEngineOff_;
             // Clear commit-undo state on both enable and disable: modifier-only
@@ -2419,9 +2201,9 @@ bool HookEngine::HandleAlphaKey(DWORD vkCode, bool shift, bool capsLock) {
         // rawMacroBuffer_ keeps the physical case HandleMacro (PreEngine stage) already
         // appended, so keys like "nMa" still match their exact-case entry. Record the
         // auto-cap separately instead: MacroCase::Plan needs to know the first character
-        // is capitalized on screen (to title-case the expansion) without that leaking
+        // is capitalized on screen (to capitalize the expansion) without that leaking
         // into the lookup key. Mirrors TSF's EngineController::HandleKey.
-        if (autoCapped) {
+        if (autoCapped && rawMacroBuffer_.size() == 1) {
             wasFirstCharAutoCapped_ = true;
         }
     }
@@ -2592,7 +2374,7 @@ void HookEngine::HandleBackspace() {
     }
 }
 
-bool HookEngine::CommitComposition() {
+bool HookEngine::CommitComposition(bool verbatim) {
     VKEY_ASSERT_HOOK_THREAD();
     HOOK_LOG(L"  CommitComposition (count=%zu, prev='%s')", engine_->Count(), previousComposition_.c_str());
 
@@ -2605,10 +2387,14 @@ bool HookEngine::CommitComposition() {
     // escRawHistory_ (see TelexEngineTest.EscRestoreRaw_PeekRawClearedByCommit).
     // Snapshot lives in CommitEntry.rawInput for post-BS ESC restore.
     std::wstring rawSnapshot = engine_->PeekRaw();
+    // Uncorrected commit == the engine's rendered text; Commit() clears it.
+    std::wstring rendered = verbatim ? engine_->Peek() : std::wstring{};
 
     std::wstring committed = engine_->Commit();
     if (engine_->LastCommitWasCorrected()) {
-        HOOK_LOG(L"  CommitComposition: lexicon-corrected, text='%s'", committed.c_str());
+        HOOK_LOG(L"  CommitComposition: lexicon-corrected, text='%s' verbatim=%d",
+                 committed.c_str(), verbatim ? 1 : 0);
+        if (verbatim) committed = std::move(rendered);
     }
 
     bool restored = false;
@@ -2656,12 +2442,16 @@ bool HookEngine::CommitComposition() {
 void HookEngine::ResetComposition() {
     VKEY_ASSERT_HOOK_THREAD();
     HOOK_LOG(L"  ResetComposition (count=%zu, prev='%s')", engine_->Count(), previousComposition_.c_str());
+    if (engine_) {
+        engine_->ClearContext();
+    }
     // Secure-erase keystroke history before releasing the buffer to prevent
     // heap forensics from recovering typed content (including passwords).
     SecureZeroMemory(commitState_.History().data(), commitState_.History().size() * sizeof(wchar_t));
     SecureZeroMemory(rawMacroBuffer_.data(), rawMacroBuffer_.size() * sizeof(wchar_t));
     ClearWordState();
     CancelCommitUndo();
+    ClearMacroUndo();
     // Mouse click, Ctrl/Alt shortcut (step 5), exception handler — all funnel here.
     // Each is a "sentence-context broke" event, so drop any pending sentence arm.
     autoCapState_ = AutoCapState::Idle;
@@ -2685,92 +2475,18 @@ void HookEngine::ClearWordState() {
 void HookEngine::ClearMacroBuffer() noexcept {
     rawMacroBuffer_.clear();
     wasFirstCharAutoCapped_ = false;
+    macroCrossCommit_ = false;
 }
 
-void HookEngine::CancelCommitUndo() {
-    commitState_.Cancel();
+void HookEngine::ClearMacroUndo() noexcept {
+    macroUndoState_.active = false;
+    macroUndoState_.shortcut.clear();
+    macroUndoState_.expansionLength = 0;
+    macroUndoState_.hasTrailingTrigger = false;
 }
 
-void HookEngine::SetCommitUndoReady() {
-    // Inherit any extra leading triggers carried by the current word (either set when
-    // the user typed extra trigger chars between commits and then started a new word,
-    // or restored from a popped CommitEntry during multi-word replay).
-    commitState_.SetPendingTriggers(commitState_.LeadingTriggersForCurrentWord());
-    commitState_.SetLeadingTriggersForCurrentWord(0);
-    commitState_.SetReady();  // sets state + bumps readyTime to GetTickCount()
-}
-
-// ═══════════════════════════════════════════════════════════
-// Backspace-into-committed-word: replay saved chars from stack
-// ═══════════════════════════════════════════════════════════
-
-bool HookEngine::ReplayCommittedChars(bool preferVisibleText) {
-    VKEY_ASSERT_HOOK_THREAD();
-    if (commitState_.StackEmpty()) {
-        HOOK_LOG(L"  ReplayCommittedChars: stack empty, nothing to replay");
-        commitState_.SetIdle();
-        return false;
-    }
-
-    // Pop the most recently committed word from the stack
-    CommitEntry entry = std::move(commitState_.StackTop());
-    commitState_.PopStackTop();
-
-    HOOK_LOG(L"  ReplayCommittedChars: replaying %zu keystrokes, restoring prev='%s' (stack=%zu remaining)",
-             entry.history.size(), entry.text.c_str(), commitState_.StackSize());
-
-    CommittedTextRestoreResult restored;
-    {
-        PERF_SCOPE(::NextKey::Perf::Stage::EnginePush);
-        restored = RestoreCommittedText(
-            *engine_, entry.text, [&entry](IInputEngine& replayEngine) {
-                for (const wchar_t ch : entry.history) {
-                    if (ch == kBackspaceMarker) {
-                        replayEngine.Backspace();
-                    } else {
-                        replayEngine.PushChar(ch);
-                    }
-                }
-            },
-            preferVisibleText ? CommittedTextRestorePreference::VisibleText
-                              : CommittedTextRestorePreference::ReplayHistory);
-    }
-    if (restored == CommittedTextRestoreResult::Failed) {
-        commitState_.ClearHistory();
-        commitState_.SetIdle();
-        HOOK_LOG(L"  ReplayCommittedChars: committed-text restore failed for '%s'",
-                 entry.text.c_str());
-        return false;
-    }
-    if (restored == CommittedTextRestoreResult::SeededVisibleText) {
-        HOOK_LOG(L"  ReplayCommittedChars: seeded committed visible text '%s'",
-                 entry.text.c_str());
-    }
-
-    // A corrected commit becomes literal visible history so reopening it again
-    // cannot resurrect the stale physical typo.
-    auto& currentHistory = commitState_.History();
-    if (restored == CommittedTextRestoreResult::SeededVisibleText) {
-        currentHistory.assign(entry.text.begin(), entry.text.end());
-    } else {
-        currentHistory.assign(entry.history.begin(), entry.history.end());
-    }
-
-    // Restore screen state so ReplaceComposition can diff correctly
-    previousComposition_ = std::move(entry.text);
-    previousEncodedWidths_ = std::move(entry.widths);
-
-    // Restore leading-trigger context for the now-current word: if the user BS'es the
-    // replayed word back to empty, SetCommitUndoReady() will pick this up and re-prime
-    // pendingTriggerCount_ so any extra trigger chars sitting between this word and the
-    // previous one get backspaced before the next prime.
-    commitState_.SetLeadingTriggersForCurrentWord(entry.extraLeadingTriggers);
-
-    // Reset undo state — HandleBackspace will re-enter state 1 if engine becomes
-    // empty again and stack still has entries (enabling multi-word backward).
-    commitState_.SetIdle();
-    return true;
-}
+// Commit-undo state mutators (CancelCommitUndo, SetCommitUndoReady,
+// ReplayCommittedChars) are implemented in HookEngineCommitUndo.cpp.
 
 // ═══════════════════════════════════════════════════════════
 // Output — Universal SendInput with KEYEVENTF_UNICODE
@@ -3398,6 +3114,28 @@ void HookEngine::OnFocusChangedSyncOnWorker(
 
     if (!classified.hwndOpaque) return;  // sentinel: nothing to apply
 
+    // Tier 2 spurious event filter (Issue #273):
+    // If request.triggerHwnd is a stale trigger from a background helper/tool window
+    // (such as FastStone Capture's recorder toolbar timer updating every 1s) and the
+    // live foreground window AND focused child target have not changed at all,
+    // drop the event on the worker without posting to the hook mailbox.
+    const std::uintptr_t currentTarget =
+        (classified.focusedChildHwndOpaque != 0)
+            ? classified.focusedChildHwndOpaque
+            : classified.hwndOpaque;
+    const std::uintptr_t triggerHwndOpaque =
+        reinterpret_cast<std::uintptr_t>(request.triggerHwnd);
+    if (IsSpuriousBackgroundFocusEvent(
+            triggerHwndOpaque, classified.hwndOpaque, currentTarget,
+            lastDispatchedHwnd_, lastDispatchedTargetHwnd_)) {
+        HOOK_LOG(L"  Worker: drop spurious focus event from %p (target %p unchanged)",
+                 request.triggerHwnd, reinterpret_cast<HWND>(currentTarget));
+        return;
+    }
+
+    lastDispatchedHwnd_ = classified.hwndOpaque;
+    lastDispatchedTargetHwnd_ = currentTarget;
+
     OutputDispatcher::PrepareFocusOutput(classified);
 
     // Process creation time is a cold Win32 query and therefore belongs on
@@ -3481,26 +3219,8 @@ void HookEngine::ExecuteReplace(std::wstring_view newText,
     ReplaceComposition(std::wstring{newText}, static_cast<DWORD>(reinjectVk));
 }
 
-/// Wave 3 — Pipeline::ICommitUndoExecutor adapter. Delegates to the FSM
-/// body (renamed `HandleCommitUndoFsm` to disambiguate from this override).
-/// vnMode is read fresh from vietnameseMode_ atomic — slightly different
-/// from the legacy inline call site that took vnMode as a stack-local
-/// param, but byte-equivalent because vietnameseMode_ writers are async
-/// to the hook thread (main thread on toggle / config reload).
-NextKey::Pipeline::CommitUndoOutcome HookEngine::HandleCommitUndo(
-    std::uint16_t vkCode,
-    bool shift, bool capsLock, bool ctrl, bool alt, bool win) {
-    const bool vnMode = vietnameseMode_.load(std::memory_order_acquire);
-    const KeyOutcome out =
-        HandleCommitUndoFsm(static_cast<DWORD>(vkCode), vnMode,
-                            shift, capsLock, ctrl, alt, win);
-    switch (out) {
-        case KeyOutcome::Eat:         return NextKey::Pipeline::CommitUndoOutcome::Eat;
-        case KeyOutcome::Pass:        return NextKey::Pipeline::CommitUndoOutcome::Pass;
-        case KeyOutcome::Fallthrough: return NextKey::Pipeline::CommitUndoOutcome::Fallthrough;
-    }
-    return NextKey::Pipeline::CommitUndoOutcome::Fallthrough;  // defensive
-}
+// Wave 3 — Pipeline::ICommitUndoExecutor adapter (HandleCommitUndo)
+// is implemented in HookEngineCommitUndo.cpp.
 
 /// Wave 4b — Pipeline::IMacroExecutor adapter. Owns macro tracking +
 /// dispatch. Body transcribed 1:1 from pre-W4b HandlePreDispatch:
@@ -3520,6 +3240,40 @@ NextKey::Pipeline::MacroOutcome HookEngine::HandleMacro(
     const bool hasMacros = cfgSnap && !cfgSnap->macroTable.empty();
     auto hotkeysSnap = hotkeys_.load(std::memory_order_acquire);
     const uint32_t currentMods = ComputeModMask(ctrl, shift, alt, win);
+
+    // Check for macro undo on Backspace (issue #264)
+    if (macroUndoState_.active) {
+        DWORD now = GetTickCount();
+        if (vk == VK_BACK && !ctrl && !alt && !win && (now - macroUndoState_.timestamp <= kMacroUndoTimeoutMs)) {
+            size_t pendingBs = macroUndoState_.expansionLength +
+                                (macroUndoState_.hasTrailingTrigger ? 1 : 0);
+            std::wstring shortcut = std::move(macroUndoState_.shortcut);
+            ClearMacroUndo();
+
+            while (pendingBs > 0) {
+                const auto count = (std::min)(pendingBs, size_t{60});
+                if (!dispatcher_.ReplaceRaw(count, std::wstring_view{})) {
+                    ResetComposition();
+                    return NextKey::Pipeline::MacroOutcome::Eat;
+                }
+                pendingBs -= count;
+            }
+            for (size_t offset = 0; offset < shortcut.size(); offset += 60) {
+                if (!dispatcher_.ReplaceRaw(0, std::wstring_view(shortcut).substr(offset, 60))) {
+                    ResetComposition();
+                    return NextKey::Pipeline::MacroOutcome::Eat;
+                }
+            }
+
+            rawMacroBuffer_ = shortcut;
+            macroCrossCommit_ = true;
+            tempMacroOff_ = true;
+            HOOK_LOG(L"  macro-undo: reverted expansion to shortcut '%ls'", shortcut.c_str());
+            return NextKey::Pipeline::MacroOutcome::Eat;
+        } else if (vk != VK_BACK) {
+            ClearMacroUndo();
+        }
+    }
 
     // EN mode: only engages when macroOn && macroEng. Always returns Pass
     // (caller passes the key to OS as English) — except macro-expand which
@@ -3563,6 +3317,7 @@ NextKey::Pipeline::MacroOutcome HookEngine::HandleMacro(
             }
         } else if (vk == VK_BACK && !rawMacroBuffer_.empty()) {
             rawMacroBuffer_.pop_back();
+            if (rawMacroBuffer_.empty()) ClearMacroBuffer();
         } else if (!(vk >= 0x41 && vk <= 0x5A) && !IsCommitTrigger(vk)) {
             ClearMacroBuffer();
             tempMacroOff_ = false;
@@ -3616,6 +3371,7 @@ NextKey::Pipeline::MacroOutcome HookEngine::HandleMacro(
     if (macroOn && hasMacros) {
         if (vk == VK_BACK && !rawMacroBuffer_.empty()) {
             rawMacroBuffer_.pop_back();
+            if (rawMacroBuffer_.empty()) ClearMacroBuffer();
         } else if (IsCommitTrigger(vk)) {
             // If the trigger was disabled, or if it was enabled but did not result in expansion,
             // we clear the buffer unless it's a Space character that matches a multi-word macro
@@ -3631,7 +3387,7 @@ NextKey::Pipeline::MacroOutcome HookEngine::HandleMacro(
                 // Rule 11.2). IsSpaceMacroPrefix is noexcept and read-only, so the
                 // append/pop pair restores the buffer with no per-keystroke alloc.
                 rawMacroBuffer_.push_back(L' ');
-                preserve = IsSpaceMacroPrefix(rawMacroBuffer_, cfgSnap->spaceMacroKeys);
+                preserve = IsSpaceMacroPrefix(rawMacroBuffer_, cfgSnap->macroPrefixIndex);
                 rawMacroBuffer_.pop_back();
             } else if (IsMacroTrigger(vk)) {
                 preserve = VkToMacroChar(vk) > L' ';
@@ -3936,6 +3692,7 @@ bool HookEngine::IsMacroTrigger(DWORD vkCode) const {
 
 HookEngine::MacroResult HookEngine::TryExpandMacro(wchar_t triggerChar) {
     Win32CaseMapper mapper;
+    const auto typingConfig = config_.load(std::memory_order_acquire);
     // Phase 3c: macro table comes from the RCU snapshot. The shared_ptr
     // local keeps the table alive for the duration of Macro::Plan even
     // if a worker thread republishes mid-call.
@@ -3947,7 +3704,8 @@ HookEngine::MacroResult HookEngine::TryExpandMacro(wchar_t triggerChar) {
         .macroTable            = snap->macroTable,
         .macroCrossCommit      = macroCrossCommit_,
         .currentCodeTable      = currentCodeTable_.load(std::memory_order_acquire),
-        .autoCapsEnabled       = autoCapsMacro_.load(std::memory_order_acquire),
+        .autoCapsEnabled       = typingConfig->autoCapsMacro,
+        .titleCaseEnabled      = typingConfig->macroTitleCase,
         .wasFirstCharAutoCapped = wasFirstCharAutoCapped_,
         .triggerChar           = triggerChar,
         .clipboardThreshold    = kMacroClipboardThreshold,
@@ -3957,12 +3715,15 @@ HookEngine::MacroResult HookEngine::TryExpandMacro(wchar_t triggerChar) {
 
     auto inj = dispatcher_.GetInjector();
 
+    std::size_t expansionLength = 0;
+    bool expansionDelivered = true;
     if (plan.useClipboard) {
         if (plan.bsCount > 0) {
             (void)dispatcher_.ReplaceRaw(plan.bsCount, std::wstring_view{});
         }
         auto clipText = Macro::ExpandEscapesForClipboard(plan.expansion);
         dispatcher_.ClipboardPasteText(clipText);
+        expansionLength = clipText.size();
         HOOK_LOG(L"  TryExpandMacro: clipboard paste %zu chars (raw %zu)",
                  clipText.size(), plan.expansion.size());
     } else {
@@ -3970,22 +3731,38 @@ HookEngine::MacroResult HookEngine::TryExpandMacro(wchar_t triggerChar) {
         for (const auto& s : Macro::BuildSegments(plan.expansion, currentCodeTable_.load(std::memory_order_acquire))) {
             if (s.isReturn) {
                 if (pendingBs > 0) {
-                    (void)dispatcher_.ReplaceRaw(pendingBs, std::wstring_view{});
+                    expansionDelivered = dispatcher_.ReplaceRaw(pendingBs, std::wstring_view{}) && expansionDelivered;
                     pendingBs = 0;
                 }
                 dispatcher_.InjectKey(VK_RETURN);
+                expansionLength += 1;
             } else if (!s.text.empty()) {
-                (void)dispatcher_.ReplaceRaw(pendingBs, std::wstring_view(s.text));
+                expansionDelivered = dispatcher_.ReplaceRaw(pendingBs, std::wstring_view(s.text)) && expansionDelivered;
                 pendingBs = 0;
+                expansionLength += s.text.size();
             }
         }
         if (pendingBs > 0) {
-            (void)dispatcher_.ReplaceRaw(pendingBs, std::wstring_view{});
+            expansionDelivered = dispatcher_.ReplaceRaw(pendingBs, std::wstring_view{}) && expansionDelivered;
         }
     }
 
     ClearWordState();
     CancelCommitUndo();
+
+    auto cfg = config_.load(std::memory_order_acquire);
+    if (cfg && cfg->macroUndoOnBackspace && expansionDelivered && !plan.shortcut.empty()
+        && triggerChar >= L' ' && !plan.useClipboard
+        && currentCodeTable_.load(std::memory_order_acquire) == CodeTable::Unicode
+        && Macro::CanUndoWithBackspaces(plan.expansion)) {
+        macroUndoState_.shortcut = std::move(plan.shortcut);
+        macroUndoState_.expansionLength = expansionLength;
+        macroUndoState_.hasTrailingTrigger = !plan.isPartOfMacro;
+        macroUndoState_.timestamp = GetTickCount();
+        macroUndoState_.active = true;
+    } else {
+        ClearMacroUndo();
+    }
     return plan.isPartOfMacro ? MacroResult::ExpandedEatTrigger
                               : MacroResult::ExpandedPassTrigger;
 }
@@ -4099,547 +3876,11 @@ void HookEngine::DrainHookCommands() {
     }
 }
 
-void HookEngine::RouteFocusOnHookThread(
-        std::shared_ptr<const FocusClassification> cls) {
-    VKEY_ASSERT_HOOK_THREAD();
-    if (!cls || !cls->hwndOpaque) return;
-
-    const bool hasComposition =
-        (engine_ && engine_->Count() > 0) || !rawMacroBuffer_.empty();
-    const FocusApplyInputs inputs{
-        .snapshotRequestSerial = cls->requestSerial,
-        .latestRequestSerial =
-            latestFocusRequestSerial_.load(std::memory_order_relaxed),
-        .snapshotInputEpoch = cls->inputEpochAtRequest,
-        .currentInputEpoch =
-            physicalInputEpoch_.load(std::memory_order_relaxed),
-        .hasComposition = hasComposition,
-    };
-
-    const FocusApplyDisposition disposition = DecideFocusApply(inputs);
-
-    const auto cfg = config_.load(std::memory_order_acquire);
-    if (dispatcher_.ApplyFocusOutput(*cls, disposition, cfg->suggestKeepChars)) {
-        HOOK_LOG(L"  FocusOutput: request=%llu bait=%d game=%d deferred=%d",
-                 static_cast<unsigned long long>(cls->requestSerial),
-                 cls->localNeedBait ? 1 : 0, cls->localGameReinject ? 1 : 0,
-                 disposition == FocusApplyDisposition::DeferUntilBoundary ? 1 : 0);
-    }
-
-    // Hook-chain protection is independent of the typing-context transaction.
-    // Dorion can bypass this callback entirely once it is foreground, so
-    // waiting for a deferred composition boundary could make the boundary
-    // unreachable. Only a current, exact executable/PID observation may post,
-    // and the policy suppresses ordinary Alt+Tab re-entry for the same process.
-    const DorionProcessIdentity dorionIdentity{
-        cls->pid,
-        cls->processCreationTime,
-    };
-    if (disposition != FocusApplyDisposition::DropStale
-        && dorionHookReclaimPolicy_.Observe(
-            cls->exeName, dorionIdentity, true)) {
-        if (lifecycle_.RequestDorionKeyboardReclaim(dorionIdentity)) {
-            HOOK_LOG(L"  DorionHookReclaim: queued pid=%u creation=%llu request=%llu",
-                     dorionIdentity.pid,
-                     static_cast<unsigned long long>(
-                         dorionIdentity.creationTime),
-                     static_cast<unsigned long long>(cls->requestSerial));
-        } else {
-            // Posting did not transfer ownership to the pump. Re-arm so a
-            // later current snapshot or a clean restart can retry safely.
-            dorionHookReclaimPolicy_.Complete(dorionIdentity, false);
-            HOOK_LOG(L"  DorionHookReclaim: post FAILED pid=%u creation=%llu request=%llu",
-                     dorionIdentity.pid,
-                     static_cast<unsigned long long>(
-                         dorionIdentity.creationTime),
-                     static_cast<unsigned long long>(cls->requestSerial));
-        }
-    }
-
-    switch (disposition) {
-        case FocusApplyDisposition::DropStale:
-            HOOK_LOG(L"  FocusApply: drop stale request=%llu latest=%llu",
-                     static_cast<unsigned long long>(inputs.snapshotRequestSerial),
-                     static_cast<unsigned long long>(inputs.latestRequestSerial));
-            return;
-
-        case FocusApplyDisposition::DeferUntilBoundary:
-            // Keep the word, method, encoding and mode transaction together.
-            // Output already follows the host receiving the next replacement.
-            deferredFocusApply_ = std::move(cls);
-            HOOK_LOG(L"  FocusApply: defer request=%llu input=%llu->%llu count=%zu macro=%zu",
-                     static_cast<unsigned long long>(inputs.snapshotRequestSerial),
-                     static_cast<unsigned long long>(inputs.snapshotInputEpoch),
-                     static_cast<unsigned long long>(inputs.currentInputEpoch),
-                     engine_ ? engine_->Count() : 0,
-                     rawMacroBuffer_.size());
-            return;
-
-        case FocusApplyDisposition::ApplyNow:
-            // A current snapshot supersedes any retained older transaction.
-            deferredFocusApply_.reset();
-            ApplyFocusOnHookThread(std::move(cls));
-            return;
-    }
-}
-
-void HookEngine::TryApplyDeferredFocusOnHookThread() {
-    VKEY_ASSERT_HOOK_THREAD();
-    if (!deferredFocusApply_) return;
-
-    // Read the fields out before any branch can move the member — the ApplyNow
-    // case moves out of deferredFocusApply_, so a reference bound to it would
-    // go null mid-function.
-    const bool hasComposition =
-        (engine_ && engine_->Count() > 0) || !rawMacroBuffer_.empty();
-    const FocusApplyInputs inputs{
-        .snapshotRequestSerial = deferredFocusApply_->requestSerial,
-        .latestRequestSerial =
-            latestFocusRequestSerial_.load(std::memory_order_relaxed),
-        .snapshotInputEpoch = deferredFocusApply_->inputEpochAtRequest,
-        .currentInputEpoch =
-            physicalInputEpoch_.load(std::memory_order_relaxed),
-        .hasComposition = hasComposition,
-    };
-
-    switch (DecideFocusApply(inputs)) {
-        case FocusApplyDisposition::DropStale:
-            // Dropping is safe only because the superseding request is
-            // guaranteed to produce its own apply OR to leave the tick poll
-            // able to retry: a classification that early-returns for a helper
-            // window deliberately does NOT update lastForegroundPid_ (see the
-            // comment in ApplyFocusOnHookThread), so OnTickPoll's stale-PID
-            // fallback re-fires within one tick. Do not "simplify" that PID
-            // handling without revisiting this branch — otherwise a transient
-            // focus event can strand the real app's typing context.
-            HOOK_LOG(L"  FocusApply: drop deferred request=%llu latest=%llu",
-                     static_cast<unsigned long long>(inputs.snapshotRequestSerial),
-                     static_cast<unsigned long long>(inputs.latestRequestSerial));
-            deferredFocusApply_.reset();
-            return;
-        case FocusApplyDisposition::DeferUntilBoundary:
-            return;
-        case FocusApplyDisposition::ApplyNow: {
-            auto ready = std::move(deferredFocusApply_);
-            const auto cfg = config_.load(std::memory_order_acquire);
-            (void)dispatcher_.ApplyFocusOutput(
-                *ready, FocusApplyDisposition::ApplyNow, cfg->suggestKeepChars);
-            HOOK_LOG(L"  FocusApply: apply deferred request=%llu at boundary",
-                     static_cast<unsigned long long>(inputs.snapshotRequestSerial));
-            ApplyFocusOnHookThread(std::move(ready));
-            return;
-        }
-    }
-}
-
-void HookEngine::ReconcileModifierStateOnHookThread() noexcept {
-    VKEY_ASSERT_HOOK_THREAD();
-
-    // Snapshot once: repeated GetAsyncKeyState calls across this transaction
-    // can otherwise disagree when Alt/Win is released mid-reconciliation.
-    const bool physicalCtrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-    const bool physicalShift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-    const bool physicalAlt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-    const bool physicalWin = (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0
-        || (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
-    const bool anyPhysicalModifier =
-        physicalCtrl || physicalShift || physicalAlt || physicalWin;
-
-    modCtrlDown_ = physicalCtrl;
-    modShiftDown_ = physicalShift;
-    modAltDown_ = physicalAlt;
-    modWinDown_ = physicalWin;
-
-    // A foreground transition is a gesture boundary. If Alt/Win/Ctrl/Shift is
-    // still held (most notably between Alt+Tab's Tab-down and Alt-up), preserve
-    // contamination so the eventual release cannot fire a modifier-alone VKey
-    // action in the new app. Once every modifier is up, stale latches are safe
-    // to clear.
-    modComboSeen_ = anyPhysicalModifier;
-    otherKeyPressed_ = anyPhysicalModifier;
-    for (int i = 0; i < kModCount; ++i) {
-        modTapCount_[i] = 0;
-        modTapLastTs_[i] = 0;
-    }
-
-    if (hotkeyManager_) {
-        hotkeyManager_->ReconcileModifiers({
-            .ctrl = physicalCtrl,
-            .shift = physicalShift,
-            .alt = physicalAlt,
-            .win = physicalWin,
-        });
-    }
-}
-
-// Phase 2b — focus apply runs on the hook thread (called from
-// DrainHookCommands). All composition-state writes that used to live in
-// OnFocusChanged moved here. The cls parameter is the pre-computed
-// classification snapshot produced by FocusOwner::Classify.
-//
-// Must stay fast (Rule 11.2) — no syscalls beyond the cheap ones already
-// listed in the design's "may only mutate composition state + atomic
-// stores" contract. Heavy work (ClassifyWindow, GetExeNameForHwnd,
-// IsWebView2App, CreateToolhelp32Snapshot) is in FocusOwner::Classify,
-// not here.
-void HookEngine::ApplyFocusOnHookThread(std::shared_ptr<const FocusClassification> cls) {
-    VKEY_ASSERT_HOOK_THREAD();
-    if (!cls || !cls->hwndOpaque) return;
-
-    const auto cfg = config_.load(std::memory_order_acquire);
-
-    HWND activeHwnd = reinterpret_cast<HWND>(cls->hwndOpaque);
-
-    // PID update moved (2026-05-29): OnTickPoll now updates lastForegroundPid_
-    // defensively BEFORE calling OnFocusChangedSyncOnWorker (v2.1.24 pattern),
-    // which breaks the WebView2 poll-loop that commit 87a560f tried to fix by
-    // moving the update here. Updating PID at function entry blocked Bug 1's
-    // natural fallback (notepad++ launch with only helper events relies on the
-    // poll detecting a stale PID to re-classify against GetForegroundWindow
-    // once the main window settles). PID is now updated below at the end of
-    // the real-focus path — see comment near isExcludedApp_ store.
-
-    // Re-validate the focused CHILD control right before trusting anything
-    // the worker computed against it. WH_MOUSE_LL fires before Windows
-    // delivers the click to the target app, so Classify() can run before
-    // (or after) that app finishes moving focus to the control the user
-    // actually clicked — the child probed may not be the one now focused.
-    //
-    // Two skips, because GetFocusedChildHwnd IS AttachThreadInput: it briefly
-    // serialises THIS thread's input queue with the foreground thread's, and
-    // this is the thread that owns WH_MOUSE_LL. "Cheap (~µs)" measured alone
-    // is not the cost that matters — who we serialise against is.
-    //   * auto-cap off — both consumers below are auto-cap-only, so the probe
-    //     buys nothing at any price.
-    //   * tray/taskbar foreground — that attaches us to explorer.exe's taskbar
-    //     thread, the very thread that must itself detect the tray icon's
-    //     double-click. Lose that race and WM_LBUTTONDBLCLK degrades into two
-    //     WM_LBUTTONUPs, so a double-click only toggles V/E and never opens
-    //     Settings (#209: "left-click 3 lần... phải click thêm 3 lần nữa";
-    //     right-click via the menu was unaffected, which is what pinned the
-    //     fault to double-click DETECTION rather than to opening the dialog).
-    //     Nothing is ever typed into the taskbar, so there is no Vietnamese
-    //     state to validate there.
-    // Both skips leave suppressAutoCapForPasswordSafety_ permissive rather
-    // than latched: it is re-derived on the next real foreground change, and
-    // HandleAlphaKey re-probes the focused control synchronously before it
-    // capitalizes, re-suppressing if that control IS a password field.
-    const bool needsChildProbe =
-        cfg->autoCaps && !FocusOwner::IsTrayOrTaskbarWindow(activeHwnd);
-    const HWND currentFocusedChild =
-        needsChildProbe ? ::NextKey::GetFocusedChildHwnd(activeHwnd) : nullptr;
-    const std::uintptr_t currentFocusedChildOpaque =
-        reinterpret_cast<std::uintptr_t>(currentFocusedChild);
-
-    // Reset composition + per-word state. These were the Rule 11.3-violating
-    // writes from main pre-Phase-2b.
-    ResetComposition();
-    tempEngineOff_ = false;
-
-    // Skipped probe ⇒ permissive (see needsChildProbe above); never latch a
-    // suppression we derived from an HWND we deliberately did not read.
-    suppressAutoCapForPasswordSafety_ = needsChildProbe
-        && ShouldSuppressAutoCapForPasswordSafety(
-               cls->isPasswordFieldFocused, cls->focusedChildHwndOpaque,
-               currentFocusedChildOpaque);
-
-    // Validate worker-produced empty-document evidence at consumption time.
-    // The HWND/PID/child check extends the existing latest-focus mailbox
-    // pattern; the activity clock catches a key that overtook the worker probe
-    // because LowLevelKeyboardProc calls MarkActivity before DrainHookCommands.
-    bool shouldArmAutoCap = false;
-    if (cfg->autoCaps && cls->isKnownEmptyDocument) {
-        const HWND foregroundHwnd = GetForegroundWindow();
-        DWORD foregroundPid = 0;
-        if (foregroundHwnd != nullptr) {
-            GetWindowThreadProcessId(foregroundHwnd, &foregroundPid);
-        }
-        const std::uint64_t nowMs = GetTickCount64();
-        const bool foregroundStayedStable =
-            GetForegroundWindow() == foregroundHwnd;
-        const AutoCapFocusEvidence evidence{
-            .isKnownEmptyDocument = true,
-            .hwndOpaque = cls->hwndOpaque,
-            .focusedChildHwndOpaque = cls->focusedChildHwndOpaque,
-            .pid = cls->pid,
-            .probeStartedAtMs = cls->emptyDocumentProbeStartedAtMs,
-        };
-        const AutoCapFocusContext current{
-            .hwndOpaque = foregroundStayedStable
-                ? reinterpret_cast<std::uintptr_t>(foregroundHwnd)
-                : 0,
-            .focusedChildHwndOpaque = foregroundStayedStable
-                ? currentFocusedChildOpaque
-                : 0,
-            .pid = static_cast<std::uint32_t>(foregroundPid),
-            .lastInputAtMs = lastActivityTickMs_.load(std::memory_order_relaxed),
-            .nowMs = nowMs,
-        };
-        shouldArmAutoCap = ShouldArmAutoCapFromFocusEvidence(
-            evidence, current, kAutoCapFocusEvidenceMaxAgeMs);
-    }
-    autoCapState_ = shouldArmAutoCap
-        ? AutoCapState::ReadyToCapitalize
-        : AutoCapState::Idle;
-    // Reconcile our modifier/hotkey trackers after desktop switch / Win+L,
-    // without turning a still-held Alt+Tab chord into an Alt-alone release.
-    ReconcileModifierStateOnHookThread();
-
-    HOOK_LOG(L"  AppDetect: console=%d skipEmpty=%d electron=%d webview2=%d bait=%d clipboard=%d editMsg=%d useClipInj=%d splitSleepMs=%d emptyDoc=%d fresh=%d",
-             cls->isConsole ? 1 : 0, cls->localSkipEmpty ? 1 : 0, cls->localElectronApp ? 1 : 0,
-             cls->isWebView2 ? 1 : 0, cls->localNeedBait ? 1 : 0, cls->localClipboard ? 1 : 0,
-             cls->localEditMsg ? 1 : 0, cls->localUseClipboardInjector ? 1 : 0,
-             cls->localForcedSplitSleepMs, cls->isKnownEmptyDocument ? 1 : 0,
-             shouldArmAutoCap ? 1 : 0);
-
-    // RefreshFocusCache uses GetFocusedChildHwnd (AttachThreadInput) which
-    // is cheap (~µs). Safe on hook thread.
-    if (cls->localClipboard || cls->localEditMsg) {
-        focus_.RefreshFocusCache(activeHwnd);
-    } else {
-        focus_.InvalidateFocusCache();
-    }
-
-    // CJK layout check — GetKeyboardLayout is kernel-cached, single µs.
-    CheckLayoutChange();
-
-    // Split state SmartSwitch (2026-05-26): activeExe_ tracks any focused
-    // exe (including helper windows like dock panels / SearchHost / tray);
-    // lastRealExe_ tracks only non-skipAppTracking transitions. This split
-    // resolves the tension between toggle (wants "user's current app", so
-    // notepad++ all-helper case attributes correctly) and SAVE (wants
-    // "last real app", so helper-event detours don't poison the previous
-    // real app's entry).
-    //
-    // Gates for activeExe_ update:
-    //   - non-empty exeName (classifier failed to resolve → skip)
-    //   - cls->pid != 0 (GetWindowThreadProcessId failed → skip)
-    //   - cls->pid != GetCurrentProcessId() (our own tray/menu → skip)
-    if (!cls->exeName.empty() && cls->pid != 0 &&
-        cls->pid != GetCurrentProcessId()) {
-        focus_.SetActiveExe(cls->exeName);
-    }
-
-    // Helper HWNDs: SAVE/RESTORE skipped (mode shouldn't flip on transient
-    // dock-panel, tray icon, splash, init helper, or shell focus events).
-    // activeExe_ above is already updated so the next toggle / non-skip
-    // focus event sees the right app.
-    //
-    // Bug 1 (notepad++ launches with helper-only events, mode never
-    // restores) is fixed via the OnTickPoll PID poll: helper events
-    // here return WITHOUT updating lastForegroundPid_, the poll detects
-    // a stale PID on its next tick (~200 ms later), updates the PID
-    // defensively, and re-fires OnFocusChanged against the foreground
-    // window — by which point the main window has typically settled
-    // and runs the real-focus SmartSwitch path below. This is the
-    // pre-2026-05-21 (v2.1.24) pattern; see commit 87a560f notes +
-    // docs/plans/2026-05-28-smart-switch-persistence-design.md §4.
-    //
-    // Engine ownership (which of hook / TIP consumes keys for this app) is the
-    // one thing that must NOT wait for that: it is derived from the exe alone,
-    // and leaving it stale hands the app to the wrong engine. #242 — focus went
-    // from One Commander (a tsf_apps entry) to Explorer's file list, that event
-    // returned here, so TSF_ACTIVE stayed ON and the TIP kept composing in a
-    // shell list view, which is where Windows opens its "Finalize the string"
-    // box. An unidentified window resolves to isTsf=false on purpose: the hook
-    // works everywhere, the TIP only where it was whitelisted.
-    const bool wasExcludedApp = isExcludedApp_.load(std::memory_order_acquire);
-    const bool wasTsfAppFlag  = isTsfApp_.load(std::memory_order_acquire);
-    const bool wasForcedVnApp = isForcedVnApp_.load(std::memory_order_acquire);
-    const bool wasBrowserContextActive = browserContextActive_;
-    const bool modeBeforeBrowserRefresh =
-        vietnameseMode_.load(std::memory_order_acquire);
-    const bool wasEffectiveTsf = ResolveEffectiveTsf(
-        wasTsfAppFlag, wasExcludedApp, cfg->tsfApps,
-        browserRoute_.load(std::memory_order_acquire));
-
-    isExcludedApp_.store(cls->isExcluded, std::memory_order_release);
-    isTsfApp_.store(cls->isTsf, std::memory_order_release);
-    // Store forced-V cache flag at the SAME site as the others, BEFORE the
-    // browser restore and excluded/tsf early-returns below. This also ensures
-    // an app hard-V lock wins immediately over a remembered domain mode.
-    isForcedVnApp_.store(cls->isForcedVietnamese, std::memory_order_release);
-    if (cls->isForcedVietnamese) forcedVnPid_.store(cls->pid, std::memory_order_release);
-    RefreshBrowserRouteOnHookThread(true, false);
-    const bool effectiveTsf = IsEffectiveTsf();
-    const bool shouldActivateTsfProfile = ShouldActivateTsfProfileForFocus(
-        tsfFocusActivationState_, effectiveTsf, cls->hwndOpaque, cls->pid);
-
-    // activate_tip is in this line for #250: the reporter still saw the Start
-    // menu stall after removing StartMenuExperienceHost.exe from tsf_apps, which
-    // should make this 0 for that focus. Without it the log cannot say whether
-    // the profile re-assertion ran at all for the focus that stalled.
-    HOOK_LOG(L"  Engine: %s for '%s' (tsf_feature=%d, in_tsf_list=%d, excluded=%d, "
-             L"activate_tip=%d)",
-             cls->isTsf ? L"TSF (hook passthrough)" : L"HOOK",
-             cls->exeName.empty() ? L"<unknown>" : cls->exeName.c_str(),
-             cfg->tsfApps ? 1 : 0,
-             cls->isTsf ? 1 : 0,
-             cls->isExcluded ? 1 : 0,
-             shouldActivateTsfProfile ? 1 : 0);
-
-    // SharedState TSF flag bridge — idempotent via SetOrClearFlag in main.
-    if (tsfModeCallback_) {
-        const bool tsfReadonly = !effectiveTsf && !cls->isExcluded;
-        if (effectiveTsf != wasEffectiveTsf) {
-            HOOK_LOG(L"  TSF_ACTIVE flag: %s → %s",
-                     wasEffectiveTsf ? L"true" : L"false",
-                     effectiveTsf ? L"true" : L"false");
-        }
-        tsfModeCallback_(effectiveTsf, tsfReadonly,
-                         shouldActivateTsfProfile);
-    }
-
-    if (cls->skipAppTracking) {
-        // Say it, or the log just goes quiet: #242 was read as "no focus event
-        // for explorer.exe" when the event had in fact arrived and stopped here.
-        HOOK_LOG(L"  SmartSwitch/overrides skipped (helper or hidden window)");
-        return;
-    }
-
-    // Short-circuit when no per-app feature needs tracking. Phase 3c
-    // reads the override-map presence from the RCU snapshot — same data
-    // the cls fields were resolved against in Classify.
-    {
-        auto snap = configSnapshot_.load(std::memory_order_acquire);
-        const bool noOverrides = !snap
-            || (snap->appEncodingOverrides.empty()
-                && snap->appInputMethodOverrides.empty());
-        if (!cfg->smartSwitch && !cfg->excludeApps && !cfg->tsfApps && noOverrides) return;
-    }
-
-    if (cls->exeName.empty()) {
-        HOOK_LOG(L"  Focus exe unresolved (hwnd=%p) — per-app tracking skipped",
-                 reinterpret_cast<void*>(cls->hwndOpaque));
-        return;
-    }
-
-    // Smart switch SAVE for the previous real app — captured BEFORE we
-    // advance lastRealExe_ below. Uses lastRealExe_, NOT activeExe_:
-    // a helper-event detour right before this non-skip event would have
-    // moved activeExe_ to the helper's exe, while lastRealExe_ correctly
-    // still points to the app whose mode the engine state corresponds to.
-    const std::wstring oldLastReal = focus_.LastRealExe();
-    // !wasForcedV: a forced-V app's mode is locked to V, never the user's
-    // choice — don't persist it into appModeMap or it poisons the remembered
-    // preference (the SAVE writes the forced 'true', not a real toggle).
-    if (cfg->smartSwitch && !oldLastReal.empty() && !wasExcludedApp
-        && !wasForcedVnApp && !wasBrowserContextActive) {
-        if (focus_.AppModeMap().size() >= kMaxSmartSwitchEntries) {
-            focus_.AppModeMap().clear();
-            HOOK_LOG(L"  SmartSwitch: map cap %zu hit, cleared", kMaxSmartSwitchEntries);
-        }
-        // Browser restore above may already have applied the new tab's mode;
-        // persist the mode that actually belonged to the app being left.
-        const bool savedMode = modeBeforeBrowserRefresh;
-        focus_.AppModeMap()[oldLastReal] = savedMode;
-        focus_.Smart().SetAppMode(oldLastReal, savedMode);
-        focus_.PublishAppModesSnapshot();           // RCU publish (alloc + atomic_store)
-        focus_.MarkAppModeDirty();
-        focus_.SetLastDirtyTs(GetTickCount64());    // worker debounce input
-    }
-
-    // Advance lastRealExe_ to the new real app (auto-shifts previousExe_
-    // for the encoding-override fallback chain).
-    focus_.SetLastRealExe(cls->exeName);
-
-    // Real-focus PID update — moved here from function entry (v2.1.24
-    // pattern restored, see comment near top). Helper-only events that
-    // hit the skipAppTracking early-return above LEAVE PID stale on
-    // purpose so the OnTickPoll defensive update can re-fire OnFocusChanged
-    // once the app's main window settles to foreground (Bug 1 fallback).
-    if (cls->pid) focus_.SetLastForegroundPid(cls->pid);
-
-    if (cls->isExcluded) {
-        excludedPid_.store(cls->pid, std::memory_order_release);
-        HOOK_LOG(L"  ExcludeApps: '%s' is excluded, passthrough (pid=%u)",
-                 focus_.LastRealExe().c_str(), cls->pid);
-        if (!wasExcludedApp) NotifyModeChange();
-        return;
-    }
+// Phase 2b — Hook-thread focus routing & reconciliation (RouteFocusOnHookThread,
+// TryApplyDeferredFocusOnHookThread, ReconcileModifierStateOnHookThread,
+// ApplyFocusOnHookThread) extracted to HookEngineFocus.cpp.
 
 
-    // Per-app hard-V lock WINS over smart-switch: force V on focus regardless of
-    // any remembered preference. (D2: on LEAVING a forced-V app the normal
-    // smart-switch restore for the *next* app applies — handled on that focus.)
-    if (cls->isForcedVietnamese) {
-        if (!vietnameseMode_.load(std::memory_order_acquire)) {
-            vietnameseMode_.store(true, std::memory_order_release);
-            HOOK_LOG(L"  ForceVN: locked Vietnamese for '%s'", focus_.LastRealExe().c_str());
-            NotifyModeChange();
-        }
-    } else if (cfg->smartSwitch && !browserContextActive_) {
-        // Smart switch restore for the new app — uses lastRealExe_ (just set
-        // above to cls->exeName).
-        auto it = focus_.AppModeMap().find(focus_.LastRealExe());
-        if (it != focus_.AppModeMap().end()) {
-            const bool curMode = vietnameseMode_.load(std::memory_order_acquire);
-            if (it->second != curMode) {
-                vietnameseMode_.store(it->second, std::memory_order_release);
-                HOOK_LOG(L"  SmartSwitch: restored %s for '%s'",
-                         it->second ? L"Vietnamese" : L"English",
-                         focus_.LastRealExe().c_str());
-                NotifyModeChange();
-            }
-        } else {
-            HOOK_LOG(L"  SmartSwitch: inherit %s for unknown '%s'",
-                     vietnameseMode_.load(std::memory_order_acquire)
-                         ? L"Vietnamese" : L"English",
-                     focus_.LastRealExe().c_str());
-        }
-    }
-
-    // Leaving an excluded OR forced-V app — effective mode changed even if
-    // vietnameseMode_ didn't move, and CJK auto-switch was gated off while
-    // locked. Replay the layout check so a suppressed CJK transition can
-    // re-evaluate now that the lock has cleared.
-    if (wasExcludedApp || wasForcedVnApp) {
-        const bool wasSuppressed = focus_.LayoutSuppressed();
-        OnLayoutChanged(focus_.CachedIsCompatLayout());
-        if (wasSuppressed == focus_.LayoutSuppressed()) NotifyModeChange();
-    }
-
-    if (effectiveTsf) {
-        HOOK_LOG(L"  TsfApps: '%s' uses TSF engine, hook passthrough",
-                 focus_.LastRealExe().c_str());
-        // #195/#209: no callback re-fire here. The early tsfModeCallback_ above
-        // already published (tsfActive=true, tsfReadonly=false) and posted the
-        // TIP re-assert. The re-fire existed because the old main.cpp callback
-        // read V/E mode (resolved only by the force-V / smart-switch blocks
-        // above); since #209 the callback is mode-independent, so firing again
-        // would be an identical duplicate. Still focus-driven only (never the
-        // OnTickPoll TSF_TIP_ACTIVE/Win+Space monitor).
-        return;
-    }
-
-    // Per-app encoding override (target value pre-resolved in Classify
-    // against the on-main global to avoid a cross-thread read of
-    // globalCodeTable_ here).
-    {
-        const CodeTable targetTable = static_cast<CodeTable>(cls->targetCodeTable);
-        if (targetTable != currentCodeTable_.load(std::memory_order_acquire)) {
-            currentCodeTable_.store(targetTable, std::memory_order_release);
-            HOOK_LOG(L"  AppOverride: encoding=%d for '%s'",
-                     static_cast<int>(targetTable),
-                     focus_.LastRealExe().c_str());
-        }
-    }
-
-    // Per-app input method override (same pattern as encoding). Recreate
-    // engine_ on change — the only heap allocation on this path.
-    {
-        const InputMethod targetMethod = static_cast<InputMethod>(cls->targetMethod);
-        if (targetMethod != currentMethod_.load(std::memory_order_acquire)) {
-            currentMethod_.store(targetMethod, std::memory_order_release);
-            TypingConfig engineConfig = *config_.load(std::memory_order_acquire);
-            engineConfig.inputMethod = targetMethod;
-            engine_ = EngineFactory::Create(engineConfig);
-            HOOK_LOG(L"  AppOverride: inputMethod=%d for '%s'",
-                     static_cast<int>(targetMethod),
-                     focus_.LastRealExe().c_str());
-        }
-    }
-}
 
 // Phase 2c — ToggleVietnameseMode body, migrated to the hook thread.
 //
@@ -4723,7 +3964,7 @@ void HookEngine::ApplyToggleVNOnHookThread() {
 
     // Commit pending composition (skip if CJK-suppressed — engine inactive).
     if (!focus_.LayoutSuppressed() && engine_->Count() > 0) {
-        CommitComposition();
+        CommitComposition(true);
     }
     CancelCommitUndo();
     digitLedWord_ = false;
@@ -4925,7 +4166,7 @@ void HookEngine::RefreshBrowserRouteOnHookThread(bool forceRead, bool notifyCall
         && vietnameseMode_.load(std::memory_order_acquire) != (modeTarget != 0);
     if (!routeChanged && !modeChanged) return;
 
-    if (engine_ && engine_->Count() > 0) CommitComposition();
+    if (engine_ && engine_->Count() > 0) CommitComposition(true);
     if (modeChanged) {
         vietnameseMode_.store(modeTarget != 0, std::memory_order_release);
     }

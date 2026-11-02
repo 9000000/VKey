@@ -9,6 +9,8 @@
 #include <filesystem>
 #include <fstream>
 #include <vector>
+#include <memory>
+#include <set>
 
 namespace NextKey {
 
@@ -39,7 +41,7 @@ DWORD GetCurrentPID() {
 /// Wait for all other instances of this app to exit (up to timeoutMs)
 bool WaitForOtherProcesses(DWORD timeoutMs) {
     DWORD myPid = GetCurrentPID();
-    
+
     wchar_t myPath[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, myPath, MAX_PATH);
     std::wstring myName = myPath;
@@ -60,8 +62,17 @@ bool WaitForOtherProcesses(DWORD timeoutMs) {
             do {
                 if (pe.th32ProcessID != myPid &&
                     (_wcsicmp(pe.szExeFile, myName.c_str()) == 0)) {
-                    othersRunning = true;
-                    break;
+                    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+                    wchar_t otherPath[MAX_PATH] = {};
+                    DWORD pathLength = MAX_PATH;
+                    const bool resolved = process && QueryFullProcessImageNameW(process, 0, otherPath, &pathLength);
+                    if (process) CloseHandle(process);
+                    // A separate installation must not block this handover.
+                    // If a same-name process cannot be resolved, fail closed.
+                    if (!resolved || _wcsicmp(otherPath, myPath) == 0) {
+                        othersRunning = true;
+                        break;
+                    }
                 }
             } while (Process32NextW(snap, &pe));
         }
@@ -82,8 +93,8 @@ bool ExtractZip(const std::wstring& zipPath, const std::wstring& destDir) {
     if (safeZipPath.empty() || safeDestDir.empty()) return false;
 
     // Build PowerShell command
-    std::wstring cmd = L"powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"";
-    cmd += L"Expand-Archive -Path '";
+    std::wstring cmd = L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"";
+    cmd += L"$ErrorActionPreference='Stop'; Expand-Archive -LiteralPath '";
     cmd += safeZipPath;
     cmd += L"' -DestinationPath '";
     cmd += safeDestDir;
@@ -98,7 +109,13 @@ bool ExtractZip(const std::wstring& zipPath, const std::wstring& destDir) {
         return false;
     }
 
-    WaitForSingleObject(pi.hProcess, 60000);  // 60s timeout
+    if (WaitForSingleObject(pi.hProcess, 60000) != WAIT_OBJECT_0) {
+        (void)TerminateProcess(pi.hProcess, 1);
+        (void)WaitForSingleObject(pi.hProcess, 5000);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return false;
+    }
 
     DWORD exitCode = 1;
     GetExitCodeProcess(pi.hProcess, &exitCode);
@@ -117,9 +134,9 @@ bool ExtractZip(const std::wstring& zipPath, const std::wstring& destDir) {
 /// If rename fails (rare: AV holding a non-share-delete handle), stash the new
 /// DLL next to the old one with a `.pending` suffix and drop a marker file so
 /// WinMain applies the swap on the next EXE launch.
-void HandleTsfDllReplace(const std::wstring& newDllSrc,
+bool HandleTsfDllReplace(const std::wstring& newDllSrc,
                          const std::wstring& exeDir,
-                         const std::wstring& oldVersionDir) {
+                         const std::wstring& oldVersionDir, std::wstring& parkedBackup) {
     namespace fs = std::filesystem;
 
     std::wstring liveDll = exeDir + L"\\" + TSF_DLL_FILENAME;
@@ -129,11 +146,15 @@ void HandleTsfDllReplace(const std::wstring& newDllSrc,
     std::error_code ec;
     fs::create_directories(oldVersionDir, ec);
 
+    if (GetFileAttributesW(liveDll.c_str()) == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND) {
+        return CopyFileW(newDllSrc.c_str(), liveDll.c_str(), FALSE) != FALSE;
+    }
     if (MoveFileW(liveDll.c_str(), parked.c_str())) {
         if (CopyFileW(newDllSrc.c_str(), liveDll.c_str(), FALSE)) {
             DeleteFileW((exeDir + L"\\" + TSF_DLL_FILENAME + TSF_DLL_PENDING_SUFFIX).c_str());
             DeleteFileW((exeDir + L"\\" + TSF_DLL_PENDING_MARKER).c_str());
-            return;
+            parkedBackup = parked;
+            return true;
         }
         MoveFileW(parked.c_str(), liveDll.c_str());
     }
@@ -145,7 +166,7 @@ void HandleTsfDllReplace(const std::wstring& newDllSrc,
         // the next boot's ApplyPendingDllUpdate doesn't see half-deferred
         // state. User retains the old DLL; EXE may be newer but ABI gate
         // will catch it on DLL-load.
-        return;
+        return false;
     }
 
     // Marker body = SHA256 of the pending DLL. ApplyPendingDllUpdate recomputes
@@ -155,7 +176,7 @@ void HandleTsfDllReplace(const std::wstring& newDllSrc,
     if (sha.empty()) {
         NEXTKEY_LOG(L"HandleTsfDllReplace: SHA-256 of pending DLL failed — discarding");
         DeleteFileW(pendingPath.c_str());
-        return;
+        return false;
     }
     std::wstring markerPath = exeDir + L"\\" + TSF_DLL_PENDING_MARKER;
     HANDLE hMarker = CreateFileW(markerPath.c_str(), GENERIC_WRITE, 0, nullptr,
@@ -164,7 +185,7 @@ void HandleTsfDllReplace(const std::wstring& newDllSrc,
         NEXTKEY_LOG(L"HandleTsfDllReplace: CreateFileW marker failed (err=%lu) — discarding pending",
                     GetLastError());
         DeleteFileW(pendingPath.c_str());  // back out of the half-deferred state
-        return;
+        return false;
     }
     DWORD written = 0;
     BOOL wrote = WriteFile(hMarker, sha.data(), static_cast<DWORD>(sha.size()), &written, nullptr);
@@ -174,7 +195,9 @@ void HandleTsfDllReplace(const std::wstring& newDllSrc,
                     written, sha.size(), GetLastError());
         DeleteFileW(markerPath.c_str());
         DeleteFileW(pendingPath.c_str());
+        return false;
     }
+    return true;
 }
 
 /// Copy all files from srcDir to destDir (overwriting)
@@ -193,6 +216,7 @@ bool CopyDirectoryContents(const std::wstring& srcDir, const std::wstring& destD
                 fs::create_directories(destPath);
             } else {
                 fs::create_directories(destPath.parent_path());
+                if (relativePath.wstring() == TSF_DLL_FILENAME) continue;
                 // Preserving config.toml if it already exists at the root level:
                 if (_wcsicmp(relativePath.wstring().c_str(), L"config.toml") == 0 && fs::exists(destPath)) {
                     continue; // Skip overwriting config.toml
@@ -206,70 +230,62 @@ bool CopyDirectoryContents(const std::wstring& srcDir, const std::wstring& destD
     }
 }
 
-// Publisher pin for VKey-owned update binaries. Verified 2026-07-02 against the
-// signed v4.1.0 release: VKey.exe / VKeyTSF.dll / VKeyWatchdog.exe carry
-//   CN=SignPath Foundation, O=SignPath Foundation, L=Lewes, S=Delaware, C=US
-// (free OSS Authenticode signing, issued by GlobalSign). CERT_NAME_SIMPLE_DISPLAY
-// yields "SignPath Foundation", so this substring is the pin. If VKey ever moves
-// to a different signing provider, update this (or clear it to require only a
-// valid signature) — re-read with:
-//   powershell (Get-AuthenticodeSignature VKey.exe).SignerCertificate.Subject
-constexpr const wchar_t* kExpectedUpdateSigner = L"SignPath Foundation";
-
-// Verify VKey-owned .exe/.dll in the extracted update carry a valid Authenticode
-// signature (chains to a trusted root, not revoked) AND match the publisher pin.
-// Third-party deps (sciter.dll) ship UNSIGNED — verified against the release —
-// so they are NOT signature-checked here; their integrity rests on the SHA-256'd
-// ZIP. Returns false if any VKey binary fails, or if the update contains no VKey
-// binaries at all (a valid release always ships our signed executables).
-[[nodiscard]] bool VerifyExtractedBinaries(const std::wstring& sourceDir) noexcept {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    bool sawVKeyBinary = false;
-    for (const auto& entry : fs::directory_iterator(sourceDir, ec)) {
-        if (ec) return false;
-        if (!entry.is_regular_file()) continue;
-        const auto ext = entry.path().extension().wstring();
-        if (_wcsicmp(ext.c_str(), L".exe") != 0 && _wcsicmp(ext.c_str(), L".dll") != 0) {
-            continue;
+// The authenticated ZIP covers third-party DLLs as well as our binaries.
+// Require the exact edition layout so no companion or unrelated file can be
+// mistaken for the application executable.
+[[nodiscard]] bool VerifyPackageLayout(const std::wstring& directory) noexcept {
+    try {
+#ifdef VKEY_LITE_MODE
+        const std::set<std::wstring> expected{L"THIRD_PARTY_NOTICES.txt", L"VKeyClassic.exe", L"VKeyTSF.dll"};
+#else
+        const std::set<std::wstring> expected{L"THIRD_PARTY_NOTICES.txt", L"VKey.exe", L"VKeyTSF.dll", L"sciter.dll"};
+#endif
+        std::set<std::wstring> found;
+        for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+            if (!entry.is_regular_file() || entry.is_symlink()) return false;
+            found.insert(entry.path().filename().wstring());
         }
-        const std::wstring name = entry.path().filename().wstring();
-        // Enforce on our own binaries only. sciter.dll is unsigned third-party.
-        if (_wcsnicmp(name.c_str(), L"VKey", 4) != 0) continue;
-        sawVKeyBinary = true;
-        if (!VerifyAuthenticodeSignature(entry.path().wstring(), kExpectedUpdateSigner)) {
-            NEXTKEY_LOG(L"VerifyExtractedBinaries: signature/publisher check FAILED for %ls — aborting update",
-                        name.c_str());
-            return false;
-        }
+        return found == expected;
+    } catch (...) {
+        return false;
     }
-    if (!sawVKeyBinary) {
-        NEXTKEY_LOG(L"VerifyExtractedBinaries: no VKey-owned signed binaries in update — aborting");
-    }
-    return sawVKeyBinary;
 }
 
 // Restore original binaries from _old_version/, mark the update failed, relaunch
 // the restored app, and exit. Shared by the extraction-failure and signature-
 // verification-failure paths so both recover identically.
 [[noreturn]] void RollbackRestoreAndExit(const std::wstring& exeDir,
-                                         const std::wstring& oldVersionDir) {
+                                         const std::wstring& oldVersionDir, bool restoreBackup = true,
+                                         const std::wstring& parkedTsf = L"") {
     namespace fs = std::filesystem;
     std::error_code rollbackEc;
-    std::wstring restoredExePath;
-    for (const auto& entry : fs::directory_iterator(oldVersionDir, rollbackEc)) {
-        if (!entry.is_regular_file()) continue;
-        std::wstring name = entry.path().filename().wstring();
-        std::wstring destPath = exeDir + L"\\" + name;
-        MoveFileW(entry.path().c_str(), destPath.c_str());
-        if (_wcsicmp(fs::path(name).extension().c_str(), L".exe") == 0 &&
-            name.find(L"VKey") != std::wstring::npos &&
-            name.find(L"Update") == std::wstring::npos) {
-            restoredExePath = destPath;
+    std::wstring restoredExePath = restoreBackup ? std::wstring{} : GetExePath();
+    if (restoreBackup) {
+        for (const auto& entry : fs::directory_iterator(oldVersionDir, rollbackEc)) {
+            if (!entry.is_regular_file()) continue;
+            std::wstring name = entry.path().filename().wstring();
+            if (name.starts_with(std::wstring(TSF_DLL_FILENAME) + L"_")) continue;
+            std::wstring destPath = exeDir + L"\\" + name;
+            const bool restored = MoveFileExW(entry.path().c_str(), destPath.c_str(), MOVEFILE_REPLACE_EXISTING) != FALSE;
+            if (restored && (_wcsicmp(name.c_str(), L"VKey.exe") == 0 ||
+                             _wcsicmp(name.c_str(), L"VKeyClassic.exe") == 0)) {
+                restoredExePath = destPath;
+            }
         }
     }
 
+    if (!parkedTsf.empty()) {
+        const auto live = exeDir + L"\\" + TSF_DLL_FILENAME;
+        const auto failed = oldVersionDir + L"\\" + TSF_DLL_FILENAME + MakeParkedDllTimestamp(L"_failed");
+        (void)MoveFileW(live.c_str(), failed.c_str());
+        (void)MoveFileW(parkedTsf.c_str(), live.c_str());
+    }
+    DeleteFileW((exeDir + L"\\" + TSF_DLL_FILENAME + TSF_DLL_PENDING_SUFFIX).c_str());
+    DeleteFileW((exeDir + L"\\" + TSF_DLL_PENDING_MARKER).c_str());
+    if (restoredExePath.empty() && fs::is_regular_file(GetExePath(), rollbackEc)) restoredExePath = GetExePath();
+
     std::wstring markerPath = exeDir + L"\\_update_failed";
+    DeleteFileW((exeDir + L"\\_update_succeeded").c_str());
     HANDLE hMarker = CreateFileW(markerPath.c_str(), GENERIC_WRITE, 0, nullptr,
                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hMarker != INVALID_HANDLE_VALUE) CloseHandle(hMarker);
@@ -314,9 +330,28 @@ std::wstring MakeParkedDllTimestamp(const wchar_t* extraSuffix) noexcept {
 }
 
 [[noreturn]] void RunUpdateInstaller(const std::wstring& zipPath) {
+    // Loader failures (missing/quarantined imports, invalid images) must return
+    // to our rollback path instead of waiting on a hidden Windows error dialog.
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     std::wstring exeDir = GetExeDirectory();
-    std::wstring currentExePath = GetExePath();
     std::wstring tempDir = exeDir + L"\\_update_temp";
+    DeleteFileW((exeDir + L"\\_update_succeeded").c_str());
+
+    // 1. Wait for all other VKey.exe processes to exit (120s timeout)
+    if (!WaitForOtherProcesses(120000)) {
+        // Do not move live binaries after a failed handover.
+        std::ofstream(std::filesystem::path(exeDir) / kUpdateFailedMarker);
+        ExitProcess(1);
+    }
+
+    const std::wstring oldVersionDir = exeDir + L"\\_old_version";
+    const auto closePackage = [](HANDLE h) { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); };
+    std::unique_ptr<void, decltype(closePackage)> package(
+        CreateFileW(zipPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL, nullptr), closePackage);
+    if (package.get() == INVALID_HANDLE_VALUE || !VerifySignedUpdateZip(zipPath)) {
+        RollbackRestoreAndExit(exeDir, oldVersionDir, false);
+    }
 
     // Known-clean start: delete any stale .pending / marker from a prior
     // aborted update. Otherwise a rollback in this run + stale pending from
@@ -325,34 +360,7 @@ std::wstring MakeParkedDllTimestamp(const wchar_t* extraSuffix) noexcept {
     DeleteFileW((exeDir + L"\\" + TSF_DLL_FILENAME + TSF_DLL_PENDING_SUFFIX).c_str());
     DeleteFileW((exeDir + L"\\" + TSF_DLL_PENDING_MARKER).c_str());
 
-    // 1. Wait for all other VKey.exe processes to exit (120s timeout)
-    WaitForOtherProcesses(120000);
-
-    // 2. Move ALL .exe and .dll files to _old_version/ folder
-    // This handles sciter.dll, TSF DLLs, and the main EXE regardless of name.
-    std::wstring oldVersionDir = exeDir + L"\\_old_version";
-    {
-        namespace fs = std::filesystem;
-        std::error_code ec;
-        fs::create_directories(oldVersionDir, ec);
-
-        for (const auto& entry : fs::directory_iterator(exeDir)) {
-            if (!entry.is_regular_file()) continue;
-            auto ext = entry.path().extension().wstring();
-            if (_wcsicmp(ext.c_str(), L".exe") == 0 || _wcsicmp(ext.c_str(), L".dll") == 0) {
-                std::wstring name = entry.path().filename().wstring();
-
-                // TSF DLL is handled separately after extraction — it may be
-                // mapped into foreign host processes and cannot be bulk-moved
-                // safely alongside the EXE kill path.
-                if (_wcsicmp(name.c_str(), TSF_DLL_FILENAME) == 0) continue;
-
-                std::wstring destPath = oldVersionDir + L"\\" + name;
-                DeleteFileW(destPath.c_str());
-                MoveFileW(entry.path().c_str(), destPath.c_str());
-            }
-        }
-    }
+    std::wstring parkedTsf;
 
     // 3. Extract ZIP to _update_temp/
     {
@@ -364,8 +372,9 @@ std::wstring MakeParkedDllTimestamp(const wchar_t* extraSuffix) noexcept {
 
     bool extracted = ExtractZip(zipPath, tempDir);
     if (!extracted) {
-        RollbackRestoreAndExit(exeDir, oldVersionDir);
+        RollbackRestoreAndExit(exeDir, oldVersionDir, false);
     }
+    package.reset();
 
     // 4. Detect ZIP structure: root files or single subdirectory
     std::wstring finalExePath;
@@ -383,35 +392,54 @@ std::wstring MakeParkedDllTimestamp(const wchar_t* extraSuffix) noexcept {
             sourceDir = entries[0].path().wstring();
         }
 
-        // 5.0 Authenticode gate — verify signatures BEFORE any file is installed
-        //     or run. SHA-256 (VerifyDownloadedZip) only proves the ZIP matches a
-        //     same-origin sidecar; this proves the actual binaries are validly
-        //     signed (and, when pinned, by us). On failure, roll back like a
-        //     failed extraction rather than installing unverified code.
-        if (!VerifyExtractedBinaries(sourceDir)) {
-            RollbackRestoreAndExit(exeDir, oldVersionDir);
+        if (!VerifyPackageLayout(sourceDir)) {
+            RollbackRestoreAndExit(exeDir, oldVersionDir, false);
         }
 
-        // 5a. Special-case TSF DLL (may be mapped in foreign host processes).
-        //     CopyDirectoryContents below would blindly try to overwrite the
-        //     live copy and silently fail; instead route via HandleTsfDllReplace
-        //     which does the NTFS rename trick + pending-swap fallback.
+        // Back up application files only. An update must not remove unrelated
+        // executables or optional companions from the installation directory.
         {
-            std::wstring newTsfDll = sourceDir + L"\\" + TSF_DLL_FILENAME;
-            if (fs::exists(newTsfDll)) {
-                HandleTsfDllReplace(newTsfDll, exeDir, oldVersionDir);
-                // Prevent the generic copy from clobbering our decision.
-                std::error_code delEc;
-                fs::remove(newTsfDll, delEc);
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            fs::create_directories(oldVersionDir, ec);
+
+            for (const auto& entry : fs::directory_iterator(exeDir)) {
+                if (!entry.is_regular_file()) continue;
+                auto ext = entry.path().extension().wstring();
+                if (_wcsicmp(ext.c_str(), L".exe") == 0 || _wcsicmp(ext.c_str(), L".dll") == 0) {
+                    std::wstring name = entry.path().filename().wstring();
+                    if (name != L"VKey.exe" && name != L"VKeyClassic.exe" &&
+                        name != L"sciter.dll" && name != TSF_DLL_FILENAME) continue;
+
+                    // TSF DLL is handled separately after extraction — it may be
+                    // mapped into foreign host processes and cannot be bulk-moved
+                    // safely alongside the EXE kill path.
+                    if (_wcsicmp(name.c_str(), TSF_DLL_FILENAME) == 0) continue;
+
+                    std::wstring destPath = oldVersionDir + L"\\" + name;
+                    DeleteFileW(destPath.c_str());
+                    MoveFileW(entry.path().c_str(), destPath.c_str());
+                }
             }
         }
 
         // 5b. Copy remaining new files to exe directory.
-        CopyDirectoryContents(sourceDir, exeDir);
+        if (!CopyDirectoryContents(sourceDir, exeDir)) {
+            RollbackRestoreAndExit(exeDir, oldVersionDir, true, parkedTsf);
+        }
 
-        // 6. Find the main executable to launch
-        // Prefer "VKey.exe", then "VKeyClassic.exe"
-        const std::vector<std::wstring> preferredNames = { L"VKey.exe", L"VKeyClassic.exe" };
+        // TSF is swapped only after every ordinary file has copied. A failed
+        // copy must not leave a new DLL paired with the restored application.
+        if (!HandleTsfDllReplace(sourceDir + L"\\" + TSF_DLL_FILENAME, exeDir, oldVersionDir, parkedTsf)) {
+            RollbackRestoreAndExit(exeDir, oldVersionDir, true, parkedTsf);
+        }
+
+        // Launch the same edition whose signed package was verified.
+#ifdef VKEY_LITE_MODE
+        const std::vector<std::wstring> preferredNames = { L"VKeyClassic.exe" };
+#else
+        const std::vector<std::wstring> preferredNames = { L"VKey.exe" };
+#endif
         for (const auto& name : preferredNames) {
             std::wstring testPath = exeDir + L"\\" + name;
             if (fs::exists(testPath)) {
@@ -420,40 +448,39 @@ std::wstring MakeParkedDllTimestamp(const wchar_t* extraSuffix) noexcept {
             }
         }
 
-        // Fallback: find any EXE that looks like the main app
-        if (finalExePath.empty()) {
-            for (const auto& entry : fs::directory_iterator(exeDir)) {
-                if (!entry.is_regular_file()) continue;
-                if (_wcsicmp(entry.path().extension().c_str(), L".exe") == 0) {
-                    std::wstring name = entry.path().filename().wstring();
-                    if (name.find(L"VKey") != std::wstring::npos) {
-                        // Skip updater if it's named VKeyUpdate.exe
-                        if (name.find(L"Update") == std::wstring::npos) {
-                            finalExePath = entry.path().wstring();
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+        // Never mistake a watchdog/browser companion for the main application.
+        if (finalExePath.empty()) RollbackRestoreAndExit(exeDir, oldVersionDir, true, parkedTsf);
     }
 
     // 7. Clean up temp files
     DeleteFileW(zipPath.c_str());
+    DeleteFileW((zipPath + L".sig").c_str());
     {
         namespace fs = std::filesystem;
         std::error_code ec;
         fs::remove_all(tempDir, ec);
     }
 
-    // 8. Launch new executable
+    // 8. Bind the success receipt to the executable actually installed. Startup
+    // consumes this only if that exact EXE is running; debris cannot imply success.
+    const std::string installedHash = ComputeFileSha256(finalExePath);
+    if (installedHash.empty()) RollbackRestoreAndExit(exeDir, oldVersionDir, true, parkedTsf);
+    {
+        std::ofstream receipt(std::filesystem::path(exeDir) / kUpdateSucceededMarker);
+        receipt << installedHash;
+        receipt.close();
+        if (!receipt) RollbackRestoreAndExit(exeDir, oldVersionDir, true, parkedTsf);
+    }
+    DeleteFileW((exeDir + L"\\_update_failed").c_str());
+
+    // Launch new executable
     if (!finalExePath.empty()) {
         STARTUPINFOW si = { sizeof(si) };
         PROCESS_INFORMATION pi = {};
-        
+
         // Quote the path for CreateProcessW cmdline
         std::wstring cmdLine = L"\"" + finalExePath + L"\"";
-        
+
         if (!CreateProcessW(nullptr, cmdLine.data(), nullptr, nullptr, FALSE,
                             CREATE_BREAKAWAY_FROM_JOB, nullptr, exeDir.c_str(), &si, &pi)) {
             // Fallback: if breakaway fails due to restricted job object, retry without it
@@ -462,6 +489,8 @@ std::wstring MakeParkedDllTimestamp(const wchar_t* extraSuffix) noexcept {
                                0, nullptr, exeDir.c_str(), &si, &pi)) {
                 CloseHandle(pi.hThread);
                 CloseHandle(pi.hProcess);
+            } else {
+                RollbackRestoreAndExit(exeDir, oldVersionDir, true, parkedTsf);
             }
         } else {
             CloseHandle(pi.hThread);
@@ -471,6 +500,18 @@ std::wstring MakeParkedDllTimestamp(const wchar_t* extraSuffix) noexcept {
 
     // 9. Exit updater
     ExitProcess(0);
+}
+
+UpdateOutcome ConsumeInstalledUpdateOutcome() noexcept {
+    try {
+        const auto directory = std::filesystem::path(GetExeDirectory());
+        std::error_code ec;
+        const auto hash = std::filesystem::exists(directory / kUpdateSucceededMarker, ec)
+            ? ComputeFileSha256(GetExePath()) : std::string{};
+        return ConsumeUpdateOutcome(directory, hash);
+    } catch (...) {
+        return UpdateOutcome::None;
+    }
 }
 
 bool CleanupOldUpdateFiles() noexcept {

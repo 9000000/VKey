@@ -6,6 +6,8 @@
 
 #pragma once
 #include <windows.h>
+#include <cstdio>
+#include <string>
 
 namespace NextKey {
 
@@ -65,6 +67,15 @@ namespace Win10Frame {
 
 namespace SciterHelper {
 
+    constexpr const wchar_t* BASE_RGB_DARK = L"18, 20, 28";
+    constexpr const wchar_t* BASE_RGB_LIGHT = L"244, 245, 247";
+
+    [[nodiscard]] inline std::wstring FormatBackgroundColor(bool dark, double opacity) {
+        wchar_t buf[64];
+        swprintf_s(buf, L"rgba(%ls, %.2f)", dark ? BASE_RGB_DARK : BASE_RGB_LIGHT, opacity);
+        return buf;
+    }
+
     /**
      * Enable DWM blur/acrylic effect on a window.
      *
@@ -93,8 +104,9 @@ namespace SciterHelper {
 
     /**
      * Force a Sciter popup/main window to appear on the taskbar with the app icon.
-     * Removes WS_EX_TOOLWINDOW, adds WS_EX_APPWINDOW, applies SWP_FRAMECHANGED,
-     * and sets WM_SETICON from IDI_APP. Call AFTER all expand() calls.
+     * Removes WS_EX_TOOLWINDOW, adds WS_EX_APPWINDOW, ensures WS_MINIMIZEBOX and
+     * WS_SYSMENU styles so clicking the taskbar button minimizes/restores the window,
+     * applies SWP_FRAMECHANGED, and sets WM_SETICON from IDI_APP. Call AFTER all expand() calls.
      *
      * @param hwnd Window handle
      * @param iconId Resource ID for the window icon (e.g. IDI_APP)
@@ -102,7 +114,8 @@ namespace SciterHelper {
     void ForceTaskbarPresence(HWND hwnd, int iconId) noexcept;
 
     /**
-     * Filter WM_STYLECHANGING to prevent Sciter from re-adding WS_EX_TOOLWINDOW.
+     * Filter WM_STYLECHANGING to prevent Sciter from re-adding WS_EX_TOOLWINDOW
+     * and ensure WS_MINIMIZEBOX / WS_SYSMENU are retained.
      * Call from SubclassProc. Modifies styleNew in-place; caller should fall through
      * to DefSubclassProc to propagate the corrected style.
      *
@@ -111,6 +124,20 @@ namespace SciterHelper {
      * @return true if the style was modified (caller should still fall through)
      */
     [[nodiscard]] bool GuardTaskbarStyle(WPARAM wParam, LPARAM lParam) noexcept;
+
+    /**
+     * Track minimize/restore from SubclassProc. Records SIZE_MINIMIZED in
+     * wasMinimized and returns true (clearing the flag) on the first
+     * WM_SIZE SIZE_RESTORED or WM_SHOWWINDOW(TRUE) after it — the point where
+     * Sciter needs RepaintAfterRestore() to avoid a stale/blank frame (#258).
+     */
+    [[nodiscard]] bool ConsumeRestoreFromMinimized(UINT msg, WPARAM wParam,
+                                                   bool& wasMinimized) noexcept;
+
+    /**
+     * Force Sciter to re-layout and repaint the whole window after a restore.
+     */
+    void RepaintAfterRestore(HWND hwnd);
 
 }  // namespace SciterHelper
 

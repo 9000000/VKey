@@ -37,6 +37,7 @@ std::atomic<FocusOwner*> FocusOwner::s_instance{nullptr};
 //                  (issue #178 — typing over cloud desktop drops/misplaces tones).
 static constexpr int kCompatSplitFirefoxMs = 6;
 static constexpr int kCompatSplitRemoteMs  = 25;
+static constexpr int kCompatSplitWebViewMs = 6;
 static constexpr UINT kControlProbeTimeoutMs = 20;
 static constexpr UINT kSciGetLength = 2006;
 static constexpr UINT kSciGetCurrentPos = 2008;
@@ -617,7 +618,11 @@ FocusClassification FocusOwner::Classify(HWND triggerHwnd,
     // `appSendMethodOverrides` map — RCU-published from the worker thread, so
     // this main-thread lookup is lock-free and immune to torn reads during a
     // TOML rebuild. Values: 1=Clipboard, 2=Firefox-compat split, 3=Cloud/Remote
-    // compat split, 5=game re-inject (0/absent = default Win32 batch path).
+    // compat split, 4=EM_REPLACESEL, 5=game re-inject, 6=WebView App split
+    // without bait (0/absent = default Win32 batch path). Auto-detected
+    // WebView2 hosts keep the bait; 6 is the per-app opt-out for hosts such as
+    // embedded terminals where the bait char is lost or leaks.
+    bool forceNoBait = false;
     if (!cls.exeName.empty() && ctx.snap) {
         auto it = ctx.snap->appSendMethodOverrides.find(cls.exeName);
         if (it != ctx.snap->appSendMethodOverrides.end()) {
@@ -634,6 +639,10 @@ FocusClassification FocusOwner::Classify(HWND triggerHwnd,
                 // "game + EM_REPLACESEL" — combinations whose re-inject
                 // accounting has no sensible answer — unreachable.
                 case 5: cls.localGameReinject = true;                         break;
+                case 6:
+                    cls.localForcedSplitSleepMs = kCompatSplitWebViewMs;
+                    forceNoBait = true;
+                    break;
                 default: break;  // 0=SendInput / unknown → default Win32 path
             }
         }
@@ -643,8 +652,8 @@ FocusClassification FocusOwner::Classify(HWND triggerHwnd,
     // for the per-host rationale (bait char, split dispatch, edit message
     // path, clipboard fallback). Preserved verbatim — this is data the
     // hook hot path will read via the IOutputInjector picked in Apply.
-    cls.localSkipEmpty = cls.isElectron || cls.isConsole;
-    cls.localNeedBait  = cls.isBrowser;
+    cls.localSkipEmpty = cls.isElectron || cls.isConsole || forceNoBait;
+    cls.localNeedBait  = forceNoBait ? false : cls.isBrowser;
     cls.localClipboard = cls.isVB6;
     if (!cls.localSkipEmpty && !cls.localNeedBait && !cls.localClipboard) {
         if (!cls.exeName.empty()) {
@@ -676,7 +685,7 @@ FocusClassification FocusOwner::Classify(HWND triggerHwnd,
         }
     }
     cls.isWebView2 = isWebView2;
-    cls.localElectronApp = (cls.isElectron || cls.isWebView2) && !cls.isConsole;
+    cls.localElectronApp = (cls.isElectron || cls.isWebView2 || forceNoBait) && !cls.isConsole;
 
     // Cache miss path: persist for next focus event. Skipped when
     // GetWindowThreadProcessId fails — invariant requires PID for re-check.

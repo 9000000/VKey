@@ -21,7 +21,7 @@ extern "C" {
 #endif
 
 /* Bump when the ABI changes; check against vkey_engine_abi_version(). */
-#define VKEY_ENGINE_ABI_VERSION 9u
+#define VKEY_ENGINE_ABI_VERSION 10u
 
 /* ABI v6 runtime-artifact identity status. */
 #define VKEY_ENGINE_RUNTIME_OK                   0u
@@ -44,6 +44,8 @@ extern "C" {
 #define VKEY_FEAT_ALLOW_ENGLISH_BYPASS (1u << 5)
 #define VKEY_FEAT_ALLOW_ZWJF           (1u << 6)
 #define VKEY_FEAT_SPELL_SUGGEST        (1u << 7)
+/* Opt out of commit-time raw restoration; older callers retain the default. */
+#define VKEY_FEAT_DISABLE_AUTO_RESTORE (1u << 8)
 
 /* Opaque engine handle. */
 typedef struct VKeyEngine VKeyEngine;
@@ -60,6 +62,9 @@ void vkey_engine_destroy(VKeyEngine *engine);
 
 /* Clear the active composition. */
 void vkey_engine_reset(VKeyEngine *engine);
+
+/* ABI v10: clear cached inter-word context used for N-gram reranking. */
+void vkey_engine_clear_context(VKeyEngine *engine);
 
 /* Push one decoded key (a Unicode scalar value, e.g. an ASCII letter). */
 void vkey_engine_push_char(VKeyEngine *engine, uint32_t codepoint);
@@ -117,11 +122,13 @@ bool vkey_engine_has_active_quick_consonant(const VKeyEngine *engine);
  * Pass buf=NULL, cap=0 to query the length. */
 size_t vkey_engine_peek_raw_utf16(const VKeyEngine *engine, uint16_t *buf, size_t cap);
 
-/* Seed the active composition from already-rendered UTF-16 text, treating every
- * scalar as literal input (for backspace-revive into a committed word). Returns
+/* Seed the active composition from already-rendered UTF-16 text (for
+ * backspace-revive into a committed word). The text is replayed as canonical
+ * telex keys when they render back to it exactly, so a later tone/modifier key
+ * edits it; otherwise every scalar is seeded literally (ADR-0013). Either way
+ * peek_raw returns the seeded keys, not keys the user physically typed. Returns
  * true on success, false (leaving the engine reset) on invalid UTF-16 or
- * capacity overflow. Re-applying a tone/modifier to seeded glyphs is NOT
- * faithfully supported — that needs a raw snapshot captured at commit time. */
+ * capacity overflow. */
 bool vkey_engine_seed_text_utf16(VKeyEngine *engine, const uint16_t *buf, size_t len);
 
 /* --- ABI v3: lexicon smart-restore -----------------------------------------

@@ -38,13 +38,12 @@ public:
 
     /// Download ZIP, verify hash, launch installer (synchronous — call from background thread).
     /// Returns true if installer was launched. On failure, cleans up the downloaded file.
-    [[nodiscard]] static bool DownloadAndLaunchInstaller(const std::wstring& downloadUrl, std::atomic<bool>& cancelFlag) noexcept;
+    [[nodiscard]] static bool DownloadAndLaunchInstaller(const std::wstring& downloadUrl, std::atomic<bool>& cancelFlag, std::uint32_t expectedVersion) noexcept;
 
     /// Parse version string (e.g. "v1.2.3-beta") into packed format (major<<16 | minor<<8 | patch)
     [[nodiscard]] static uint32_t ParseVersion(const std::wstring& versionStr) noexcept;
 
-    /// Show TaskDialog with "Update now" / "Skip" buttons + changelog link
-    /// Returns true if user clicked "Update now"
+    /// Show update confirmation and release notes.
     [[nodiscard]] static bool ShowUpdateDialog(HWND parent, const UpdateInfo& info);
 
     /// Show "You're on the latest version" message
@@ -61,7 +60,7 @@ public:
 
     /// Download update with progress dialog, launch installer.
     /// Shows marquee progress, handles errors. Returns true if installer launched (caller should exit).
-    [[nodiscard]] static bool DownloadWithProgress(HWND parent, const std::wstring& downloadUrl);
+    [[nodiscard]] static bool DownloadWithProgress(HWND parent, const std::wstring& downloadUrl, std::uint32_t expectedVersion);
 
 private:
 

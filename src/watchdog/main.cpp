@@ -14,11 +14,13 @@
 #include <string>
 
 #include "../core/RestartThrottle.h"
+#include "../core/WatchdogEvents.h"
+
+using NextKey::HEARTBEAT_EVENT_NAME;
+using NextKey::GRACEFUL_SHUTDOWN_EVENT_NAME;
 
 namespace {
 
-constexpr const wchar_t* HEARTBEAT_EVENT_NAME = L"Local\\VKeyHeartbeat";
-constexpr const wchar_t* GRACEFUL_SHUTDOWN_EVENT_NAME = L"Local\\VKeyGracefulShutdown";
 constexpr DWORD HEARTBEAT_TIMEOUT_MS = 90'000;  // 3× publisher interval
 constexpr DWORD POST_RESPAWN_GRACE_MS = 5'000;  // Wait this long after respawn
 constexpr DWORD POST_INIT_GRACE_MS = 30'000;    // Initial grace for VKey to start
@@ -135,6 +137,22 @@ bool TryRespawn() {
 }  // namespace
 
 int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
+    // Hold both events for our entire lifetime. Reopening them each iteration
+    // loses a quick user quit when the publisher closes its last handle before
+    // the watchdog opens the event. Never respawn without the shutdown channel.
+    struct EventHandles {
+        HANDLE graceful = CreateEventW(nullptr, TRUE, FALSE, GRACEFUL_SHUTDOWN_EVENT_NAME);
+        HANDLE heartbeat = CreateEventW(nullptr, FALSE, FALSE, HEARTBEAT_EVENT_NAME);
+        ~EventHandles() {
+            if (heartbeat) CloseHandle(heartbeat);
+            if (graceful) CloseHandle(graceful);
+        }
+    } events;
+    if (!events.graceful || !events.heartbeat) {
+        LogLine(L"Cannot create watchdog events — supervision disabled (err=%lu)", GetLastError());
+        return 1;
+    }
+
     // Single-instance guard — both VKey app launch and Task Scheduler
     // at-logon trigger may try to start watchdog. The second one bails
     // silently on ERROR_ALREADY_EXISTS so we never run two supervisors
@@ -148,57 +166,30 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
 
     LogLine(L"Watchdog starting (pid=%lu)", GetCurrentProcessId());
 
-    // Initial grace — VKey may not be up yet at logon.
-    Sleep(POST_INIT_GRACE_MS);
+    // All delays remain interruptible by a user-requested shutdown.
+    if (WaitForSingleObject(events.graceful, POST_INIT_GRACE_MS) != WAIT_TIMEOUT) return 0;
 
     while (true) {
-        // Open events fresh each iteration — handles publisher restart
-        // (VKey crashed and respawned) by reattaching to new instance.
-        HANDLE heartbeat = OpenEventW(SYNCHRONIZE, FALSE, HEARTBEAT_EVENT_NAME);
-        HANDLE graceful = OpenEventW(SYNCHRONIZE, FALSE, GRACEFUL_SHUTDOWN_EVENT_NAME);
-
-        if (!heartbeat || !graceful) {
-            // Events not yet created → VKey not running.
-            if (heartbeat) CloseHandle(heartbeat);
-            if (graceful) CloseHandle(graceful);
-
-            if (!IsProcessAlive(L"VKey.exe") && !IsProcessAlive(L"VKeyClassic.exe")) {
-                LogLine(L"Heartbeat events absent + process not running → respawn");
-                if (!TryRespawn()) return 0;  // cap hit → stop supervising
-                Sleep(POST_RESPAWN_GRACE_MS);
-            } else {
-                Sleep(5000);  // Process exists but events not yet up — be patient
-            }
-            continue;
-        }
-
-        DWORD waitResult = WaitForSingleObject(heartbeat, HEARTBEAT_TIMEOUT_MS);
-        CloseHandle(heartbeat);
-
+        const DWORD waitResult = NextKey::WaitForWatchdogSignal(
+            events.graceful, events.heartbeat, HEARTBEAT_TIMEOUT_MS);
         if (waitResult == WAIT_OBJECT_0) {
-            // Pulse received — alive.
-            CloseHandle(graceful);
-            continue;
-        }
-
-        // Heartbeat stale — check graceful flag.
-        DWORD gracefulState = WaitForSingleObject(graceful, 0);
-        CloseHandle(graceful);
-
-        if (gracefulState == WAIT_OBJECT_0) {
-            LogLine(L"Heartbeat stale + graceful flag set → user quit, watchdog exiting");
+            LogLine(L"Graceful shutdown requested → watchdog exiting");
             return 0;
         }
-
-        // Stale + no graceful — but is process actually dead?
-        if (IsProcessAlive(L"VKey.exe") || IsProcessAlive(L"VKeyClassic.exe")) {
-            LogLine(L"Heartbeat stale but process alive (UI hung?) — NOT respawning");
-            Sleep(POST_RESPAWN_GRACE_MS);
-            continue;
+        if (waitResult == WAIT_OBJECT_0 + 1) continue;
+        if (waitResult != WAIT_TIMEOUT) {
+            LogLine(L"Watchdog wait failed — stopping supervision (err=%lu)", GetLastError());
+            return 1;
         }
 
-        LogLine(L"Heartbeat stale + graceful clear + process dead → CRASH detected");
-        if (!TryRespawn()) return 0;  // cap hit → stop supervising
-        Sleep(POST_RESPAWN_GRACE_MS);
+        // Check quit once more before a restart decision at the timeout edge.
+        if (WaitForSingleObject(events.graceful, 0) != WAIT_TIMEOUT) return 0;
+        if (IsProcessAlive(L"VKey.exe") || IsProcessAlive(L"VKeyClassic.exe")) {
+            LogLine(L"Heartbeat stale but process alive — NOT respawning");
+        } else {
+            LogLine(L"Heartbeat stale + graceful clear + process dead → CRASH detected");
+            if (!TryRespawn()) return 0;
+        }
+        if (WaitForSingleObject(events.graceful, POST_RESPAWN_GRACE_MS) != WAIT_TIMEOUT) return 0;
     }
 }

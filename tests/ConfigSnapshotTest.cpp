@@ -287,5 +287,19 @@ TEST(ConfigSnapshotBuild, RoundTripsAllFields) {
     EXPECT_TRUE(snap.spaceMacroKeys.empty());
 }
 
+TEST(ConfigSnapshotBuild, PrefixIndexStaysWithItsPublishedSnapshot) {
+    auto first = ConfigSnapshot::Build(
+        {{L"hi there", L"hello"}, {L"Strict Key", L"strict"}, {L"single", L"value"}},
+        {}, {}, {}, {}, {}, {}, 1);
+    auto retained = first;
+    first = ConfigSnapshot::Build({{L"new phrase", L"new"}}, {}, {}, {}, {}, {}, {}, 2);
+    EXPECT_TRUE(IsSpaceMacroPrefix(L"HI ", retained.macroPrefixIndex));
+    EXPECT_TRUE(IsSpaceMacroPrefix(L"Strict ", retained.macroPrefixIndex));
+    EXPECT_FALSE(IsSpaceMacroPrefix(L"strict ", retained.macroPrefixIndex));
+    EXPECT_FALSE(IsSpaceMacroPrefix(L"single", retained.macroPrefixIndex));
+    EXPECT_FALSE(IsSpaceMacroPrefix(L"HI ", first.macroPrefixIndex));
+    EXPECT_TRUE(IsSpaceMacroPrefix(L"NEW ", first.macroPrefixIndex));
+}
+
 }  // namespace
 }  // namespace NextKey

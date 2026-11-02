@@ -54,6 +54,21 @@ public:
             return FAILED(hr) ? hr : E_FAIL;
         }
 
+        // Only overwrite the committed body if it is still what precedes the
+        // caret. Hosts rewrite committed text (Teams ":smile:" → one emoji,
+        // Word "(c)" → "©"), so a blind N-char replace would eat unrelated
+        // text the user never asked to restore.
+        std::wstring onScreen(textToReplace_.size(), L'\0');
+        ULONG got = 0;
+        hr = sel.range->GetText(ec, 0, onScreen.data(),
+                                static_cast<ULONG>(onScreen.size()), &got);
+        if (FAILED(hr) || got != onScreen.size() || onScreen != textToReplace_) {
+            TSF_LOG(L"EscRestoreLastCommitSession: text before caret changed, skip (hr=0x%08X got=%lu)",
+                    hr, got);
+            sel.range->Release();
+            return FAILED(hr) ? hr : E_FAIL;
+        }
+
         // Replace with raw keys.
         hr = sel.range->SetText(ec, 0, rawInput_.data(), static_cast<LONG>(rawInput_.size()));
         if (FAILED(hr)) {
@@ -71,14 +86,19 @@ public:
         }
 
         sel.range->Release();
+        replaced_ = true;
         TSF_LOG(L"EscRestoreLastCommitSession: replaced '%ls' with raw '%ls'",
                 textToReplace_.c_str(), rawInput_.c_str());
         return S_OK;
     }
 
+    /// True once the committed body was actually replaced with raw keys.
+    [[nodiscard]] bool Replaced() const noexcept { return replaced_; }
+
 private:
     std::wstring textToReplace_;
     std::wstring rawInput_;
+    bool replaced_ = false;
 };
 
 }  // namespace TSF

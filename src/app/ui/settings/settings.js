@@ -145,12 +145,7 @@ function updateBackgroundForTheme(isDark) {
     var hiddenInput = document.getElementById("val-bg-opacity");
     if (container && hiddenInput) {
         var opacity = parseInt(hiddenInput.value || "80") / 100;
-        if (isDark) {
-            // Semi-transparent blue-gray for frosted glass
-            container.style.backgroundColor = "rgba(18, 20, 28, " + opacity + ")";
-        } else {
-            container.style.backgroundColor = "rgba(255, 255, 255, " + opacity + ")";
-        }
+        container.style.backgroundColor = getThemeBackgroundColor(isDark, opacity);
     }
 }
 
@@ -213,6 +208,12 @@ function initializeToggles() {
             if (id === "tsf-apps") {
                 updateTsfChildren(newState);
             }
+            if (id === "use-macro") {
+                updateMacroChildren(newState);
+            }
+            if (id === "auto-caps-macro") {
+                updateMacroCapsChildren(newState);
+            }
 
             // Show toast message (except show-advanced)
             if (id !== "show-advanced" && typeof showToastI18n === "function") {
@@ -253,6 +254,10 @@ function initializeToggles() {
 
     // Initial state: sync userdefined button
     updateUserDefinedButton();
+    var useMacro = document.getElementById("use-macro");
+    updateMacroChildren(useMacro && useMacro.classList.contains("checked"));
+    var macroCaps = document.getElementById("auto-caps-macro");
+    updateMacroCapsChildren(macroCaps && macroCaps.classList.contains("checked"));
 }
 
 // Grey out a child toggle + its row when the parent option is off.
@@ -275,6 +280,14 @@ function setToggleRowEnabled(id, enabled) {
 
 function updateTsfChildren(tsfEnabled) {
     setToggleRowEnabled("hide-preedit-underline", tsfEnabled);
+}
+
+function updateMacroChildren(enabled) {
+    setToggleRowEnabled("macro-undo-backspace", enabled);
+}
+
+function updateMacroCapsChildren(enabled) {
+    setToggleRowEnabled("macro-title-case", enabled);
 }
 
 function updateUserDefinedButton() {
@@ -486,12 +499,7 @@ function updateSliderFromMouse(evt, slider, thumb, fill, valueLabel, hiddenInput
     var container = document.getElementById("main-container");
     if (container) {
         var isDark = document.body.classList.contains("dark");
-        if (isDark) {
-            // Semi-transparent blue-gray for frosted glass effect
-            container.style.backgroundColor = "rgba(18, 20, 28, " + opacity + ")";
-        } else {
-            container.style.backgroundColor = "rgba(255, 255, 255, " + opacity + ")";
-        }
+        container.style.backgroundColor = getThemeBackgroundColor(isDark, opacity);
     }
 }
 
@@ -514,11 +522,7 @@ function setBackgroundOpacity(value) {
         var container = document.getElementById("main-container");
         if (container) {
             var isDark = document.body.classList.contains("dark");
-            if (isDark) {
-                container.style.backgroundColor = "rgba(18, 20, 28, " + opacity + ")";
-            } else {
-                container.style.backgroundColor = "rgba(255, 255, 255, " + opacity + ")";
-            }
+            container.style.backgroundColor = getThemeBackgroundColor(isDark, opacity);
         }
     }
 }

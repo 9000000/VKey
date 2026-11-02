@@ -50,8 +50,11 @@ enum class TrayMenuId : UINT {
     InputUserDefined = 1044,
     // Hybrid TSF update — restart prompt (only shown when any update flag is live)
     RestartWindows = 1050,
-    // Watchdog control (toggle — label switches based on TrayMenuState::watchdogEnabled)
+    // Watchdog control (toggle — legacy alias)
     ToggleWatchdog = 1060,
+    // Extensions submenu
+    ExtensionBrowser = 1061,
+    ExtensionWatchdog = 1062,
 };
 
 /// Callback type for tray events
@@ -69,6 +72,7 @@ struct TrayMenuState {
     int inputMethod = 0;       // 0=Telex, 1=VNI, 2=SimpleTelex, 3=Combined, 4=UserDefined
     CodeTable codeTable = CodeTable::Unicode;
     bool watchdogEnabled = false;  // Auto-restart on crash (opt-in)
+    bool browserEnabled = false;   // Browser extension integration (opt-in)
 };
 
 /// Callback to query current menu state (pull model — called when menu opens)
@@ -162,7 +166,7 @@ private:
     NOTIFYICONDATAW nid_ = {};
     bool vietnameseMode_ = true;
     bool tsfActive_ = false;             // Focused app is a TSF app → show colored "T"
-    bool toggledByClick_ = false;        // Single-click toggled — undo if double-click follows
+    bool pendingClickToggle_ = false;    // Waiting for double-click before executing single-click toggle
     bool ignoreNextLButtonUp_ = false;   // Suppress WM_LBUTTONUP after WM_LBUTTONDBLCLK
     MenuCallback menuCallback_;
     ModeRequestCallback modeRequestCallback_;

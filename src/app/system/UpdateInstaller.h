@@ -9,6 +9,7 @@
 
 #include <Windows.h>
 #include <string>
+#include "core/UpdateOutcome.h"
 
 namespace NextKey {
 
@@ -35,6 +36,9 @@ std::wstring MakeParkedDllTimestamp(const wchar_t* extraSuffix = L"") noexcept;
 /// Waits for other VKey processes to exit, extracts ZIP, replaces files, relaunches.
 /// Called from --install-update CLI route. Never returns.
 [[noreturn]] void RunUpdateInstaller(const std::wstring& zipPath);
+
+/// Consume an explicit installer receipt for the running EXE, before cleanup.
+[[nodiscard]] UpdateOutcome ConsumeInstalledUpdateOutcome() noexcept;
 
 /// Clean up leftover files from a previous update (*_old.*, _update_temp/).
 /// Returns true if any files were actually cleaned up.

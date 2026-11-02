@@ -40,6 +40,7 @@ struct EngineApi {
     VKeyEngine* (*create)(uint32_t, uint32_t) = nullptr;
     void (*destroy)(VKeyEngine*) = nullptr;
     void (*reset)(VKeyEngine*) = nullptr;
+    void (*clear_context)(VKeyEngine*) = nullptr;
     void (*push_char)(VKeyEngine*, uint32_t) = nullptr;
 #if VKEY_ENGINE_ABI_VERSION >= 9u
     // ABI v9: physical scalar and output-case intent are independent.
@@ -100,6 +101,7 @@ const EngineApi& Api() {
         a.create = Resolve<decltype(a.create)>(lib, "vkey_engine_create");
         a.destroy = Resolve<decltype(a.destroy)>(lib, "vkey_engine_destroy");
         a.reset = Resolve<decltype(a.reset)>(lib, "vkey_engine_reset");
+        a.clear_context = Resolve<decltype(a.clear_context)>(lib, "vkey_engine_clear_context");
         a.push_char = Resolve<decltype(a.push_char)>(lib, "vkey_engine_push_char");
 #if VKEY_ENGINE_ABI_VERSION >= 9u
         a.push_key = Resolve<decltype(a.push_key)>(lib, "vkey_engine_push_key");
@@ -140,7 +142,7 @@ const EngineApi& Api() {
             lib, "vkey_engine_set_user_dictionary");
 #endif
         const bool symbolsResolved =
-            a.create && a.destroy && a.reset && a.push_char && a.backspace &&
+            a.create && a.destroy && a.reset && a.clear_context && a.push_char && a.backspace &&
 #if VKEY_ENGINE_ABI_VERSION >= 9u
             a.push_key &&
 #endif
@@ -208,6 +210,7 @@ uint32_t MapFeatures(const TypingConfig& c) {
     if (c.quickConsonant) f |= VKEY_FEAT_QUICK_CONSONANT;
     if (c.quickEndConsonant) f |= VKEY_FEAT_QUICK_END_CONSONANT;
     if (c.spellCheckEnabled) f |= VKEY_FEAT_SPELL_CHECK;
+    if (!c.autoRestoreEnabled) f |= VKEY_FEAT_DISABLE_AUTO_RESTORE;
     if (c.spellSuggestEnabled && c.autoRestoreEnabled) f |= VKEY_FEAT_SPELL_SUGGEST;
     if (c.allowEnglishBypass) f |= VKEY_FEAT_ALLOW_ENGLISH_BYPASS;
     if (c.allowZwjf) f |= VKEY_FEAT_ALLOW_ZWJF;
@@ -750,6 +753,12 @@ void RustInputEngine::Reset() {
     peek_.clear();
     raw_.clear();
     count_ = 0;
+}
+
+void RustInputEngine::ClearContext() noexcept {
+    if (handle_) {
+        Api().clear_context(static_cast<VKeyEngine*>(handle_));
+    }
 }
 
 bool RustInputEngine::HasActiveQuickConsonant() const {

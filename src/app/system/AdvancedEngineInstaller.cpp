@@ -146,8 +146,10 @@ bool IsRedirectStatus(DWORD status) noexcept {
     return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
 }
 
-InstallResult StreamResponseToFile(HINTERNET request, HANDLE file, std::atomic<bool>& cancel) noexcept {
-    const std::uint64_t expectedBytes = ExpectedRustEngineByteLength();
+InstallResult StreamResponseToFile(HINTERNET request, HANDLE file, AdvancedEngineDownloadAsset asset,
+                                   std::atomic<bool>& cancel) noexcept {
+    AdvancedEngineDownloadBudget budget(asset, ExpectedRustEngineByteLength());
+    const std::uint64_t expectedBytes = budget.ExpectedBytes();
     if (expectedBytes > (std::numeric_limits<DWORD>::max)()) {
         return InstallResult::VerificationFailure;
     }
@@ -157,7 +159,7 @@ InstallResult StreamResponseToFile(HINTERNET request, HANDLE file, std::atomic<b
     if (::WinHttpQueryHeaders(request, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
                               WINHTTP_HEADER_NAME_BY_INDEX, &contentLength, &contentLengthBytes,
                               WINHTTP_NO_HEADER_INDEX)) {
-        if (contentLength != expectedBytes) {
+        if (!budget.MatchesContentLength(contentLength)) {
             return InstallResult::VerificationFailure;
         }
     } else if (::GetLastError() != ERROR_WINHTTP_HEADER_NOT_FOUND) {
@@ -165,7 +167,6 @@ InstallResult StreamResponseToFile(HINTERNET request, HANDLE file, std::atomic<b
     }
 
     std::array<std::uint8_t, 64 * 1024> buffer{};
-    std::uint64_t totalBytes = 0;
     for (;;) {
         if (cancel.load(std::memory_order_relaxed)) {
             return InstallResult::Cancelled;
@@ -178,7 +179,7 @@ InstallResult StreamResponseToFile(HINTERNET request, HANDLE file, std::atomic<b
         if (bytesRead == 0) {
             break;
         }
-        if (totalBytes > expectedBytes || bytesRead > expectedBytes - totalBytes) {
+        if (!budget.AcceptChunk(bytesRead)) {
             return InstallResult::VerificationFailure;
         }
 
@@ -191,13 +192,13 @@ InstallResult StreamResponseToFile(HINTERNET request, HANDLE file, std::atomic<b
             }
             offset += bytesWritten;
         }
-        totalBytes += bytesRead;
     }
 
-    return totalBytes == expectedBytes ? InstallResult::Installed : InstallResult::VerificationFailure;
+    return budget.Complete() ? InstallResult::Installed : InstallResult::VerificationFailure;
 }
 
-InstallResult DownloadToFile(HANDLE file, std::wstring startUrl, std::atomic<bool>& cancel) {
+InstallResult DownloadToFile(HANDLE file, std::wstring startUrl, AdvancedEngineDownloadAsset asset,
+                             std::atomic<bool>& cancel) {
     UniqueInternet session(::WinHttpOpen(L"VKey/" VKEY_VERSION_WSTR, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                          WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
     if (!session.get() ||
@@ -252,7 +253,7 @@ InstallResult DownloadToFile(HANDLE file, std::wstring startUrl, std::atomic<boo
         if (status != HTTP_STATUS_OK) {
             return InstallResult::NetworkFailure;
         }
-        return StreamResponseToFile(request.get(), file, cancel);
+        return StreamResponseToFile(request.get(), file, asset, cancel);
     }
     return InstallResult::NetworkFailure;
 }
@@ -270,7 +271,7 @@ InstallResult InstallEngine(std::atomic<bool>& cancel) noexcept {
         }
 
         const InstallResult download =
-            DownloadToFile(staging.get(), BuildAdvancedEngineReleaseUrl(), cancel);
+            DownloadToFile(staging.get(), BuildAdvancedEngineReleaseUrl(), AdvancedEngineDownloadAsset::Engine, cancel);
         if (download != InstallResult::Installed) {
             return download;
         }
@@ -278,21 +279,23 @@ InstallResult InstallEngine(std::atomic<bool>& cancel) noexcept {
         // The signature has to land before the engine is verified, and it has to
         // be the one published beside this engine — an installed pair from an
         // older release would verify each other but not this download.
-        AdvancedEngineStagingFile signatureStaging;
-        if (!signatureStaging.Create(directory)) {
-            return InstallResult::StorageFailure;
-        }
-        const InstallResult signatureDownload =
-            DownloadToFile(signatureStaging.get(), BuildAdvancedEngineSignatureUrl(), cancel);
-        if (signatureDownload != InstallResult::Installed) {
-            return signatureDownload;
-        }
-        if (!::FlushFileBuffers(signatureStaging.get())) {
-            return InstallResult::StorageFailure;
-        }
-        if (!signatureStaging.ActivateAs(SignaturePath(directory))) {
-            return InstallResult::ActivationFailure;
-        }
+        {
+            AdvancedEngineStagingFile signatureStaging;
+            if (!signatureStaging.Create(directory)) {
+                return InstallResult::StorageFailure;
+            }
+            const InstallResult signatureDownload =
+                DownloadToFile(signatureStaging.get(), BuildAdvancedEngineSignatureUrl(), AdvancedEngineDownloadAsset::Signature, cancel);
+            if (signatureDownload != InstallResult::Installed) {
+                return signatureDownload;
+            }
+            if (!::FlushFileBuffers(signatureStaging.get())) {
+                return InstallResult::StorageFailure;
+            }
+            if (!signatureStaging.ActivateAs(SignaturePath(directory))) {
+                return InstallResult::ActivationFailure;
+            }
+        } // Release the exclusive signature handle before verification opens it.
 
         if (VerifyRustEngineFileHandle(staging.get(), SignaturePath(directory).c_str()) !=
             RustEngineTrustStatus::Trusted) {
@@ -349,7 +352,7 @@ HRESULT CALLBACK AdvancedEngineDialogCallback(
 }
 
 void OpenManualInstallFlow(HWND parent) {
-    const std::wstring url = BuildAdvancedEngineReleaseUrl();
+    const std::wstring url = BuildAdvancedEngineReleasePageUrl();
     const std::wstring directory = ModuleDirectory(nullptr);
 
     // Delegates the request to the default browser. VKey performs no network

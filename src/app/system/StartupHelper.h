@@ -10,6 +10,7 @@
 #include <Windows.h>
 #include <ShlObj.h>
 #include <shellapi.h>
+#include <sddl.h>
 #include <exdisp.h>       // IShellWindows
 // Windows.h defines `ShellExecute` as a macro aliasing `ShellExecuteA/W`.
 // If the macro is active when <shldisp.h> is preprocessed, MIDL-declared
@@ -22,6 +23,7 @@
 #include <servprov.h>     // IServiceProvider
 #include <memory>
 #include <string>
+#include <vector>
 #include "UpdateSecurity.h"
 #include "core/config/ConfigManager.h"
 #include "core/SystemConfig.h"
@@ -34,6 +36,7 @@ inline constexpr const wchar_t* STARTUP_REG_KEY = L"Software\\Microsoft\\Windows
 inline constexpr const wchar_t* STARTUP_REG_VALUE = L"VKey";
 inline constexpr const wchar_t* STARTUP_TASK_NAME = L"VKey";
 inline constexpr const wchar_t* WATCHDOG_TASK_NAME = L"\\VKey\\Watchdog";
+inline constexpr const wchar_t* WATCHDOG_TASK_FLAG = L"--watchdog-task";
 
 // Forward declaration — defined below. RemoveScheduledTask() calls this before
 // its definition appears in the file.
@@ -182,18 +185,13 @@ inline void RemoveRegistryStartup() noexcept {
     wchar_t exePath[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
 
-    // Get current username BEFORE elevation — ensures task triggers for the
-    // logged-in user, not the admin account used for UAC elevation.
-    wchar_t username[256] = {};
-    DWORD usernameSize = 256;
-    GetUserNameW(username, &usernameSize);
-
     std::wstring exeStr(exePath);
     std::wstring dirStr = exeStr.substr(0, exeStr.find_last_of(L"\\/"));
 
     // Secure memory-only PowerShell script string (No %TEMP% XML files required -> 100% secure from TOCTOU)
     // Uses Cmdlets to fully configure Triggers, Actions, and disabled Battery constraints natively.
-    std::wstring ps1Args = L"-NoProfile -WindowStyle Hidden -Command \"";
+    std::wstring ps1Args = L"-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"";
+    ps1Args += L"$ErrorActionPreference = 'Stop'; ";
     // -Execute takes the BARE path. Task Scheduler stores it in the structured
     // <Command> field (launched as lpApplicationName, not a command line), so
     // embedded quotes would become literal path chars → 0x2 "cannot find the
@@ -203,7 +201,15 @@ inline void RemoveRegistryStartup() noexcept {
     ps1Args += L"$T = New-ScheduledTaskTrigger -AtLogOn; ";
     ps1Args += L"$T.Delay = 'PT5S'; ";
     ps1Args += L"$S = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit 0; ";
-    ps1Args += L"$P = New-ScheduledTaskPrincipal -UserId '" + EscapePowerShellSingleQuote(username) + L"' -LogonType Interactive -RunLevel Highest; ";
+    // Use the BUILTIN\Administrators group principal rather than a specific -UserId.
+    // -UserId with GetUserNameW breaks on Microsoft Accounts (email truncation),
+    // domain accounts, and Windows Hello PIN/biometrics logons where Task Scheduler
+    // fails to resolve interactive credentials (issue #261). The group principal
+    // dynamically executes for any local administrator who logs in interactively.
+    // Named by well-known SID: the group's display name is localized on some
+    // Windows editions (e.g. "Administratoren"), where 'BUILTIN\Administrators'
+    // does not resolve.
+    ps1Args += L"$P = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-544' -RunLevel Highest; ";
     ps1Args += L"Register-ScheduledTask -TaskName '" + std::wstring(STARTUP_TASK_NAME) + L"' -Action $A -Trigger $T -Settings $S -Principal $P -Force\"";
 
     SHELLEXECUTEINFOW sei = { sizeof(sei) };
@@ -216,7 +222,7 @@ inline void RemoveRegistryStartup() noexcept {
     if (!ShellExecuteExW(&sei)) return false;
 
     if (sei.hProcess) {
-        WaitForSingleObject(sei.hProcess, 10000);  // PowerShell + Register-ScheduledTask can be slow
+        WaitForSingleObject(sei.hProcess, 15000);  // PowerShell + Register-ScheduledTask can be slow
         DWORD exitCode = 1;
         GetExitCodeProcess(sei.hProcess, &exitCode);
         CloseHandle(sei.hProcess);
@@ -227,10 +233,19 @@ inline void RemoveRegistryStartup() noexcept {
 
 /// Create the watchdog scheduled task at \VKey\Watchdog.
 /// Differences from CreateScheduledTaskElevated():
-///   - Action: VKeyWatchdog.exe (sibling of VKey.exe in install dir)
-///   - Trigger delay: 10s (let VKey come up first; main task uses 5s)
-///   - Settings: RestartCount=3, RestartInterval=1min for self-healing if
-///     the watchdog itself dies (Win10+).
+///   - Action: current VKey executable with --watchdog-task. The app verifies
+///     the companion before launching it; Task Scheduler must not bypass that gate.
+///   - Trigger: -AtLogOn restricted to the specific user's SID (delay 10s).
+///   - Principal: Per-user SID with -LogonType Interactive -RunLevel Limited.
+///     Unlike CreateScheduledTaskElevated() (which uses BUILTIN\Administrators
+///     group S-1-5-32-544), the watchdog must run only for the user who enabled
+///     it, not every user on the system (BUILTIN\Users S-1-5-32-545 ran for all).
+///     We identify the user by SID string rather than name because -UserId with
+///     GetUserNameW breaks on Microsoft Accounts, domain accounts, and PIN logons
+///     (issue #261). The SID is read from the calling process token before
+///     spawning elevated PowerShell so over-the-shoulder UAC doesn't register the
+///     task under a different administrator account.
+///   - Settings: RestartCount=3, RestartInterval=1min if the launch fails.
 ///   - Principal RunLevel: Limited (NOT Highest) — process supervisor doesn't
 ///     need elevation. Keeps AV calm, no UAC needed at logon.
 ///   - Task path: \VKey\Watchdog (user-root folder, visible in Task
@@ -239,24 +254,75 @@ inline void RemoveRegistryStartup() noexcept {
 [[nodiscard]] inline bool CreateWatchdogScheduledTask() noexcept {
     std::wstring dirStr = GetInstallDirectory();
     if (dirStr.empty()) return false;
-    std::wstring watchdogPath = dirStr + L"\\VKeyWatchdog.exe";
+    wchar_t appPath[MAX_PATH] = {};
+    const DWORD appLength = GetModuleFileNameW(nullptr, appPath, MAX_PATH);
+    if (appLength == 0 || appLength >= MAX_PATH) return false;
 
-    // Get current username BEFORE elevation — ensures task triggers for the
-    // logged-in user, not the admin account used for UAC elevation.
-    wchar_t username[256] = {};
-    DWORD usernameSize = 256;
-    GetUserNameW(username, &usernameSize);
+    // Over-the-shoulder UAC may elevate as a different admin account, so the
+    // user's SID must be resolved in the calling process rather than PowerShell.
+    std::wstring userSid;
+    {
+        HANDLE hToken = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+            return false;
+        }
+        struct ScopedTokenHandle {
+            HANDLE h = nullptr;
+            ~ScopedTokenHandle() noexcept {
+                if (h && h != INVALID_HANDLE_VALUE) {
+                    CloseHandle(h);
+                }
+            }
+        } tokenGuard{hToken};
+
+        DWORD tokenInfoLen = 0;
+        (void)GetTokenInformation(hToken, TokenUser, nullptr, 0, &tokenInfoLen);
+        if (tokenInfoLen == 0) {
+            return false;
+        }
+
+        std::vector<BYTE> tokenUserBuffer(tokenInfoLen);
+        if (!GetTokenInformation(hToken, TokenUser, tokenUserBuffer.data(), tokenInfoLen, &tokenInfoLen)) {
+            return false;
+        }
+
+        auto* pTokenUser = reinterpret_cast<TOKEN_USER*>(tokenUserBuffer.data());
+        LPWSTR rawSidString = nullptr;
+        if (!ConvertSidToStringSidW(pTokenUser->User.Sid, &rawSidString)) {
+            return false;
+        }
+        struct ScopedSidString {
+            HLOCAL p = nullptr;
+            ~ScopedSidString() noexcept {
+                if (p) {
+                    LocalFree(p);
+                }
+            }
+        } sidGuard{rawSidString};
+
+        userSid = rawSidString;
+    }
+
+    if (userSid.empty() || !userSid.starts_with(L"S-")) {
+        return false;
+    }
+    for (wchar_t c : userSid) {
+        if (c != L'S' && c != L'-' && (c < L'0' || c > L'9')) {
+            return false;
+        }
+    }
 
     // PowerShell registers the task. Watchdog runs at LIMITED RunLevel
     // (NOT Highest) — keeps AV calm, no UAC needed at logon.
-    std::wstring ps1Args = L"-NoProfile -WindowStyle Hidden -Command \"";
+    std::wstring ps1Args = L"-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"";
+    ps1Args += L"$ErrorActionPreference = 'Stop'; ";
     // Bare path — see CreateScheduledTaskElevated() (issue #210): quotes in the
     // <Command> field cause 0x2 "cannot find the file" at logon.
-    ps1Args += L"$A = New-ScheduledTaskAction -Execute '" + EscapePowerShellSingleQuote(watchdogPath) + L"' -WorkingDirectory '" + EscapePowerShellSingleQuote(dirStr) + L"'; ";
-    ps1Args += L"$T = New-ScheduledTaskTrigger -AtLogOn; ";
+    ps1Args += L"$A = New-ScheduledTaskAction -Execute '" + EscapePowerShellSingleQuote(appPath) + L"' -Argument '" + WATCHDOG_TASK_FLAG + L"' -WorkingDirectory '" + EscapePowerShellSingleQuote(dirStr) + L"'; ";
+    ps1Args += L"$T = New-ScheduledTaskTrigger -AtLogOn -User '" + userSid + L"'; ";
     ps1Args += L"$T.Delay = 'PT10S'; ";  // 10s after logon — let VKey come up first
     ps1Args += L"$S = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit 0 -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1); ";
-    ps1Args += L"$P = New-ScheduledTaskPrincipal -UserId '" + EscapePowerShellSingleQuote(username) + L"' -LogonType Interactive -RunLevel Limited; ";
+    ps1Args += L"$P = New-ScheduledTaskPrincipal -UserId '" + userSid + L"' -LogonType Interactive -RunLevel Limited; ";
     ps1Args += L"Register-ScheduledTask -TaskName '" + std::wstring(WATCHDOG_TASK_NAME) + L"' -Action $A -Trigger $T -Settings $S -Principal $P -Force\"";
 
     SHELLEXECUTEINFOW sei = { sizeof(sei) };
@@ -269,7 +335,7 @@ inline void RemoveRegistryStartup() noexcept {
     if (!ShellExecuteExW(&sei)) return false;
 
     if (sei.hProcess) {
-        WaitForSingleObject(sei.hProcess, 10000);
+        WaitForSingleObject(sei.hProcess, 15000);
         DWORD exitCode = 1;
         GetExitCodeProcess(sei.hProcess, &exitCode);
         CloseHandle(sei.hProcess);

@@ -35,6 +35,7 @@
 #include "system/PendingDllApply.h"
 #include "system/ToastPopup.h"
 #include "system/WatchdogController.h"
+#include "system/BrowserExtensionController.h"
 #include "helpers/AppHelpers.h"
 
 #include "classic/ClassicSettingsDialog.h"
@@ -159,6 +160,7 @@ static void ShutdownLexiconWireMapping() noexcept {
 static HotkeyManager::SlotId g_toggleHotkeySlot = 0;
 static HotkeyManager::SlotId g_convertHotkeySlot = 0;
 static WatchdogController g_watchdog;  // Owns heartbeat + Task Scheduler entry + VKeyWatchdog.exe lifecycle
+static BrowserExtensionController g_browserExtension;  // Owns browser native-messaging registration
 static HINSTANCE g_hInstance = nullptr;
 
 // Forward declarations
@@ -462,8 +464,13 @@ static void OnMenuCommand(TrayMenuId id) {
             RestartWindowsWithPrompt(g_trayIcon.GetMessageWindow());
             break;
 
+        case TrayMenuId::ExtensionWatchdog:
         case TrayMenuId::ToggleWatchdog:
             g_watchdog.Toggle(g_trayIcon.GetMessageWindow());
+            break;
+
+        case TrayMenuId::ExtensionBrowser:
+            g_browserExtension.Toggle(g_trayIcon.GetMessageWindow());
             break;
 
         default: {
@@ -508,6 +515,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     });
 
     // ── Command-line routes (shared with main build) ──
+
+    if (BrowserHost::IsNativeMessagingInvocation()) {
+        return BrowserHost::RunTrustedNativeMessagingHost();
+    }
+
+    if (HasCmdlineFlag(lpCmdLine, WATCHDOG_TASK_FLAG)) {
+        return WatchdogController::RunScheduledTask();
+    }
 
     if (lpCmdLine && wcsstr(lpCmdLine, L"--unregister-tsf") != nullptr) {
         CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -600,8 +615,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
         }
     }
 
-    (void)BrowserHost::RegisterNativeMessagingHost();
-
     // ── Initialization ──
 
     OleInitialize(nullptr);
@@ -648,11 +661,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     // _old_version/ (the parking dir used by ApplyPendingDllUpdate).
     PendingDllState pendingDllState = ApplyPendingDllUpdate();
 
-    // Clean up leftover update files
-    bool updateJustCompleted = CleanupOldUpdateFiles();
-    if (updateJustCompleted) {
-        NEXTKEY_LOG(L"Update completed successfully, old files cleaned up");
-    }
+    // A rollback receipt overrides success. Backup cleanup is housekeeping and
+    // must never be used as evidence that installation succeeded.
+    const auto updateOutcome = ConsumeInstalledUpdateOutcome();
+    const bool updateJustFailed = updateOutcome == UpdateOutcome::Failed;
+    const bool updateJustCompleted = updateOutcome == UpdateOutcome::Succeeded;
+    (void)CleanupOldUpdateFiles();
 
     // Ensure startup registration is intact (never prompts UAC, same logic as main.cpp)
     if (EnsureStartupRegistration(systemConfig.runAtStartup, systemConfig.runAsAdmin)) {
@@ -665,21 +679,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     // heartbeat thread (single-instance mutex inside watchdog dedups against
     // the logon-trigger task, so re-launch is safe).
     g_watchdog.Init(systemConfig);
-
-    // Check for update failure marker
-    bool updateJustFailed = false;
-    {
-        wchar_t exePath[MAX_PATH] = {};
-        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-        std::wstring exeDir(exePath);
-        auto pos = exeDir.find_last_of(L"\\/");
-        if (pos != std::wstring::npos) exeDir = exeDir.substr(0, pos);
-        std::wstring markerPath = exeDir + L"\\_update_failed";
-        if (DeleteFileW(markerPath.c_str())) {
-            updateJustFailed = true;
-            NEXTKEY_LOG(L"Update failed marker found and cleaned up");
-        }
-    }
+    g_browserExtension.Init(systemConfig);
 
     // ── SharedState ──
 
@@ -800,7 +800,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
             (ff & FeatureFlags::MACRO_ENABLED) != 0,
             state.inputMethod,
             static_cast<CodeTable>(state.codeTable),
-            g_watchdog.IsEnabled()
+            g_watchdog.IsEnabled(),
+            g_browserExtension.IsEnabled()
         };
     });
 

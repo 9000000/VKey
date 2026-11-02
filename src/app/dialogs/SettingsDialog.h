@@ -79,8 +79,11 @@ private:
     void saveToToml();         // Deferred: TOML file write
     void saveUISettings();
     void saveSystemSettings();
+    void applyDocumentSettings();
+    void initializeWindow();
     void initializeUI();
 
+    bool uiInitialized_ = false;
     bool configDirty_ = false;
 
     // Event handlers for specific settings
@@ -90,6 +93,7 @@ private:
 
     // Window control
     void togglePin();
+    void notifySubdialogPinState();
 
     // UI helpers
     void setToggleState(const std::wstring& id, bool checked);
@@ -128,6 +132,7 @@ private:
     bool isExpanded_ = false;
     bool isPinned_ = false;
     bool forceLightTheme_ = false;
+    bool wasMinimized_ = false; // Track minimization to force repaint on restore
 
     // #226: cached result of measureMaxAdvancedContentHeight(), computed once the
     // first time the Advanced panel is actually shown (measuring needs the panel's

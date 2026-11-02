@@ -28,6 +28,15 @@
 
 ## <span id="faq">❓ Câu hỏi thường gặp (FAQ)</span>
 
+### <span id="eset-browser">🛡️ Q. VKey gõ được trong Notepad/Word nhưng không gõ được tiếng Việt trên Edge/Chrome khi có ESET?</span>
+**A.** Hãy kiểm tra tiện ích và tính năng bảo vệ trình duyệt của ESET. Trong [issue #229](https://github.com/phatMT97/VKey/issues/229), người dùng đã khắc phục bằng cách thêm VKey vào **Browser protection allowlist** rồi khởi động lại trình duyệt.
+
+1. Mở `edge://extensions` (Edge), `chrome://extensions` (Chrome) hoặc `about:addons` → **Extensions** (Firefox); tìm tiện ích có tên **ESET**, chẳng hạn **ESET Browser Privacy & Security**. Dù không thấy tiện ích, vẫn kiểm tra **Browser protection / Safe Banking & Browsing** trong ứng dụng ESET trên máy.
+2. Mở ESET → **Advanced setup** (`F5`) → **Protections → Browser protection → Browser protection allowlist → Edit → Add**. Thêm đúng đường dẫn `VKey.exe` đang chạy, hoặc `VKeyClassic.exe` nếu dùng Classic. Nếu dùng [TSF](#tsf-mode), thêm cả `VKeyTSF.dll`; chỉ thêm DLL này chưa đủ cho chế độ Hook mặc định.
+3. Lưu bằng **OK / Apply**, thoát hoàn toàn trình duyệt rồi mở lại và thử gõ tiếng Việt. Cửa sổ ẩn danh hoặc chạy VKey bằng quyền Administrator có thể vẫn bị ESET chặn.
+
+👉 Xem [hướng dẫn ESET chi tiết, cách tìm đường dẫn file và xử lý nếu vẫn lỗi](ANTIVIRUS.md#eset-browser).
+
 ### 🎮 Q. Tôi có thể vừa gõ tiếng Việt vừa chơi game mà không sợ bị dính phím không?
 **A.** Được, nhưng cần bật **Chế độ game** cho game đó trước.
 
@@ -166,10 +175,9 @@ VKey tích hợp sâu công nghệ TSF của Windows mang lại độ tương th
 ### <span id="macro">🚀 12. Gõ tắt (Macro)</span>
 - 💬 Hỗ trợ lưu trữ các đoạn gõ tắt dài tới **20.000 ký tự**, hỗ trợ xuống dòng thoải mái.
 - 🎯 Linh hoạt tùy chọn các phím để kích hoạt (trigger) gõ tắt như: phím Cách (`Space`), `Enter`, `Tab` hoặc các phím điều hướng.
-- 🔠 **Tự động viết hoa thông minh theo phím tắt:** Khi bạn bật chế độ tự động viết hoa (Auto Capitalization), bộ gõ sẽ tự động điều chỉnh kiểu viết hoa của cụm từ mở rộng dựa theo phím tắt bạn gõ trên bàn phím (áp dụng cho các từ gõ tắt được thiết lập viết thường trong bảng cấu hình):
-  - **Gõ chữ thường** (Ví dụ: `lhq`): Xuất ra toàn bộ chữ thường theo cấu hình (`liên hiệp quốc`).
-  - **Viết hoa chữ cái đầu** (Ví dụ: `Lhq`): Tự động viết hoa chữ cái đầu tiên của từng từ trong cụm từ mở rộng (`Liên Hiệp Quốc`).
-  - **Viết hoa toàn bộ** (Ví dụ: `LHQ`): Tự động viết hoa toàn bộ cụm từ mở rộng (`LIÊN HIỆP QUỐC`).
+- 🔠 **Tự động viết hoa theo phím tắt:** Với `bbh = bún bò Huế`, gõ `bbh` giữ nguyên nội dung, `Bbh` ra `Bún bò Huế`, `BBH` ra `BÚN BÒ HUẾ`. Bật thêm **Viết hoa đầu từng từ** nếu muốn `Bbh` ra `Bún Bò Huế`. Chữ hoa do tùy chọn viết hoa đầu câu tự tạo chỉ nâng đầu cụm. Xem [quy tắc gõ tắt và viết hoa](MACRO_CASING.md).
+- ↩️ **Khôi phục từ gõ tắt khi nhấn Backspace:** Ngay sau khi bung nội dung đầy đủ (ví dụ `bbh` + Space ra `bún bò Huế `), nếu bạn nhấn Backspace thì VKey sẽ xoá toàn bộ cụm từ đã bung và khôi phục lại từ gõ tắt ban đầu (`bbh`) thay vì phải xoá lùi từng chữ. Bật/tắt trong tab **Gõ tắt** (mặc định tắt).
+  - Nhấn trong vòng 4 giây, trước khi gõ phím khác hoặc đổi vị trí nhập. Undo chỉ được giữ với trigger chèn chữ như Space/dấu câu, không áp dụng sau Enter/Tab/phím điều hướng. Với Hook, undo hỗ trợ macro Unicode một dòng gửi trực tiếp; macro gửi qua clipboard, bảng mã cũ hoặc ký tự tổ hợp/emoji vẫn dùng Backspace thông thường.
 
 ### <span id="watchdog">🔁 13. Tự khởi động lại (Watchdog)</span>
 - *Mặc định: Tắt.*

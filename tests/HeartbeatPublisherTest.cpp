@@ -79,6 +79,44 @@ TEST(HeartbeatPublisherTest, RestartAfterStop) {
     pub.Stop();
 }
 
+TEST(HeartbeatPublisherTest, WatchdogRetainsQuickQuitAfterPublisherStops) {
+    // The supervisor starts first and holds the events through its initial
+    // grace period. A quick tray quit must remain visible after app teardown.
+    HANDLE graceful = CreateEventW(nullptr, TRUE, FALSE, GRACEFUL_SHUTDOWN_EVENT_NAME);
+    HANDLE heartbeat = CreateEventW(nullptr, FALSE, FALSE, HEARTBEAT_EVENT_NAME);
+    ASSERT_NE(graceful, nullptr);
+    ASSERT_NE(heartbeat, nullptr);
+    HeartbeatPublisher pub;
+    ASSERT_TRUE(pub.Start());
+    pub.SignalGracefulShutdown();
+    pub.Stop();
+    // Also queue a heartbeat: explicit quit must win over a stale pulse.
+    ASSERT_TRUE(SetEvent(heartbeat));
+    EXPECT_EQ(WaitForWatchdogSignal(graceful, heartbeat, 100), WAIT_OBJECT_0);
+    CloseHandle(heartbeat);
+    CloseHandle(graceful);
+}
+
+TEST(HeartbeatPublisherTest, NewPublisherClearsPreviousGracefulShutdown) {
+    HANDLE graceful = CreateEventW(nullptr, TRUE, TRUE, GRACEFUL_SHUTDOWN_EVENT_NAME);
+    ASSERT_NE(graceful, nullptr);
+    HeartbeatPublisher pub;
+    ASSERT_TRUE(pub.Start());
+    EXPECT_EQ(WaitForSingleObject(graceful, 0), WAIT_TIMEOUT);
+    pub.Stop();
+    CloseHandle(graceful);
+}
+
+TEST(HeartbeatPublisherTest, QuitSignalsExistingSupervisorWhenPublisherWasNotStarted) {
+    HANDLE graceful = CreateEventW(nullptr, TRUE, FALSE, GRACEFUL_SHUTDOWN_EVENT_NAME);
+    ASSERT_NE(graceful, nullptr);
+    ResetEvent(graceful);
+    HeartbeatPublisher pub;
+    pub.SignalGracefulShutdown();
+    EXPECT_EQ(WaitForSingleObject(graceful, 0), WAIT_OBJECT_0);
+    CloseHandle(graceful);
+}
+
 }  // namespace NextKey
 
 #endif  // _WIN32

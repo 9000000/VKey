@@ -36,8 +36,8 @@ static int SubDialogWin10Pad() noexcept {
 
 SciterSubDialog::SciterSubDialog(const SubDialogConfig& config)
     : sciter::window(SW_MAIN, RECT{-10000, -10000,
-        -10000 + ScaleHelper::scale(config.baseWidth + SubDialogWin10Pad()),
-        -10000 + ScaleHelper::scale(config.baseHeight + SubDialogWin10Pad())})
+        -10000 + ScaleHelper::scaleForWindow(config.parentHwnd, config.baseWidth, SubDialogWin10Pad()),
+        -10000 + ScaleHelper::scaleForWindow(config.parentHwnd, config.baseHeight, SubDialogWin10Pad())})
     , config_(config) {
 
     s_instance = this;
@@ -94,6 +94,9 @@ SciterSubDialog::SciterSubDialog(const SubDialogConfig& config)
 
     // Subclass for dragging and close
     SetWindowSubclass(get_hwnd(), SubclassProc, 1, reinterpret_cast<DWORD_PTR>(this));
+    if (config_.parentHwnd && IsWindow(config_.parentHwnd)) {
+        SetPropW(get_hwnd(), VKEY_SUBDIALOG_PARENT_PROP, config_.parentHwnd);
+    }
 
     // Theme-aware DWM mode + rounded corners + blur (after subclass)
     HWND hwnd = get_hwnd();
@@ -123,13 +126,8 @@ SciterSubDialog::SciterSubDialog(const SubDialogConfig& config)
         sciter::dom::element rootEl2(get_root());
         sciter::dom::element mainContainer = rootEl2.find_first("#main-container");
         if (mainContainer.is_valid()) {
-            wchar_t bgColor[64];
-            if (isDark) {
-                swprintf_s(bgColor, L"rgba(18, 20, 28, %.2f)", opacity);
-            } else {
-                swprintf_s(bgColor, L"rgba(255, 255, 255, %.2f)", opacity);
-            }
-            mainContainer.set_style_attribute("background-color", bgColor);
+            mainContainer.set_style_attribute("background-color",
+                SciterHelper::FormatBackgroundColor(isDark, opacity).c_str());
         }
     }
 
@@ -143,11 +141,9 @@ SciterSubDialog::SciterSubDialog(const SubDialogConfig& config)
     // Without this, the background stays solid black instead of blurred/transparent.
     expand();
 
-    // Finally, move the initialized window onscreen (it was created at -10000, -10000)
-    RECT rc;
-    GetWindowRect(get_hwnd(), &rc);
-    int winWidth = rc.right - rc.left;
-    int winHeight = rc.bottom - rc.top;
+    // Finally, size and move the initialized window onscreen (it was created at -10000, -10000)
+    int winWidth = ScaleHelper::scaleForWindow(config_.parentHwnd, config_.baseWidth, SubDialogWin10Pad());
+    int winHeight = ScaleHelper::scaleForWindow(config_.parentHwnd, config_.baseHeight, SubDialogWin10Pad());
 
     int posX, posY;
     HMONITOR monitor;
@@ -182,8 +178,18 @@ SciterSubDialog::SciterSubDialog(const SubDialogConfig& config)
     if (posX < workArea.left) posX = workArea.left;
     if (posY < workArea.top)  posY = workArea.top;
 
-    SetWindowPos(get_hwnd(), config_.topmost ? HWND_TOPMOST : HWND_NOTOPMOST,
-                 posX, posY, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+    bool isTopmost = config_.topmost;
+    if (config_.parentHwnd && IsWindow(config_.parentHwnd)) {
+        // Inherit TOPMOST only if parent window is currently TOPMOST (e.g. Settings pinned)
+        LONG_PTR exStyle = GetWindowLongPtrW(config_.parentHwnd, GWL_EXSTYLE);
+        if (exStyle & WS_EX_TOPMOST) {
+            isTopmost = true;
+        }
+    }
+
+    SetWindowPos(get_hwnd(), isTopmost ? HWND_TOPMOST : HWND_NOTOPMOST,
+                 posX, posY, winWidth, winHeight, SWP_SHOWWINDOW);
+    SetForegroundWindow(get_hwnd());
 
     // Force taskbar presence while DWM transitions are still disabled (avoids flicker)
     SciterHelper::ForceTaskbarPresence(get_hwnd(), IDI_APP);
@@ -197,14 +203,21 @@ SciterSubDialog::~SciterSubDialog() {
     s_instance = nullptr;
 }
 
-void SciterSubDialog::Show() {
-    MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+void SciterSubDialog::setPinned(bool pinned) {
+    config_.topmost = pinned;
+    syncParentPin();
+}
 
-        if (!IsWindow(get_hwnd())) break;
-    }
+void SciterSubDialog::syncParentPin() {
+    const bool parentPinned = config_.parentHwnd && IsWindow(config_.parentHwnd)
+        && (GetWindowLongPtrW(config_.parentHwnd, GWL_EXSTYLE) & WS_EX_TOPMOST);
+    SetWindowPos(get_hwnd(), config_.topmost || parentPinned ? HWND_TOPMOST : HWND_NOTOPMOST,
+                 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+void SciterSubDialog::Show() {
+    // Include Sciter's deferred mouse/idle processing for native tooltips.
+    sciter::application::run();
 }
 
 LRESULT SciterSubDialog::on_load_data(LPSCN_LOAD_DATA pnmld) {
@@ -270,16 +283,34 @@ LRESULT CALLBACK SciterSubDialog::SubclassProc(
         (void)SciterHelper::GuardTaskbarStyle(wParam, lParam);
     }
 
+    // Handle window restore from minimized: force Sciter to repaint (#258)
+    if (s_instance
+        && SciterHelper::ConsumeRestoreFromMinimized(msg, wParam, s_instance->wasMinimized_)) {
+        SciterHelper::RepaintAfterRestore(hwnd);
+    }
+
     if (msg == WM_CLOSE) {
+        RemovePropW(hwnd, VKEY_SUBDIALOG_PARENT_PROP);
         if (s_instance) {
             s_instance->onBeforeClose();
+            HandoffFocusToOwner(s_instance->config_.parentHwnd);
         }
+        ShowWindow(hwnd, SW_HIDE);
         RemoveWindowSubclass(hwnd, SubclassProc, 1);
         ExitProcess(0);
     }
 
     if (msg == WM_DESTROY) {
+        RemovePropW(hwnd, VKEY_SUBDIALOG_PARENT_PROP);
         RemoveWindowSubclass(hwnd, SubclassProc, 1);
+        return 0;
+    }
+
+    if (msg == WM_VKEY_PARENT_PIN_CHANGED) {
+        if (s_instance && reinterpret_cast<HWND>(lParam) == s_instance->config_.parentHwnd) {
+            // Read current state so queued notifications cannot apply a stale pin.
+            s_instance->syncParentPin();
+        }
         return 0;
     }
 
@@ -306,13 +337,8 @@ LRESULT CALLBACK SciterSubDialog::SubclassProc(
                     sciter::dom::element root = s_instance->get_root();
                     sciter::dom::element container = root.find_first("#main-container");
                     if (container.is_valid()) {
-                        wchar_t bgColor[64];
-                        if (dark) {
-                            swprintf_s(bgColor, L"rgba(18, 20, 28, %.2f)", opacity);
-                        } else {
-                            swprintf_s(bgColor, L"rgba(255, 255, 255, %.2f)", opacity);
-                        }
-                        container.set_style_attribute("background-color", bgColor);
+                        container.set_style_attribute("background-color",
+                            SciterHelper::FormatBackgroundColor(dark, opacity).c_str());
                     }
                 }
             }

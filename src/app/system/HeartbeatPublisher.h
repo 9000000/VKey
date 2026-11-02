@@ -17,13 +17,12 @@
 #ifdef _WIN32
 
 #include <Windows.h>
+#include "core/WatchdogEvents.h"
 #include <atomic>
 #include <thread>
 
 namespace NextKey {
 
-inline constexpr const wchar_t* HEARTBEAT_EVENT_NAME = L"Local\\VKeyHeartbeat";
-inline constexpr const wchar_t* GRACEFUL_SHUTDOWN_EVENT_NAME = L"Local\\VKeyGracefulShutdown";
 inline constexpr DWORD HEARTBEAT_INTERVAL_MS = 30'000;
 
 class HeartbeatPublisher {

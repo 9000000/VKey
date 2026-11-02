@@ -29,7 +29,8 @@ public:
     /// Load config from file, returns nullopt if file doesn't exist or is invalid
     [[nodiscard]] static std::optional<TypingConfig> LoadFromFile(const std::wstring& path);
 
-    /// Save config to file, returns true on success
+    /// Durably replace config (flush + atomic rename). An existing file that is
+    /// not valid TOML is moved to `<path>.corrupt` first. Returns false on I/O failure.
     [[nodiscard]] static bool SaveToFile(const std::wstring& path, const TypingConfig& config);
 
     /// Get the config file path (exe dir or %APPDATA% fallback).

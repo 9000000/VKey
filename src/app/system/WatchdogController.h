@@ -20,7 +20,7 @@ struct SystemConfig;  // forward decl — definition in core/SystemConfig.h
 class WatchdogController {
 public:
     WatchdogController() = default;
-    ~WatchdogController() = default;
+    ~WatchdogController();
 
     WatchdogController(const WatchdogController&) = delete;
     WatchdogController& operator=(const WatchdogController&) = delete;
@@ -38,16 +38,21 @@ public:
     /// Idempotent — signals "user quit, do not respawn" to the watchdog.
     void SignalGracefulShutdown() noexcept;
 
+    /// Task Scheduler entry point: check the saved setting and the embedded
+    /// companion hash before starting the watchdog.
+    [[nodiscard]] static int RunScheduledTask() noexcept;
+
     [[nodiscard]] bool IsEnabled() const noexcept {
         return enabled_.load(std::memory_order_relaxed);
     }
 
 private:
-    static void LaunchWatchdogProcess() noexcept;
+    [[nodiscard]] static bool LaunchWatchdogProcess(HANDLE* processHandle = nullptr) noexcept;
     static void KillWatchdogProcess() noexcept;
 
     HeartbeatPublisher heartbeat_;
     std::atomic<bool> enabled_{false};
+    HANDLE watchdogProcess_ = nullptr;
 };
 
 }  // namespace NextKey

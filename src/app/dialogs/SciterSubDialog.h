@@ -46,13 +46,19 @@ protected:
     /// Access the config
     const SubDialogConfig& config() const { return config_; }
 
+    /// Set this dialog's own pin independently of the inherited Settings pin.
+    void setPinned(bool pinned);
+
 private:
+    void syncParentPin();
+
     static LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
                                          LPARAM lParam, UINT_PTR uIdSubclass,
                                          DWORD_PTR dwRefData);
 
     SubDialogConfig config_;
     std::wstring uiBasePath_;
+    bool wasMinimized_ = false;
 
     // Single instance per process (subdialogs run as separate processes)
     static SciterSubDialog* s_instance;

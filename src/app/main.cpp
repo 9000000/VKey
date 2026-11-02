@@ -30,6 +30,7 @@
 #include "system/HotkeyManager.h"
 #include "system/HotkeyWiring.h"
 #include "system/WatchdogController.h"
+#include "system/BrowserExtensionController.h"
 #include "core/config/LexiconTransaction.h"
 #include "core/config/LexiconValidation.h"
 #include "core/config/SpellExclusionCanonicalizer.h"
@@ -71,6 +72,7 @@ static SharedStateManager g_sharedState;  // Shared memory for Settings subproce
 static Wire::LexiconWireManager g_wireManager;  // Shared memory wire manager for lexicon
 static HotkeyManager g_hotkeyManager;
 static WatchdogController g_watchdog;  // Owns heartbeat + Task Scheduler entry + VKeyWatchdog.exe lifecycle
+static BrowserExtensionController g_browserExtension;  // Owns browser native-messaging registration
 
 static bool PublishCurrentLexiconToWire() {
     if (!g_wireManager.IsWritable()) return false;
@@ -260,6 +262,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     // Command-line Router
     // ═══════════════════════════════════════════════════════════
 
+    if (BrowserHost::IsNativeMessagingInvocation()) {
+        return BrowserHost::RunTrustedNativeMessagingHost();
+    }
+
+    if (HasCmdlineFlag(lpCmdLine, WATCHDOG_TASK_FLAG)) {
+        return WatchdogController::RunScheduledTask();
+    }
+
     // TSF Unregistration (runs elevated, then exits)
     // NOTE: Must check --unregister-tsf BEFORE --register-tsf
     // because "--register-tsf" is a substring of "--unregister-tsf"
@@ -418,11 +428,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
         }
     }
 
-    // Per-user and idempotent. A portable build without the companion binary
-    // simply skips registration; normal VKey startup must never depend on the
-    // browser extension being installed.
-    (void)BrowserHost::RegisterNativeMessagingHost();
-
     // Remove any HKCU CLSID override that malware may have planted to hijack TSF DLL loading
     CleanupHkcuClsidOverride();
 
@@ -461,12 +466,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     // returned above. Result published into SharedState flags after Create().
     PendingDllState pendingDllState = ApplyPendingDllUpdate();
 
-    // Clean up leftover files from a previous update.
-    // If files were cleaned up, it means we just finished an update.
-    bool updateJustCompleted = CleanupOldUpdateFiles();
-    if (updateJustCompleted) {
-        NEXTKEY_LOG(L"Update completed successfully, old files cleaned up");
-    }
+    // A rollback receipt overrides success. Backup cleanup is housekeeping and
+    // must never be used as evidence that installation succeeded.
+    const auto updateOutcome = ConsumeInstalledUpdateOutcome();
+    const bool updateJustFailed = updateOutcome == UpdateOutcome::Failed;
+    const bool updateJustCompleted = updateOutcome == UpdateOutcome::Succeeded;
+    (void)CleanupOldUpdateFiles();
 
     // Ensure startup registration is intact (never prompts UAC).
     // If admin task was lost, falls back to registry and syncs config.
@@ -480,21 +485,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     // heartbeat thread (single-instance mutex inside watchdog dedups against
     // the logon-trigger task, so re-launch is safe).
     g_watchdog.Init(systemConfig);
+    g_browserExtension.Init(systemConfig);
 
-    // Check for update failure marker (installer failed and relaunched us)
-    bool updateJustFailed = false;
-    {
-        wchar_t exePath[MAX_PATH] = {};
-        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-        std::wstring exeDir(exePath);
-        auto pos = exeDir.find_last_of(L"\\/");
-        if (pos != std::wstring::npos) exeDir = exeDir.substr(0, pos);
-        std::wstring markerPath = exeDir + L"\\_update_failed";
-        if (DeleteFileW(markerPath.c_str())) {
-            updateJustFailed = true;
-            NEXTKEY_LOG(L"Update failed marker found and cleaned up");
-        }
-    }
 
 #ifdef VKEY_HOOK_ENGINE
     // ═══════════════════════════════════════════════════════════
@@ -669,7 +661,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
             (ff & FeatureFlags::MACRO_ENABLED) != 0,
             state.inputMethod,
             static_cast<CodeTable>(state.codeTable),
-            g_watchdog.IsEnabled()
+            g_watchdog.IsEnabled(),
+            g_browserExtension.IsEnabled()
         };
     });
 
@@ -956,7 +949,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
             (ff & FeatureFlags::MACRO_ENABLED) != 0,
             state.inputMethod,
             static_cast<CodeTable>(state.codeTable),
-            g_watchdog.IsEnabled()
+            g_watchdog.IsEnabled(),
+            g_browserExtension.IsEnabled()
         };
     });
 
@@ -1273,8 +1267,13 @@ void OnMenuCommand(TrayMenuId id) {
             RestartWindowsWithPrompt(g_trayIcon.GetMessageWindow());
             break;
 
+        case TrayMenuId::ExtensionWatchdog:
         case TrayMenuId::ToggleWatchdog:
             g_watchdog.Toggle(g_trayIcon.GetMessageWindow());
+            break;
+
+        case TrayMenuId::ExtensionBrowser:
+            g_browserExtension.Toggle(g_trayIcon.GetMessageWindow());
             break;
 
         default: {

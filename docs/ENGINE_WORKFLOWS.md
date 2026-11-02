@@ -114,6 +114,12 @@ cmake --build build --config Release
 Only the configure line needs the two flags; rebuilds are unchanged because the
 cache remembers them. You only revisit this after deleting `CMakeCache.txt`.
 
+When testing behavior added to a locally built engine before its release is
+pinned, configure with `-DVKEY_TEST_UNRELEASED_ENGINE=ON` as well. This enables
+adapter tests for those new contracts, including commit-time restoration in
+issue #272. Leave it off when testing the published engine pin; the engine's
+own regression and C ABI tests cover the new behavior in its source repository.
+
 Working on something unrelated to the engine? Skip it entirely and skip the token
 with it:
 
@@ -132,7 +138,8 @@ from that build does not cover the Rust engine.
 The defaults build the Sciter edition with tests and the external engine. Sciter
 stays unsigned in v4.3. Select `include_classic` to run an independent Rust-OFF
 Classic build. Every output from this mixed workflow is deliberately unsigned;
-it never submits a SignPath request and it cannot publish a Classic release.
+it never submits a SignPath request. Manual runs only upload test artifacts;
+tag runs publish both Sciter and C++-only Classic.
 
 For a manual maintainer test, `classic_rust` opts Classic into Rust and labels the
 uploaded artifact `DEV`. It requires `include_classic`, is never signed, and tag
@@ -164,36 +171,71 @@ the C++-only binary.
 
 ## 3. Publish an official release
 
-Release is intentionally two-stage so proprietary Sciter/Rust inputs never enter
-the SignPath Foundation boundary.
+**Current v4.3 release: Stage A publishes both Sciter and Classic unsigned,
+without submitting any package to SignPath.** SignPath declined signing the
+standard edition because Sciter is closed-source. Classic-only signing is
+awaiting renewed approval; Classic is released unsigned while that review is
+pending. Stage B below describes the future procedure after approval, not a
+step for this release.
+Keep the Classic signing and release gates disabled and do not dispatch either
+`review` or `release` in the Foundation workflow for this release.
 
-### Stage A: standard Sciter release
+Both unsigned editions may be warned about, blocked, or quarantined by
+Windows SmartScreen or antivirus software. Older clients (v4.2/v4.3.0) require
+one manual upgrade to v4.3.1 because they pin SignPath Authenticode. From v4.3.1,
+automatic updates verify project-signed ZIP packages instead. Sigstore attestations
+verify build provenance but do not replace Authenticode or remove SmartScreen warnings.
+
+The workflows separate the unsigned release from the proposed Classic signing
+path so proprietary Sciter/Rust inputs never enter the SignPath Foundation boundary.
+
+### Stage A: unsigned Sciter and Classic release
 
 Before the first production run, create protected environment
 `vkey-standard-release`, require reviewers, allow only canonical `v*` tags, and
-store a dedicated `VKEY_STANDARD_WINGET_TOKEN` secret there. Leave repository variable
+store a dedicated `VKEY_STANDARD_WINGET_TOKEN` secret there for both WinGet
+packages. Leave repository variable
 `VKEY_STANDARD_RELEASE_ENABLED` unset until those controls are active, then set
 it to exactly `true`.
 
 Push a canonical `vMAJOR.MINOR.PATCH` tag whose version exactly matches
 `CMakeLists.txt` and whose commit is the exact current `Main` HEAD. The `Build`
 workflow validates the public tree and assets, builds Sciter with the pinned
-engine, runs tests and the tampered-engine rejection check, then publishes only:
+engine and Classic in a separate Rust-OFF tree, runs each edition's tests and
+the Sciter tampered-engine rejection check, then publishes:
 
-- `VKey.zip` and `VKey-x64.zip`, with SHA-256 sidecars and GitHub attestations;
+- `VKey-x64.zip`, with SHA-256 sidecar and GitHub attestation;
+- `VKeyWatchdog.exe` and `VKeyBrowserHost.exe` as separate assets, each with a
+  SHA-256 sidecar;
+- `VKeyClassic-x64.zip`, with SHA-256 sidecar and GitHub attestation;
+  each ZIP contains only `VKeyClassic.exe`, its own `VKeyTSF.dll`,
+  and `THIRD_PARTY_NOTICES.txt`;
+- `VKeyClassicWatchdog.exe` and `VKeyClassicBrowserHost.exe` as separate assets,
+  each with a SHA-256 sidecar;
 - `vkey_engine.dll`, its detached signature, both SHA-256 sidecars, and its
   separate license notice.
 
-The engine remains outside both application ZIPs. The workflow creates the
-GitHub Release and updates the Sciter WinGet package. Build/package jobs have
+The engine remains outside all application ZIPs. All four companion executables
+also receive GitHub attestations. The workflow creates one GitHub Release for
+both unsigned editions and submits both WinGet packages when the dedicated
+environment token is configured. Without that token, the WinGet jobs report a
+skipped submission; GitHub Release publication still completes. Build/package jobs have
 read-only repository permission; only a protected downstream job can attest and
 publish their exact artifact ID. It rechecks the tag and `Main` after approval,
 creates a draft first, publishes only after every asset is present, and refuses
-to overwrite a different existing asset. It cannot build, sign, or publish
-Classic from a tag. Depending on the environment rules, GitHub may ask again
-before the separate least-privilege WinGet job.
+to overwrite a different existing asset. Publishing requires both edition builds
+and packaging to succeed; a failed Classic build cannot leave a Sciter-only
+release. It never invokes the Foundation signing workflow. Depending on the
+environment rules, GitHub may ask again before the separate least-privilege
+WinGet jobs.
 
-### Stage B: protected Classic release
+### Stage B: protected Classic release (pending renewed approval)
+
+This future path must use a new release tag: signed binaries cannot overwrite
+the unsigned Classic assets from v4.3. Before enabling this future path, update
+Stage A to leave Classic publication to the Foundation workflow for that new
+tag; do not publish unsigned Classic first and then try to replace those assets
+with signed files.
 
 Create GitHub environment
 `vkeyclassic-foundation-release`, require reviewers, restrict deployment to
@@ -203,8 +245,10 @@ the dedicated names prevent fallback to an unprotected repository secret. Set
 repository variable `VKEYCLASSIC_SIGNING_ENABLED=true` only after that environment
 is protected; both review and production signing then enter the environment.
 
-The safe default is **Actions → VKeyClassic Foundation signing → Run workflow →
-`review`**. It builds exactly `VKeyClassic.exe`, `VKeyTSF.dll`, and
+When a new review submission is authorized after this release, use
+**Actions → VKeyClassic Foundation signing → Run workflow → `review`**.
+This operation also sends a package to SignPath; do not run it for the current
+release. It builds exactly `VKeyClassic.exe`, `VKeyTSF.dll`, and
 `VKeyWatchdog.exe`, submits only that immutable artifact to `test-signing`, and
 uploads a 30-day review artifact. The review job has no permission to modify a
 GitHub Release and still requires the protected-environment approval.
@@ -221,10 +265,11 @@ and `release-signing` policy, then set it to exactly `true`. Production then:
 3. submits only the three-file Foundation artifact to `release-signing`;
 4. requires valid `CN=SignPath Foundation` signatures, timestamps, an exact file
    inventory, and no Sciter/Rust imports;
-5. adds separately built, unsigned `VKeyBrowserHost.exe` plus
-   `THIRD_PARTY_NOTICES.txt` to the final Classic package;
-6. enforces the five-file package allowlist, then archives, checksums, and attests
-   both Classic ZIP names;
+5. keeps `THIRD_PARTY_NOTICES.txt` in the three-file Classic ZIP, while staging
+   the signed watchdog and separately built unsigned browser host as independent
+   `VKeyClassicWatchdog.exe` and `VKeyClassicBrowserHost.exe` release assets;
+6. enforces the three-file ZIP allowlist, then archives, checksums, and attests
+   both Classic ZIP names and both companion assets;
 7. attaches assets only to the existing tag Release and refuses to overwrite a
    different existing asset, after rechecking the tag and `Main` following final
    approval, then updates the Classic WinGet package.

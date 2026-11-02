@@ -3,14 +3,18 @@
 
 #include "UpdateSecurity.h"
 #include "CancelableBindStatusCallback.h"
+#include "core/Version.h"
+#include "core/security/UpdateSigningKey.h"
 
 #ifdef _WIN32
+
 #include <Windows.h>
 #include <bcrypt.h>
 #include <urlmon.h>
 #include <wintrust.h>
 #include <Softpub.h>
 #include <wincrypt.h>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #pragma comment(lib, "bcrypt.lib")
@@ -143,6 +147,85 @@ std::string ParseSha256File(const std::string& content) noexcept {
 
 #ifdef _WIN32
 
+bool VerifyUpdateSignature(const std::array<std::uint8_t, 32>& digest,
+                           const UpdatePackageSignature::Parsed& signature,
+                           std::string_view publicKeyHex) noexcept {
+    try {
+        if (publicKeyHex.size() != 128) return false;
+        struct Algorithm {
+            BCRYPT_ALG_HANDLE value = nullptr;
+            ~Algorithm() { if (value) BCryptCloseAlgorithmProvider(value, 0); }
+        } ec, sha;
+        struct Key {
+            BCRYPT_KEY_HANDLE value = nullptr;
+            ~Key() { if (value) BCryptDestroyKey(value); }
+        } key;
+        struct Hash {
+            BCRYPT_HASH_HANDLE value = nullptr;
+            ~Hash() { if (value) BCryptDestroyHash(value); }
+        };
+        struct PublicBlob {
+            BCRYPT_ECCKEY_BLOB header{BCRYPT_ECDSA_PUBLIC_P256_MAGIC, 32};
+            std::array<std::uint8_t, 64> coordinates{};
+        } blob;
+        const auto hexValue = [](char c) {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            return -1;
+        };
+        for (std::size_t i = 0; i < blob.coordinates.size(); ++i) {
+            const int a = hexValue(publicKeyHex[2 * i]);
+            const int b = hexValue(publicKeyHex[2 * i + 1]);
+            if (a < 0 || b < 0) return false;
+            blob.coordinates[i] = static_cast<std::uint8_t>((a << 4) | b);
+        }
+        if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&ec.value, BCRYPT_ECDSA_P256_ALGORITHM, nullptr, 0)) ||
+            !BCRYPT_SUCCESS(BCryptImportKeyPair(ec.value, nullptr, BCRYPT_ECCPUBLIC_BLOB, &key.value,
+                reinterpret_cast<PUCHAR>(&blob), static_cast<ULONG>(sizeof(blob)), 0)) ||
+            !BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&sha.value, BCRYPT_SHA256_ALGORITHM, nullptr, 0))) return false;
+        DWORD objectBytes = 0, resultBytes = 0;
+        if (!BCRYPT_SUCCESS(BCryptGetProperty(sha.value, BCRYPT_OBJECT_LENGTH,
+                reinterpret_cast<PUCHAR>(&objectBytes), sizeof(objectBytes), &resultBytes, 0))) return false;
+        std::vector<std::uint8_t> object(objectBytes);
+        Hash hash;
+        auto payload = UpdatePackageSignature::BuildPayload(digest, signature);
+        std::array<std::uint8_t, 32> payloadDigest{};
+        if (!BCRYPT_SUCCESS(BCryptCreateHash(sha.value, &hash.value, object.data(), objectBytes, nullptr, 0, 0)) ||
+            !BCRYPT_SUCCESS(BCryptHashData(hash.value, payload.data(), static_cast<ULONG>(payload.size()), 0)) ||
+            !BCRYPT_SUCCESS(BCryptFinishHash(hash.value, payloadDigest.data(), static_cast<ULONG>(payloadDigest.size()), 0))) return false;
+        return BCRYPT_SUCCESS(BCryptVerifySignature(key.value, nullptr, payloadDigest.data(),
+            static_cast<ULONG>(payloadDigest.size()), const_cast<PUCHAR>(signature.signature.data()),
+            static_cast<ULONG>(signature.signature.size()), 0));
+    } catch (...) {
+        return false;
+    }
+}
+
+bool VerifySignedUpdateZip(const std::wstring& zipPath, std::uint32_t expectedVersion) noexcept {
+    try {
+        std::ifstream file(std::filesystem::path(zipPath + L".sig"), std::ios::binary);
+        std::array<std::uint8_t, UpdatePackageSignature::kFileBytes> raw{};
+        if (!file.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size())) ||
+            file.peek() != std::char_traits<char>::eof()) return false;
+        const auto parsed = UpdatePackageSignature::Parse(raw);
+#ifdef VKEY_LITE_MODE
+        constexpr auto edition = UpdatePackageSignature::Edition::Classic;
+#else
+        constexpr auto edition = UpdatePackageSignature::Edition::Sciter;
+#endif
+        if (!parsed || !UpdatePackageSignature::Accepts(*parsed, VKEY_VERSION_PACKED, expectedVersion, edition)) return false;
+        const auto hex = ComputeFileSha256(zipPath);
+        if (hex.size() != 64) return false;
+        std::array<std::uint8_t, 32> digest{};
+        for (std::size_t i = 0; i < digest.size(); ++i) {
+            const auto value = [](char c) { return c <= '9' ? c - '0' : c - 'a' + 10; };
+            digest[i] = static_cast<std::uint8_t>((value(hex[2 * i]) << 4) | value(hex[2 * i + 1]));
+        }
+        return VerifyUpdateSignature(digest, *parsed, kUpdateSigningPublicKey);
+    } catch (...) {
+        return false;
+    }
+}
 std::string ComputeFileSha256(const std::wstring& filePath) noexcept {
     try {
         struct AlgHandle {
@@ -189,7 +272,9 @@ std::string ComputeFileSha256(const std::wstring& filePath) noexcept {
         std::vector<BYTE> readBuf(kBufSize);
         DWORD bytesRead = 0;
 
-        while (ReadFile(file.h, readBuf.data(), kBufSize, &bytesRead, nullptr) && bytesRead > 0) {
+        for (;;) {
+            if (!ReadFile(file.h, readBuf.data(), kBufSize, &bytesRead, nullptr)) return {};
+            if (bytesRead == 0) break;
             status = BCryptHashData(hash.h, readBuf.data(), bytesRead, 0);
             if (!BCRYPT_SUCCESS(status)) return {};
         }
@@ -243,7 +328,7 @@ bool VerifyDownloadedZip(
         }
 
         // 3. Read checksum file content
-        std::ifstream checksumFile(checksumPath, std::ios::binary);
+        std::ifstream checksumFile(std::filesystem::path(checksumPath), std::ios::binary);
         if (!checksumFile.is_open()) {
             DeleteFileW(checksumPath.c_str());
             return false;

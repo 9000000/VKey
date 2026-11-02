@@ -119,6 +119,20 @@ public:
         leadingTriggersForCurrentWord_ = v;
     }
 
+    // ── Gap shape (see DecideReadyGapKey) ─────────────────────────────
+    /// True while Ready was armed by a non-space commit trigger, i.e. the char
+    /// left of the caret is punctuation a new word would fuse with.
+    [[nodiscard]] bool GapEndsInGlyph() const noexcept { return gapEndsInGlyph_; }
+    void SetGapEndsInGlyph(bool v) noexcept { gapEndsInGlyph_ = v; }
+
+    // ── Word opener (see IsHostReplacedWord) ──────────────────────────
+    /// Punctuation char of the previous key (0 for anything else).
+    [[nodiscard]] wchar_t PrevKeyGlyph() const noexcept { return prevKeyGlyph_; }
+    void SetPrevKeyGlyph(wchar_t c) noexcept { prevKeyGlyph_ = c; }
+    /// PrevKeyGlyph() captured when the current word's first letter was typed.
+    [[nodiscard]] wchar_t WordOpenGlyph() const noexcept { return wordOpenGlyph_; }
+    void SetWordOpenGlyph(wchar_t c) noexcept { wordOpenGlyph_ = c; }
+
     // ── Input history (keystrokes for replay; includes BS markers) ────
     [[nodiscard]] const std::vector<wchar_t>& History() const noexcept { return inputHistory_; }
     [[nodiscard]] std::vector<wchar_t>&       History()       noexcept { return inputHistory_; }
@@ -157,6 +171,7 @@ public:
         state_ = State::Idle;
         pendingTriggerCount_ = 0;
         leadingTriggersForCurrentWord_ = 0;
+        gapEndsInGlyph_ = false;
         stack_.clear();
     }
 
@@ -182,6 +197,9 @@ private:
     State                  state_                          = State::Idle;
     std::vector<Entry>     stack_;          ///< LIFO; max kMaxStack entries
     bool                   pushedToStack_                  = false;
+    bool                   gapEndsInGlyph_                 = false;
+    wchar_t                prevKeyGlyph_                   = L'\0';
+    wchar_t                wordOpenGlyph_                  = L'\0';
     uint8_t                pendingTriggerCount_            = 0;
     uint8_t                leadingTriggersForCurrentWord_  = 0;
     DWORD                  readyTime_                      = 0;

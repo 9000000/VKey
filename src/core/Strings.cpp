@@ -25,6 +25,9 @@ static const wchar_t* const kVietnamese[] = {
     L"Thoát",                                        // MENU_EXIT
     L"Tắt tự khởi động lại",                         // MENU_STOP_WATCHDOG
     L"Bật tự khởi động lại",                         // MENU_ENABLE_WATCHDOG
+    L"Tiện ích mở rộng",                             // MENU_EXTENSIONS
+    L"Hỗ trợ trình duyệt (Browser Host)",            // MENU_EXT_BROWSER
+    L"Tự khởi động lại khi crash (Watchdog)",        // MENU_EXT_WATCHDOG
     L"VKey - Tiếng Việt",                        // TIP_VIETNAMESE
     L"VKey - English",                            // TIP_ENGLISH
     L"Giới thiệu VKey",                          // ABOUT_TITLE
@@ -33,8 +36,8 @@ static const wchar_t* const kVietnamese[] = {
     L"SPDX-License-Identifier: GPL-3.0-only",
     L"Cập nhật",                                     // UPDATE_TITLE
     L"Có phiên bản mới!",                            // UPDATE_AVAILABLE_TITLE
-    L"Phiên bản mới %s đã sẵn sàng.\n\nỨng dụng sẽ tự động đóng, cập nhật và khởi động lại.", // UPDATE_AVAILABLE_BODY
-    L"Cập nhật ngay",                                // UPDATE_NOW
+    L"Phiên bản mới %s đã sẵn sàng.\n\nVKey sẽ tải và xác minh gói cập nhật, sau đó đóng ứng dụng, cài đặt và khởi động lại.", // UPDATE_AVAILABLE_BODY
+    L"Cập nhật ngay",                // UPDATE_NOW
     L"Bỏ qua",                                      // UPDATE_SKIP
     L"Bạn đang dùng phiên bản mới nhất!",           // UPDATE_LATEST
     L"Không thể kiểm tra cập nhật.",                 // UPDATE_FAILED
@@ -71,17 +74,19 @@ static const wchar_t* const kVietnamese[] = {
     L"Vui lòng thoát và khởi động lại VKey thủ công.",
     L"Đã tắt tự khởi động lại. VKey sẽ không tự bật lại nếu thoát đột ngột.", // WATCHDOG_STOPPED_BODY
     L"Đã bật tự khởi động lại. VKey sẽ tự bật lại nếu thoát đột ngột.", // WATCHDOG_ENABLED_BODY
+    L"Đã tắt tiện ích Hỗ trợ trình duyệt (Browser Host).", // BROWSER_EXT_STOPPED_BODY
+    L"Đã bật tiện ích Hỗ trợ trình duyệt (Browser Host).\nCác trình duyệt được hỗ trợ sẽ tự động kết nối với VKey.", // BROWSER_EXT_ENABLED_BODY
     L"Cấu hình hiện tại đã được sao lưu thành công tại:\n%s\n\nỨng dụng sẽ tự động đóng để tiến hành cập nhật.", // UPDATE_BACKUP_SUCCESS
     L"Cần VKey Engine",                              // SPELL_ADVANCED_REQUIRED_TITLE
     L"Chế độ Nâng cao cần vkey_engine.dll đúng phiên bản. VKey luôn kiểm tra tính toàn vẹn của file trước khi nạp.", // SPELL_ADVANCED_DOWNLOAD_PROMPT
     L"Tải và cài đặt tự động\nTải đúng engine từ GitHub và xác minh trước khi sử dụng.", // SPELL_ADVANCED_DOWNLOAD_AUTO
-    L"Cài đặt thủ công\nMở file bằng trình duyệt; phù hợp khi firewall chặn truy cập Internet của VKey.", // SPELL_ADVANCED_INSTALL_MANUAL
+    L"Cài đặt thủ công\nMở trang phát hành bằng trình duyệt; phù hợp khi firewall chặn truy cập Internet của VKey.", // SPELL_ADVANCED_INSTALL_MANUAL
     L"Tiếp tục dùng chế độ Cơ bản\nKhông tải và không hỏi lại khi VKey khởi động.", // SPELL_ADVANCED_USE_STANDARD
     L"Không thể bật chế độ Nâng cao",                // SPELL_ADVANCED_NOT_ENABLED_TITLE
     L"Cài đặt VKey Engine thủ công",                 // SPELL_ADVANCED_MANUAL_TITLE
-    L"1. VKey vừa mở trình duyệt để tải vkey_engine.dll đúng với phiên bản hiện tại. Nếu trình duyệt cảnh báo file .dll, hãy chọn Giữ lại (Keep).\n\n2. Đặt file vừa tải vào thư mục chứa VKey.exe:\n", // SPELL_ADVANCED_MANUAL_BODY
+    L"1. VKey vừa mở trang GitHub Releases trên trình duyệt. Hãy tải cả 2 file vkey_engine.dll và vkey_engine.dll.sig tương ứng với phiên bản này. Nếu trình duyệt cảnh báo file .dll, hãy chọn Giữ lại (Keep).\n\n2. Đặt cả 2 file vừa tải vào thư mục chứa VKey.exe:\n", // SPELL_ADVANCED_MANUAL_BODY
     L"3. Quay lại VKey và chọn Kiểm tra chính tả: Nâng cao lần nữa. VKey sẽ xác minh file trước khi nạp.", // SPELL_ADVANCED_MANUAL_FINISH
-    L"Tải lại vkey_engine.dll bằng trình duyệt",     // SPELL_ADVANCED_MANUAL_LINK
+    L"Mở lại trang GitHub Releases bằng trình duyệt", // SPELL_ADVANCED_MANUAL_LINK
     L"Mở thư mục VKey",                              // SPELL_ADVANCED_OPEN_FOLDER
     L"Windows không thể mở mục này. Hãy sao chép liên kết hoặc đường dẫn bên dưới và mở thủ công:", // SPELL_ADVANCED_OPEN_TARGET_FAILED
     L"Chọn Yes để tải tự động, No để cài thủ công hoặc Cancel để tiếp tục dùng chế độ Cơ bản.", // SPELL_ADVANCED_FALLBACK_CHOICE
@@ -113,6 +118,9 @@ static const wchar_t* const kEnglish[] = {
     L"Exit",                                          // MENU_EXIT
     L"Stop auto-restart",                             // MENU_STOP_WATCHDOG
     L"Enable auto-restart",                           // MENU_ENABLE_WATCHDOG
+    L"Extensions",                                    // MENU_EXTENSIONS
+    L"Browser Integration (Browser Host)",            // MENU_EXT_BROWSER
+    L"Auto-restart on crash (Watchdog)",              // MENU_EXT_WATCHDOG
     L"VKey - Vietnamese",                         // TIP_VIETNAMESE
     L"VKey - English",                            // TIP_ENGLISH
     L"About VKey",                                // ABOUT_TITLE
@@ -121,8 +129,8 @@ static const wchar_t* const kEnglish[] = {
     L"SPDX-License-Identifier: GPL-3.0-only",
     L"Update",                                       // UPDATE_TITLE
     L"Update available!",                            // UPDATE_AVAILABLE_TITLE
-    L"Version %s is available.\n\nThe application will automatically close, update, and restart.", // UPDATE_AVAILABLE_BODY
-    L"Update now",                                   // UPDATE_NOW
+    L"Version %s is available.\n\nVKey will download and verify the update package, then close, install the update, and restart.", // UPDATE_AVAILABLE_BODY
+    L"Update now",              // UPDATE_NOW
     L"Skip",                                         // UPDATE_SKIP
     L"You're on the latest version!",                // UPDATE_LATEST
     L"Unable to check for updates.",                 // UPDATE_FAILED
@@ -159,17 +167,19 @@ static const wchar_t* const kEnglish[] = {
     L"Please exit and relaunch VKey manually.",
     L"Auto-restart stopped. VKey will not relaunch on crash.", // WATCHDOG_STOPPED_BODY
     L"Auto-restart enabled. VKey will relaunch on crash.", // WATCHDOG_ENABLED_BODY
+    L"Browser Integration (Browser Host) disabled.", // BROWSER_EXT_STOPPED_BODY
+    L"Browser Integration (Browser Host) enabled.\nSupported browsers will automatically connect to VKey.", // BROWSER_EXT_ENABLED_BODY
     L"Your current configuration has been backed up at:\n%s\n\nThe application will automatically close to perform the update.", // UPDATE_BACKUP_SUCCESS
     L"VKey Engine required",                         // SPELL_ADVANCED_REQUIRED_TITLE
     L"Advanced mode requires the correct version of vkey_engine.dll. VKey always verifies the file's integrity before loading it.", // SPELL_ADVANCED_DOWNLOAD_PROMPT
     L"Download and install automatically\nDownload the exact engine from GitHub and verify it before use.", // SPELL_ADVANCED_DOWNLOAD_AUTO
-    L"Install manually\nOpen the file in your browser; suitable when a firewall blocks VKey's Internet access.", // SPELL_ADVANCED_INSTALL_MANUAL
+    L"Install manually\nOpen the release page in your browser; suitable when a firewall blocks VKey's Internet access.", // SPELL_ADVANCED_INSTALL_MANUAL
     L"Continue with Standard mode\nDo not download or ask again when VKey starts.", // SPELL_ADVANCED_USE_STANDARD
     L"Unable to enable Advanced mode",               // SPELL_ADVANCED_NOT_ENABLED_TITLE
     L"Install VKey Engine manually",                 // SPELL_ADVANCED_MANUAL_TITLE
-    L"1. VKey just opened your browser to download the vkey_engine.dll matching this version. If your browser warns about the .dll, choose Keep.\n\n2. Place the downloaded file in the folder containing VKey.exe:\n", // SPELL_ADVANCED_MANUAL_BODY
+    L"1. VKey just opened the GitHub Releases page in your browser. Please download both vkey_engine.dll and vkey_engine.dll.sig matching this version. If your browser warns about the .dll, choose Keep.\n\n2. Place both downloaded files in the folder containing VKey.exe:\n", // SPELL_ADVANCED_MANUAL_BODY
     L"3. Return to VKey and select Spell check: Advanced again. VKey will verify the file before loading it.", // SPELL_ADVANCED_MANUAL_FINISH
-    L"Download vkey_engine.dll again in your browser", // SPELL_ADVANCED_MANUAL_LINK
+    L"Open GitHub Releases in your browser again",   // SPELL_ADVANCED_MANUAL_LINK
     L"Open VKey folder",                             // SPELL_ADVANCED_OPEN_FOLDER
     L"Windows could not open this item. Copy the link or path below and open it manually:", // SPELL_ADVANCED_OPEN_TARGET_FAILED
     L"Choose Yes to download automatically, No to install manually, or Cancel to continue with Standard mode.", // SPELL_ADVANCED_FALLBACK_CHOICE

@@ -14,6 +14,7 @@
 #include "Define.h"
 #include "Globals.h"
 #include "core/CrashLog.h"
+#include "core/CommitUndoArmDecision.h"
 #include "core/MacroCase.h"
 #include "core/TsfEditDecision.h"
 
@@ -276,6 +277,7 @@ IFACEMETHODIMP KeyEventSink::OnSetFocus(BOOL fForeground) {
         TSF_LOG(L"OnSetFocus: foreground");
         // Re-read SharedState on focus to pick up ENGINE_ENABLED/VIETNAMESE_MODE changes
         if (pEngineController_) {
+            pEngineController_->ClearContext();
             pEngineController_->CheckConfigEvent(/*allowMacroDiskRead=*/true);
             pEngineController_->RefreshFlags();
             RefreshQuickConvertPreservedKey();
@@ -285,10 +287,12 @@ IFACEMETHODIMP KeyEventSink::OnSetFocus(BOOL fForeground) {
             // Focus change invalidates the commit-undo window — cursor may have
             // moved arbitrarily relative to the cached lastCommit_ text.
             pEngineController_->ResetCommitUndo();
+            pEngineController_->ResetMacroUndo();
         }
     } else {
         TSF_LOG(L"OnSetFocus: background");
         if (pEngineController_) {
+            pEngineController_->ClearContext();
             PublishQuickConvertCapability();
             pEngineController_->SetTsfTipActive(false);
             pEngineController_->ClearMacroTracking();
@@ -316,6 +320,7 @@ HRESULT KeyEventSink::OnTestKeyDownImpl(ITfContext* pContext, WPARAM wParam, LPA
     }
     const bool routeToTsf = pEngineController_->RefreshKeyRouting();
     const UINT vk = static_cast<UINT>(wParam);
+    if (vk != VK_BACK) pEngineController_->ResetMacroUndo();
 
     // Drop any translated char cached by a previous OnTestKeyDown whose
     // OnKeyDown pair never fired (rare TSF anomaly).
@@ -405,6 +410,7 @@ HRESULT KeyEventSink::OnTestKeyDownImpl(ITfContext* pContext, WPARAM wParam, LPA
 
     // Modifiers -> commit and pass through
     if (ctrl || alt || win) {
+        pEngineController_->ResetMacroUndo();
         if (pEngineController_->HasEngineBuffer()) {
             TSF_LOG(L"OnTestKeyDown: modifier chord vk=0x%02X with live buffer → Commit",
                     static_cast<UINT>(wParam));
@@ -435,6 +441,8 @@ HRESULT KeyEventSink::OnTestKeyDownImpl(ITfContext* pContext, WPARAM wParam, LPA
         }
         if (!restored && pEngineController_->HasEngineBuffer()) {
             pEngineController_->EndCompositionVerbatim(pContext);
+        } else if (!restored) {
+            pEngineController_->ClearContext();
         }
         *pfEaten = restored ? TRUE : FALSE;
         return S_OK;
@@ -539,6 +547,12 @@ HRESULT KeyEventSink::OnTestKeyDownImpl(ITfContext* pContext, WPARAM wParam, LPA
     // restore raw via TryRestoreLastCommitRaw. Second BS in Primed → cancel.
     // Must run BEFORE BackspaceRevive so revive doesn't compete with undo.
     if (wParam == VK_BACK && !pEngineController_->HasEngineBuffer()) {
+        if (pEngineController_->HasMacroUndo()) {
+            *pfEaten = TRUE;
+            lastTestedVk_ = static_cast<UINT>(wParam);
+            lastWantKeyResult_ = true;
+            return S_OK;
+        }
         if (pEngineController_->IsCommitUndoReady()
             && pEngineController_->WithinUndoWindow()) {
             pEngineController_->TransitionUndoReadyToPrimed();
@@ -591,8 +605,15 @@ HRESULT KeyEventSink::OnTestKeyDownImpl(ITfContext* pContext, WPARAM wParam, LPA
     // they don't reach here. Bare Shift/CapsLock is excluded — see IsBareModifierKey.
     if (!wantKey && !IsBareModifierKey(vk) && pEngineController_->HasEngineBuffer()) {
         pEngineController_->Commit(pContext);
+        if (IsCaretNavigationKey(vk)) {
+            pEngineController_->ClearContext();
+        }
         *pfEaten = FALSE;
         return S_OK;
+    }
+
+    if (!wantKey && IsCaretNavigationKey(vk)) {
+        pEngineController_->ClearContext();
     }
 
     *pfEaten = wantKey ? TRUE : FALSE;
@@ -643,6 +664,11 @@ HRESULT KeyEventSink::OnKeyDownImpl(ITfContext* pContext, WPARAM wParam, LPARAM 
     }
     const bool routeToTsf = pEngineController_->RefreshKeyRouting();
     const UINT vk = static_cast<UINT>(wParam);
+    // OnTestKeyDown may have just expanded this same trigger. Preserve that
+    // snapshot until its cached result is returned below.
+    if (vk != VK_BACK && vk != lastMacroHandledVk_) {
+        pEngineController_->ResetMacroUndo();
+    }
 
     if (vk != pendingClaimedSpaceVk_) {
         pendingClaimedSpaceVk_ = 0;
@@ -695,6 +721,7 @@ HRESULT KeyEventSink::OnKeyDownImpl(ITfContext* pContext, WPARAM wParam, LPARAM 
     // composition (select-all breaks around the pre-edit word). Idempotent in
     // classic hosts: test phase already committed, buffer is empty.
     if (ctrl || alt || win) {
+        pEngineController_->ResetMacroUndo();
         if (pEngineController_->HasEngineBuffer()) {
             TSF_LOG(L"OnKeyDown: modifier chord vk=0x%02X with live buffer → Commit",
                     static_cast<UINT>(wParam));
@@ -711,6 +738,17 @@ HRESULT KeyEventSink::OnKeyDownImpl(ITfContext* pContext, WPARAM wParam, LPARAM 
         lastEnglishMacroObservedVk_ = 0;
         if (eat) RememberClaimedSpaceKeyDown(vk, lParam);
         *pfEaten = eat ? TRUE : FALSE;
+        return S_OK;
+    }
+
+    if (vk == VK_BACK && pEngineController_->HasMacroUndo()) {
+        lastTestedVk_ = 0;
+        lastTranslatedChar_ = 0;
+        lastEnglishMacroObservedVk_ = 0;
+        // Known benign mismatch (maintainer accepted 2026-11-01): when UndoMacro
+        // fails in OnKeyDown it returns pfEaten=FALSE although OnTestKeyDown
+        // already reported eaten.
+        *pfEaten = pEngineController_->UndoMacro(pContext) ? TRUE : FALSE;
         return S_OK;
     }
 
@@ -790,6 +828,8 @@ HRESULT KeyEventSink::OnKeyDownImpl(ITfContext* pContext, WPARAM wParam, LPARAM 
         }
         if (!restored && pEngineController_->HasEngineBuffer()) {
             pEngineController_->EndCompositionVerbatim(pContext);
+        } else if (!restored) {
+            pEngineController_->ClearContext();
         }
         *pfEaten = restored ? TRUE : FALSE;
         return S_OK;
@@ -875,6 +915,9 @@ HRESULT KeyEventSink::OnKeyDownImpl(ITfContext* pContext, WPARAM wParam, LPARAM 
     // Bare Shift/CapsLock is excluded — see IsBareModifierKey.
     if (!wantKey && !IsBareModifierKey(vk) && pEngineController_->HasEngineBuffer()) {
         pEngineController_->Commit(pContext);
+        if (IsCaretNavigationKey(vk)) {
+            pEngineController_->ClearContext();
+        }
         // Reaching here with a live buffer means the host skipped OnTestKeyDown
         // (Chromium family) — in every other host the test phase already
         // committed, so the buffer is empty and this branch never runs there.
@@ -908,6 +951,9 @@ HRESULT KeyEventSink::OnKeyDownImpl(ITfContext* pContext, WPARAM wParam, LPARAM 
     }
 
     if (!wantKey) {
+        if (IsCaretNavigationKey(vk)) {
+            pEngineController_->ClearContext();
+        }
         *pfEaten = FALSE;
         return S_OK;
     }

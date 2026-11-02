@@ -12,6 +12,9 @@
 #include <vector>
 #include <cstdint>
 #include <atomic>
+#include <array>
+#include <string_view>
+#include "core/UpdatePackageSignature.h"
 
 namespace NextKey {
 
@@ -43,6 +46,17 @@ namespace NextKey {
 
 #ifdef _WIN32
 
+/// Verify the package protocol with Windows CNG. Public key input is explicit
+/// for protocol tests; application entry points always use the compiled-in key.
+[[nodiscard]] bool VerifyUpdateSignature(
+    const std::array<std::uint8_t, 32>& digest,
+    const UpdatePackageSignature::Parsed& signature, std::string_view publicKeyHex) noexcept;
+
+/// Verify ZIP + adjacent .sig against this application's key, edition and
+/// version floor. expectedVersion=0 is used only by the installer recheck.
+[[nodiscard]] bool VerifySignedUpdateZip(const std::wstring& zipPath,
+                                       std::uint32_t expectedVersion = 0) noexcept;
+
 /// Compute SHA-256 hash of a file using Windows CNG (bcrypt.h).
 /// Returns lowercase hex string (64 chars), or empty string on failure.
 /// Thread-safe — creates/destroys its own CNG handles.
@@ -61,7 +75,7 @@ namespace NextKey {
 /// served from the same origin as the ZIP — an attacker who controls the origin
 /// (or a compromised release) controls both halves. It defends against
 /// corruption/CDN bit-rot, NOT tampering. Tamper resistance comes from
-/// VerifyAuthenticodeSignature on the extracted binaries (below).
+/// VerifySignedUpdateZip and its compiled-in project public key.
 [[nodiscard]] bool VerifyDownloadedZip(
     const std::wstring& zipUrl,
     const std::wstring& localZipPath,

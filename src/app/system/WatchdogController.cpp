@@ -9,7 +9,9 @@
 #include "core/Strings.h"
 #include "core/Debug.h"
 #include "core/config/ConfigManager.h"
+#include "core/security/ExtensionTrust.h"
 #include "system/StartupHelper.h"
+#include "system/ExtensionInstaller.h"
 
 #include <string>
 
@@ -18,6 +20,10 @@ namespace NextKey {
 namespace {
 constexpr const wchar_t* kAppTitle = L"VKey";
 }  // namespace
+
+WatchdogController::~WatchdogController() {
+    if (watchdogProcess_) CloseHandle(watchdogProcess_);
+}
 
 void WatchdogController::Init(const SystemConfig& systemConfig) {
     enabled_.store(systemConfig.watchdogEnabled, std::memory_order_relaxed);
@@ -29,11 +35,11 @@ void WatchdogController::Init(const SystemConfig& systemConfig) {
     // Watchdog has its own single-instance mutex — duplicate launch is a
     // no-op. Re-launch on every startup means the user doesn't have to log
     // out/in to recover the watchdog after enabling.
-    LaunchWatchdogProcess();
-
     if (!heartbeat_.Start()) {
         NEXTKEY_LOG(L"HeartbeatPublisher start failed — watchdog auto-respawn disabled");
+        return;
     }
+    (void)LaunchWatchdogProcess(&watchdogProcess_);
 }
 
 void WatchdogController::Toggle(HWND notifyHwnd) {
@@ -42,6 +48,10 @@ void WatchdogController::Toggle(HWND notifyHwnd) {
     if (cfg.watchdogEnabled) {
         heartbeat_.SignalGracefulShutdown();
         KillWatchdogProcess();
+        if (watchdogProcess_) {
+            CloseHandle(watchdogProcess_);
+            watchdogProcess_ = nullptr;
+        }
         RemoveWatchdogScheduledTask();
 
         cfg.watchdogEnabled = false;
@@ -56,6 +66,11 @@ void WatchdogController::Toggle(HWND notifyHwnd) {
                     S(StringId::WATCHDOG_STOPPED_BODY),
                     kAppTitle, MB_OK | MB_ICONINFORMATION);
     } else {
+        // Ensure VKeyWatchdog.exe is installed and verified
+        if (!ExtensionInstaller::EnsureInstalledWithUi(ExtensionType::Watchdog, notifyHwnd)) {
+            return;
+        }
+
         // Task Scheduler register prompts UAC. If user denies, leave the
         // config flag false (menu still reads "Bật…") and bail.
         if (!CreateWatchdogScheduledTask()) {
@@ -71,7 +86,7 @@ void WatchdogController::Toggle(HWND notifyHwnd) {
             NEXTKEY_LOG(L"HeartbeatPublisher start failed on toggle ON — watchdog auto-respawn disabled");
         }
 
-        LaunchWatchdogProcess();
+        (void)LaunchWatchdogProcess(&watchdogProcess_);
 
         MessageBoxW(notifyHwnd,
                     S(StringId::WATCHDOG_ENABLED_BODY),
@@ -81,22 +96,47 @@ void WatchdogController::Toggle(HWND notifyHwnd) {
 
 void WatchdogController::SignalGracefulShutdown() noexcept {
     heartbeat_.SignalGracefulShutdown();
+    // Keep the publisher's event handles alive until our child has observed
+    // quit, including a quit immediately after CreateProcess. Never leave a
+    // newly scheduled supervisor to start after the last publisher handle dies.
+    if (watchdogProcess_ && WaitForSingleObject(watchdogProcess_, 3000) == WAIT_TIMEOUT) {
+        (void)TerminateProcess(watchdogProcess_, 0);
+        (void)WaitForSingleObject(watchdogProcess_, 1000);
+    }
 }
 
-void WatchdogController::LaunchWatchdogProcess() noexcept {
+int WatchdogController::RunScheduledTask() noexcept {
+    const auto cfg = ConfigManager::LoadSystemConfigOrDefault();
+    if (!cfg.watchdogEnabled) return 0;
+    return LaunchWatchdogProcess() ? 0 : 1;
+}
+
+bool WatchdogController::LaunchWatchdogProcess(HANDLE* processHandle) noexcept {
     std::wstring dir = GetInstallDirectory();
     if (dir.empty()) {
-        return;
+        return false;
     }
     std::wstring wdPath = dir + L"\\VKeyWatchdog.exe";
+    if (!Security::IsExtensionTrusted(wdPath, Security::ExtensionBinary::Watchdog)) {
+        NEXTKEY_LOG(L"LaunchWatchdogProcess: untrusted or invalid binary at %ls — aborted",
+                    wdPath.c_str());
+        return false;
+    }
 
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
     if (CreateProcessW(wdPath.c_str(), nullptr, nullptr, nullptr, FALSE,
                        0, nullptr, nullptr, &si, &pi)) {
         CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
+        if (processHandle) {
+            if (*processHandle) CloseHandle(*processHandle);
+            *processHandle = pi.hProcess;
+        } else {
+            CloseHandle(pi.hProcess);
+        }
+        return true;
     }
+    return false;
 }
 
 void WatchdogController::KillWatchdogProcess() noexcept {

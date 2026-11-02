@@ -37,6 +37,7 @@
 #include <unordered_set>
 
 #include "core/config/TypingConfig.h"
+#include "core/MacroPrefix.h"
 
 namespace NextKey {
 
@@ -96,6 +97,9 @@ struct ConfigSnapshot {
     /// migration is a 1:1 swap, not a re-interpretation.
     std::unordered_set<std::wstring> spaceMacroKeys;
 
+    /// Built with the snapshot, so typing only reads the derived prefix index.
+    MacroPrefixIndex macroPrefixIndex;
+
     /// SharedState.configGeneration at build time. Producers must set
     /// this; default = 0 means "no config has been published yet"
     /// (HookEngine ctor's default snapshot).
@@ -130,6 +134,7 @@ struct ConfigSnapshot {
                 snap.spaceMacroKeys.insert(key);
             }
         }
+        snap.macroPrefixIndex = MacroPrefixIndex(snap.spaceMacroKeys);
         return snap;
     }
 };

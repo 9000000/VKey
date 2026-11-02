@@ -19,9 +19,11 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <utility>
 
 #include "core/engine/CommittedTextRestore.h"
 #include "core/engine/RustInputEngine.h"
+#include "core/engine/TypingEngine.h"
 
 namespace NextKey {
 namespace {
@@ -53,6 +55,111 @@ TEST_F(RustInputEngineTest, TelexComposesAndCommits) {
     EXPECT_EQ(engine.Commit(), L"â");
     EXPECT_TRUE(engine.Peek().empty());
     EXPECT_EQ(engine.Count(), 0u);
+}
+
+TEST_F(RustInputEngineTest, ContextualHornCompletionAndBackspaceThroughFfi) {
+    const struct Case {
+        const wchar_t* telex;
+        const wchar_t* vni;
+        const wchar_t* before;
+        int backspaces;
+        const wchar_t* after;
+    } cases[] = {
+        {L"uwo", L"u7o7", L"ươ", 0, L"ươ"},
+        {L"uwow", L"u7o7", L"ươ", 0, L"ươ"},
+        {L"uow", L"uo7", L"ươ", 0, L"ươ"},
+        {L"huow", L"huo7", L"huơ", 0, L"huơ"},
+        {L"thuowr", L"thuo73", L"thuở", 0, L"thuở"},
+        {L"quow", L"quo7", L"quơ", 0, L"quơ"},
+        {L"huowng", L"huo7ng", L"hương", 0, L"hương"},
+        {L"thuowng", L"thuo7ng", L"thương", 0, L"thương"},
+        {L"duongdwf", L"duong972", L"đường", 2, L"đườ"},
+        {L"luoiws", L"luoi71", L"lưới", 1, L"lướ"},
+        {L"duocdwj", L"duoc975", L"được", 1, L"đượ"},
+        {L"duocdwj", L"duoc975", L"được", 2, L"đư"},
+        {L"dadf", L"da92", L"đà", 1, L"đ"},
+    };
+    for (auto method : {InputMethod::Telex, InputMethod::SimpleTelex,
+                        InputMethod::Combined, InputMethod::VNI}) {
+        for (bool spellCheck : {false, true}) {
+            TypingConfig config;
+            config.inputMethod = method;
+            config.spellCheckEnabled = spellCheck;
+            config.spellSuggestEnabled = false;
+            for (const auto& test : cases) {
+                const std::wstring raw = method == InputMethod::VNI ? test.vni : test.telex;
+                SCOPED_TRACE(::testing::PrintToString(raw));
+                RustInputEngine engine(config);
+                for (wchar_t key : raw) engine.PushChar(key);
+                EXPECT_EQ(engine.Peek(), test.before);
+                EXPECT_EQ(engine.PeekRaw(), raw);
+                for (int i = 0; i < test.backspaces; ++i) engine.Backspace();
+                EXPECT_EQ(engine.Peek(), test.after);
+                EXPECT_EQ(engine.Commit(), test.after);
+                EXPECT_TRUE(engine.Peek().empty());
+            }
+        }
+    }
+}
+
+TEST_F(RustInputEngineTest, InvalidDistantStrokeStaysLiteralWithEitherRestorePolicy) {
+    for (auto method : {InputMethod::Telex, InputMethod::SimpleTelex, InputMethod::Combined, InputMethod::VNI}) {
+        for (bool suggest : {false, true}) {
+            for (bool restore : {false, true}) {
+                TypingConfig config;
+                config.inputMethod = method;
+                config.spellCheckEnabled = true;
+                config.spellSuggestEnabled = suggest;
+                config.autoRestoreEnabled = restore;
+                RustInputEngine engine(config);
+                const std::wstring raw = method == InputMethod::VNI ? L"dff9" : L"dffd";
+                for (wchar_t ch : raw) engine.PushChar(ch);
+                EXPECT_EQ(engine.Peek(), raw);
+                EXPECT_EQ(engine.Commit(), raw);
+            }
+        }
+    }
+}
+
+TEST_F(RustInputEngineTest, ScopedStrokeAndLocalRepetitionThroughFfi) {
+    const struct Case {
+        const wchar_t* telex;
+        const wchar_t* vni;
+        const wchar_t* expected;
+        bool rawRestoreOnBasicSpellCheck = false;
+    } cases[] = {
+        {L"dddd", L"dd9", L"dđ"},
+        {L"ddmd", L"d9md", L"đmd"},
+        {L"dmdd", L"dmd9", L"dmđ"},
+        {L"dffdd", L"dffd9", L"dffđ"},
+        {L"hddldd", L"hd9ld9", L"hđlđ"},
+        {L"dieud", L"dieu9", L"đieu"},
+        {L"viecj", L"viec5", L"viẹc", /*rawRestoreOnBasicSpellCheck=*/true},
+    };
+    for (auto method : {InputMethod::Telex, InputMethod::SimpleTelex,
+                        InputMethod::Combined, InputMethod::VNI}) {
+        for (bool spellCheck : {false, true}) {
+            TypingConfig config;
+            config.inputMethod = method;
+            config.spellCheckEnabled = spellCheck;
+            config.spellSuggestEnabled = false;
+            for (const auto& test : cases) {
+                RustInputEngine engine(config);
+                const std::wstring raw = method == InputMethod::VNI ? test.vni : test.telex;
+                SCOPED_TRACE(::testing::PrintToString(raw));
+                for (wchar_t key : raw) engine.PushChar(key);
+                EXPECT_EQ(engine.Peek(), test.expected);
+                EXPECT_EQ(engine.PeekRaw(), raw);
+                // Unfinished pending-iê syllables (e.g. "viecj") display their marks
+                // live ("viẹc"), but in basic mode (spellCheck=true, spellSuggest=false)
+                // restore raw keys at commit (issue #272). With spellCheck=false,
+                // the live composition commits as-is.
+                const std::wstring expectedCommit =
+                    (spellCheck && test.rawRestoreOnBasicSpellCheck) ? raw : test.expected;
+                EXPECT_EQ(engine.Commit(), expectedCommit);
+            }
+        }
+    }
 }
 
 TEST_F(RustInputEngineTest, ShiftedBracketsPreserveUppercaseAndEscapeThroughFfi) {
@@ -408,7 +515,7 @@ TEST_F(RustInputEngineTest, SeedFromTextLiteralRestore) {
 
     ASSERT_TRUE(engine.SeedFromText(L"việt"));
     EXPECT_EQ(engine.Peek(), L"việt");
-    EXPECT_EQ(engine.PeekRaw(), L"việt");
+    EXPECT_EQ(engine.PeekRaw(), L"vieetj");
     EXPECT_EQ(engine.Count(), 4u);
     EXPECT_FALSE(engine.IsToneEscaped());  // seeding is not a tone escape
 }
@@ -938,6 +1045,54 @@ TEST_F(RustInputEngineTest, TestSoafUserDictionary) {
         const bool correctedWithDict = engine.LastCommitWasCorrected();
         EXPECT_FALSE(correctedWithDict);
     }
+}
+
+TEST_F(RustInputEngineTest, ContextReranking_Noi_Ddieu) {
+    TypingConfig config;
+    config.inputMethod = InputMethod::Telex;
+    config.spellCheckEnabled = true;
+    config.spellSuggestEnabled = true;
+
+    RustInputEngine engine(config);
+
+    // 1. Type "nois" -> commits "nói"
+    for (wchar_t c : std::wstring_view(L"nois")) engine.PushChar(c);
+    EXPECT_EQ(engine.Peek(), L"n\u00f3i");
+    EXPECT_EQ(engine.Commit(), L"n\u00f3i");
+
+    // NexusKey calls Reset() between words (in ClearWordState)
+    engine.Reset();
+
+    // 2. Type "ddieu" -> with context "nói", reranker flips it to "điêu" (instead of "điều")!
+    for (wchar_t c : std::wstring_view(L"ddieu")) engine.PushChar(c);
+    EXPECT_EQ(engine.Peek(), L"\u0111ieu");
+    EXPECT_EQ(engine.Commit(), L"\u0111i\u00eau");
+    EXPECT_TRUE(engine.LastCommitWasCorrected());
+}
+
+TEST_F(RustInputEngineTest, ClearContextCallableAndTypingEngineNoOpHarmless) {
+    TypingConfig config;
+    config.inputMethod = InputMethod::Telex;
+
+    TypingEngine cppEngine(config);
+    IInputEngine* cppInterface = &cppEngine;
+    cppInterface->PushChar(L'a');
+    cppInterface->PushChar(L'a');
+    EXPECT_EQ(cppInterface->Peek(), L"â");
+    cppInterface->ClearContext();
+    EXPECT_EQ(cppInterface->Peek(), L"â");
+    EXPECT_EQ(cppInterface->Commit(), L"â");
+    cppInterface->ClearContext();
+
+    RustInputEngine rustEngine(config);
+    IInputEngine* rustInterface = &rustEngine;
+    rustInterface->PushChar(L'a');
+    rustInterface->PushChar(L'a');
+    EXPECT_EQ(rustInterface->Peek(), L"â");
+    rustInterface->ClearContext();
+    EXPECT_EQ(rustInterface->Peek(), L"â");
+    EXPECT_EQ(rustInterface->Commit(), L"â");
+    rustInterface->ClearContext();
 }
 
 #endif

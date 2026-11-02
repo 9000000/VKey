@@ -7,7 +7,12 @@
 #include "core/UIConfig.h"
 #include <algorithm>
 #include <fstream>
+#include <memory>
 #include <filesystem>
+#include <chrono>
+#ifdef _WIN32
+#include <Windows.h>
+#endif
 
 namespace NextKey {
 namespace {
@@ -31,6 +36,124 @@ protected:
     
     std::wstring testConfigPath_;
 };
+
+// Use an isolated directory so .tmp/.corrupt files cannot leak between tests.
+class ConfigDurabilityTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        dir_ = std::filesystem::temp_directory_path() /
+            ("vkey-config-durability-" + std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count()));
+        ASSERT_TRUE(std::filesystem::create_directory(dir_));
+        path_ = (dir_ / "config.toml").wstring();
+    }
+
+    void TearDown() override {
+        std::error_code ec;
+        std::filesystem::remove_all(dir_, ec);
+    }
+
+    void Write(const std::wstring& path, const std::string& content) {
+        std::ofstream file(std::filesystem::path(path), std::ios::binary);
+        file << content;
+        file.close();
+        ASSERT_FALSE(file.fail());
+    }
+
+    std::string Read(const std::wstring& path) {
+        std::ifstream file(std::filesystem::path(path), std::ios::binary);
+        return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    }
+
+    void SaveVni() {
+        TypingConfig config;
+        config.inputMethod = InputMethod::VNI;
+        config.spellCheckEnabled = false;
+        ASSERT_TRUE(ConfigManager::SaveToFile(path_, config));
+    }
+
+    std::filesystem::path dir_;
+    std::wstring path_;
+};
+
+TEST_F(ConfigDurabilityTest, SaveLeavesOnlyTheConfigFile) {
+    SaveVni();
+    SaveVni();
+    EXPECT_EQ(std::distance(std::filesystem::directory_iterator(dir_),
+                            std::filesystem::directory_iterator()), 1);
+    auto loaded = ConfigManager::LoadFromFile(path_);
+    ASSERT_TRUE(loaded);
+    EXPECT_EQ(loaded->inputMethod, InputMethod::VNI);
+}
+
+// The shape a power loss left behind before saves flushed data before rename.
+TEST_F(ConfigDurabilityTest, DamagedConfigIsMovedAsideNotOverwritten) {
+    const std::string damaged(128, '\0');
+    Write(path_, damaged);
+    EXPECT_FALSE(ConfigManager::LoadFromFile(path_));
+    SaveVni();
+    EXPECT_EQ(Read(path_ + L".corrupt"), damaged);
+    auto loaded = ConfigManager::LoadFromFile(path_);
+    ASSERT_TRUE(loaded);
+    EXPECT_EQ(loaded->inputMethod, InputMethod::VNI);
+}
+
+TEST_F(ConfigDurabilityTest, UnreadableConfigFailsSaveInsteadOfBeingReplaced) {
+    ASSERT_TRUE(std::filesystem::create_directory(path_));
+    EXPECT_FALSE(ConfigManager::SaveToFile(path_, TypingConfig{}));
+    EXPECT_TRUE(std::filesystem::is_directory(path_));
+    EXPECT_FALSE(std::filesystem::exists(path_ + L".corrupt"));
+}
+
+TEST_F(ConfigDurabilityTest, MergeKeepsOtherSections) {
+    Write(path_, "[input]\nmethod = 'vni'\n[macros]\nbtw = 'by the way'\n[custom]\nvalue = 42\n");
+    ASSERT_TRUE(ConfigManager::SaveUIConfig(path_, UIConfig{}));
+    EXPECT_EQ(ConfigManager::LoadMacros(path_)[L"btw"], L"by the way");
+    EXPECT_NE(Read(path_).find("value = 42"), std::string::npos);
+    EXPECT_FALSE(std::filesystem::exists(path_ + L".corrupt"));
+}
+
+TEST_F(ConfigDurabilityTest, CacheNoticesRewriteWithUnchangedTimestamp) {
+    ASSERT_TRUE(ConfigManager::SaveToFile(path_, TypingConfig{}));
+    ASSERT_TRUE(ConfigManager::LoadFromFile(path_)); // Prime cache.
+    const auto mtime = std::filesystem::last_write_time(path_);
+    Write(path_, "[input]\nmethod = 'vni'\n");
+    std::filesystem::last_write_time(path_, mtime);
+    auto loaded = ConfigManager::LoadFromFile(path_);
+    ASSERT_TRUE(loaded);
+    EXPECT_EQ(loaded->inputMethod, InputMethod::VNI);
+}
+
+TEST_F(ConfigDurabilityTest, TempWriteFailureLeavesConfigIntact) {
+    SaveVni();
+    const auto previous = Read(path_);
+    ASSERT_TRUE(std::filesystem::create_directory(path_ + L".tmp"));
+    EXPECT_FALSE(ConfigManager::SaveToFile(path_, TypingConfig{}));
+    EXPECT_EQ(Read(path_), previous);
+}
+
+#ifdef _WIN32
+TEST_F(ConfigDurabilityTest, UnicodePathRoundTrips) {
+    path_ = (dir_ / L"c\u1ea5u-h\u00ecnh.toml").wstring();
+    SaveVni();
+    auto loaded = ConfigManager::LoadFromFile(path_);
+    ASSERT_TRUE(loaded);
+    EXPECT_EQ(loaded->inputMethod, InputMethod::VNI);
+}
+
+TEST_F(ConfigDurabilityTest, FailedReplacementPreservesConfig) {
+    SaveVni();
+    const auto previous = Read(path_);
+    // Allow reads/writes but deny deletion/replacement, like a file scanner.
+    HANDLE handle = CreateFileW(path_.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    ASSERT_NE(handle, INVALID_HANDLE_VALUE);
+    std::unique_ptr<void, decltype(&CloseHandle)> heldFile(handle, &CloseHandle);
+    EXPECT_FALSE(ConfigManager::SaveToFile(path_, TypingConfig{}));
+    EXPECT_EQ(Read(path_), previous);
+    EXPECT_FALSE(std::filesystem::exists(path_ + L".tmp"));
+}
+#endif
 
 // ============================================================================
 // Loading Tests
@@ -140,6 +263,52 @@ tsf_apps = true
     auto loaded = ConfigManager::LoadFromFile(testConfigPath_);
     ASSERT_TRUE(loaded.has_value());
     EXPECT_TRUE(loaded->hidePreeditUnderline);
+}
+
+TEST_F(ConfigManagerTest, MacroUndoOnBackspaceDefaultsOffAndRoundTrips) {
+    WriteTestConfig(R"(
+[features]
+macro_enabled = true
+[macros]
+bbh = 'bún bò Huế'
+)");
+    auto config = ConfigManager::LoadFromFile(testConfigPath_);
+    ASSERT_TRUE(config.has_value());
+    EXPECT_FALSE(config->macroUndoOnBackspace);
+    const auto macros = ConfigManager::LoadMacros(testConfigPath_);
+
+    for (bool undoOnBs : {true, false}) {
+        config->macroUndoOnBackspace = undoOnBs;
+        ASSERT_TRUE(ConfigManager::SaveToFile(testConfigPath_, *config));
+        const auto loaded = ConfigManager::LoadFromFile(testConfigPath_);
+        ASSERT_TRUE(loaded.has_value());
+        EXPECT_EQ(loaded->macroUndoOnBackspace, undoOnBs);
+        EXPECT_TRUE(loaded->macroEnabled);
+        EXPECT_EQ(ConfigManager::LoadMacros(testConfigPath_), macros);
+    }
+}
+
+TEST_F(ConfigManagerTest, MacroTitleCaseDefaultsOffAndRoundTripsWithoutChangingMacros) {
+    WriteTestConfig(R"(
+[features]
+auto_caps_macro = true
+[macros]
+nMa = 'on My way'
+)");
+    auto config = ConfigManager::LoadFromFile(testConfigPath_);
+    ASSERT_TRUE(config.has_value());
+    EXPECT_FALSE(config->macroTitleCase);
+    const auto macros = ConfigManager::LoadMacros(testConfigPath_);
+
+    for (bool titleCase : {true, false}) {
+        config->macroTitleCase = titleCase;
+        ASSERT_TRUE(ConfigManager::SaveToFile(testConfigPath_, *config));
+        const auto loaded = ConfigManager::LoadFromFile(testConfigPath_);
+        ASSERT_TRUE(loaded.has_value());
+        EXPECT_EQ(loaded->macroTitleCase, titleCase);
+        EXPECT_TRUE(loaded->autoCapsMacro);
+        EXPECT_EQ(ConfigManager::LoadMacros(testConfigPath_), macros);
+    }
 }
 
 TEST_F(ConfigManagerTest, SaveToFile_PreservesUISection) {
@@ -665,6 +834,7 @@ list = ["cs2.exe"]
 
 TEST_F(ConfigManagerTest, SaveAndLoad_UnicodePath) {
     std::wstring unicodePath = L"cấu_hình_tiếng_việt.toml";
+    testConfigPath_ = unicodePath; // Fixture also cleans the recovery copy.
     std::filesystem::remove(std::filesystem::path(unicodePath));
 
     TypingConfig config;

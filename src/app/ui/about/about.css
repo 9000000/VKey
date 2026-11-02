@@ -8,7 +8,7 @@ body {
 
 .container {
     width: 330px;
-    height: 460px;
+    height: 360px;
     box-sizing: border-box;
     padding: 12px;
     position: relative;
@@ -59,7 +59,7 @@ body {
 .app-title {
     font-size: 28px;
     font-weight: 700;
-    color: var(--color-primary);
+    color: var(--text-primary);
     margin: 0 0 4px 0;
 }
 
@@ -128,50 +128,60 @@ body {
 
 .buttons-section {
     flow: horizontal;
-    justify-content: center;
-    border-spacing: 12px;
-    margin-bottom: 10px;
+    border-spacing: 10px;
 }
 
-.btn-repo {
-    padding: 10px 20px;
+.btn-about {
+    appearance: none;
+    behavior: button;
+    width: 1*;
+    height: 38px;
+    padding: 0 10px;
+    border: none;
     border-radius: 6px;
     font-size: 12px;
     font-weight: 600;
+    text-align: center;
+    vertical-align: middle;
+    white-space: nowrap;
     cursor: pointer;
-    transition: all 0.15s ease;
-    min-width: 120px;
+    transition: background-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.btn-about:focus {
+    outline: 2px solid var(--color-primary);
+    outline-offset: 2px;
 }
 
 .btn-primary {
     background: var(--color-primary);
     color: white;
-    border: none;
 }
 
 .btn-primary:hover {
     background: var(--color-primary-hover);
 }
 
-.btn-secondary {
-    background: transparent;
-    color: var(--text-primary);
-    box-shadow: inset 0 0 0 1px var(--text-secondary);
-}
-
-.btn-secondary:hover {
-    background: var(--bg-hover);
-    border-color: var(--text-light);
+.btn-primary:active {
+    background: var(--color-primary-hover);
+    box-shadow: inset 0 0 0 2px var(--text-primary);
 }
 
 .btn-report {
-    background: transparent;
-    color: var(--color-danger);
-    box-shadow: inset 0 0 0 1px var(--color-danger);
+    background: var(--bg-card);
+    color: var(--text-primary);
+    box-shadow: inset 0 0 0 1px var(--border-input);
 }
 
 .btn-report:hover {
-    background: var(--color-danger);
-    color: white;
+    background: var(--color-primary-light);
+    color: var(--color-primary);
+    box-shadow: inset 0 0 0 1px var(--color-primary);
+}
+
+.btn-report:active {
+    background: var(--color-primary-medium);
+    color: var(--color-primary-hover);
+    box-shadow: inset 0 0 0 2px var(--color-primary);
 }
 

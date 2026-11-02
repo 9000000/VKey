@@ -22,6 +22,7 @@
 #include "app/system/OutputDispatcher.h"
 #include "app/system/CommitState.h"
 #include "app/system/AdaptiveTick.h"
+#include "output/Internal.h"
 #include "core/pipeline/IBackwardEditExecutor.h"
 #include "core/pipeline/ICommitUndoExecutor.h"
 #include "core/pipeline/IEscRestoreRawExecutor.h"
@@ -85,11 +86,10 @@ public:
     void ExecuteReplace(std::wstring_view newText,
                         std::uint16_t reinjectVk) override;
 
-    // Pipeline::ICommitUndoExecutor — Wave 3 adapter for CommitUndoFeature.
-    // Thin wrapper around the existing HandleCommitUndoFsm FSM body. Reads
-    // vnMode internally from vietnameseMode_ atomic. Maps KeyOutcome →
-    // CommitUndoOutcome at the boundary. Wave N+ will lift the FSM body
-    // into CommitUndoFeature::Try for true single-owner state.
+    // Pipeline::ICommitUndoExecutor — Wave 3 adapter for CommitUndoFeature
+    // (implemented in HookEngineCommitUndo.cpp). Thin wrapper around the
+    // HandleCommitUndoFsm body. Reads vnMode internally from vietnameseMode_ atomic.
+    // Maps KeyOutcome → CommitUndoOutcome at the boundary.
     [[nodiscard]] NextKey::Pipeline::CommitUndoOutcome HandleCommitUndo(
         std::uint16_t vkCode,
         bool shift, bool capsLock, bool ctrl, bool alt, bool win) override;
@@ -283,7 +283,7 @@ public:
     [[nodiscard]] bool IsRunning() const noexcept { return lifecycle_.IsRunning(); }
 
     // Magic number to mark our own SendInput events (prevents other hooks from processing them)
-    static constexpr ULONG_PTR VKEY_EXTRA_INFO = 0x4E4B;  // "NK"
+    static constexpr ULONG_PTR VKEY_EXTRA_INFO = NextKey::Output::Internal::kVKeyExtraInfo;  // "NK"
 
     // Wave 3 PR 3.2 — `GetExeNameForHwnd` migrated to FocusOwner alongside the
     // rest of the focus-classification subsystem. Callers reach it via
@@ -346,10 +346,10 @@ private:
     // set otherKeyPressed_ themselves before returning Pass).
     [[nodiscard]] KeyOutcome RunTopGuards(DWORD vkCode);
 
-    // H1a (extracted from ProcessKeyDown step 2d): commit-undo state machine
+    // H1a (extracted to HookEngineCommitUndo.cpp): commit-undo state machine
     // (Idle/Ready/Primed) — handles backspace-into-committed-word replay.
-    // Mutates commitUndoState_/pendingTriggerCount_/macroCrossCommit_/rawMacroBuffer_
-    // and may call HandleAlphaKey/HandleVniDigitKey/HandleBackspace/InjectKey.
+    // Mutates commitState_/macroCrossCommit_/rawMacroBuffer_ and may call
+    // HandleAlphaKey/HandleVniDigitKey/HandleBackspace/InjectKey.
     [[nodiscard]] KeyOutcome HandleCommitUndoFsm(DWORD vkCode, bool vnMode,
                                                  bool shift, bool capsLock,
                                                  bool ctrl, bool alt, bool win);
@@ -383,10 +383,13 @@ private:
     [[nodiscard]] bool HandleAlphaKey(DWORD vkCode, bool shift, bool capsLock);
     [[nodiscard]] bool HandleVniDigitKey(DWORD vkCode); // VNI/UserDefined digit 0-9: push to engine, replace composition
     void HandleBackspace();
-    bool CommitComposition();  // Returns true if auto-restore changed text
+    // Returns true if auto-restore changed text. `verbatim` drops a lexicon
+    // correction (IsVerbatimCommitTrigger); raw restore still applies.
+    bool CommitComposition(bool verbatim = false);
     void ResetComposition();
-    void CancelCommitUndo();   // commitUndoState_ = Idle + commitStack_.clear()
-    void SetCommitUndoReady(); // commitUndoState_ = Ready + timestamp
+    // Commit-undo mutators (HookEngineCommitUndo.cpp)
+    void CancelCommitUndo();   // commitState_.Cancel()
+    void SetCommitUndoReady(); // commitState_.SetReady() + pending trigger inherit
 
     // Output — universal SendInput with KEYEVENTF_UNICODE. Wave 3 PR 3.3
     // shrank the body to a thin shim: prefix-diff + code-table encoding +
@@ -411,8 +414,8 @@ private:
     // Modifier state tracking (used by double-Alt and layout change detection)
     void TrackModifier(DWORD vkCode, bool isDown);
 
-    // Restore a committed word for another edit. Backspace prefers the visible
-    // glyph state; tone/modifier keys preserve raw replay provenance.
+    // Restore a committed word for another edit (HookEngineCommitUndo.cpp). Backspace
+    // prefers the visible glyph state; tone/modifier keys preserve raw replay provenance.
     [[nodiscard]] bool ReplayCommittedChars(bool preferVisibleText = false);
 
     // Commit trigger check
@@ -440,7 +443,7 @@ private:
 
     // Drop the raw macro buffer. wasFirstCharAutoCapped_ is only meaningful while the
     // buffer still starts at the word's first character, so the two must die together —
-    // a surviving flag would title-case a macro matched by a restarted buffer.
+    // a surviving flag would capitalize a macro matched by a restarted buffer.
     void ClearMacroBuffer() noexcept;
 
     // Wave 3 PR 3.2 — IsTrayOrTaskbarWindow + IsWebView2App migrated to
@@ -592,7 +595,6 @@ private:
     // (main thread). Readers: hook hot path uses .load(acquire); other call
     // sites also use .load(acquire) for uniform pattern (cost = MOV on x86).
     std::atomic<bool> autoCaps_{false};
-    std::atomic<bool> autoCapsMacro_{false};
     // tempEngineOff_ / digitLedWord_: per-word "treat as English" flags.
     // Plain bool — written from hook thread (DispatchKeyAction, ProcessKeyUp)
     // AND main/WinEvent thread (OnFocusChanged, ToggleVietnameseMode, ClearWordState).
@@ -663,6 +665,11 @@ private:
     // Hook-thread owned. Focus polls can classify the same HWND every 200 ms;
     // only the first application may request the expensive TIP re-activation.
     TsfFocusActivationState tsfFocusActivationState_{};
+    // Hook-thread owned: tracks active window and focused control so spurious
+    // background WinEvents (e.g. FastStone Capture timer UI, issue #273)
+    // do not wipe live composition when typing in the same context.
+    std::uintptr_t lastAppliedHwnd_{0};
+    std::uintptr_t lastAppliedEffectiveFocusHwnd_{0};
     // vk of the key-down currently being processed (and possibly injecting for).
     // Stamped before ProcessKeyDown; read on the re-entrant `sending_` branch to
     // identify a physical key that leaked into the injection window as the
@@ -711,6 +718,11 @@ private:
     // of every 200 ms retry (see design §5).
     bool lastFlushFailed_ = false;
 
+    // Worker-thread owned: tracks dispatched focus target to drop spurious
+    // WinEvents from background tool windows whose target hasn't changed (#273).
+    std::uintptr_t lastDispatchedHwnd_{0};
+    std::uintptr_t lastDispatchedTargetHwnd_{0};
+
     // Smart-switch off→on cross-thread handoff. ReloadFromToml runs on the
     // worker thread; it can't mutate appModeMap_ directly (hook-thread-owned).
     // Pattern: worker loads from TOML, atomic-stashes here; hook's
@@ -751,6 +763,18 @@ private:
     // (macroTable_ + spaceMacroKeys_ removed — Phase 3d. Live in
     // configSnapshot_->macroTable / ->spaceMacroKeys now.)
     std::wstring rawMacroBuffer_;
+
+    // Macro undo on Backspace (issue #264)
+    struct MacroUndoState {
+        std::wstring shortcut;
+        std::size_t  expansionLength{0};
+        bool         hasTrailingTrigger{false};
+        DWORD        timestamp{0};
+        bool         active{false};
+    };
+    MacroUndoState macroUndoState_{};
+    static constexpr DWORD kMacroUndoTimeoutMs = 4000;
+    void ClearMacroUndo() noexcept;
 
     // Hooks
     // Wave 3 PR 3.1 — hook handles, thread, mailbox moved to HookLifecycle.
@@ -823,9 +847,10 @@ private:
     TickRetuneFn tickRetuneFn_;
 
     void DrainHookCommands();                                 // hook thread only
+    // Focus routing and application (HookEngineFocus.cpp)
     void RouteFocusOnHookThread(std::shared_ptr<const FocusClassification> cls);
     void TryApplyDeferredFocusOnHookThread();
-    void ReconcileModifierStateOnHookThread() noexcept;
+    void ReconcileModifierStateOnHookThread(bool gestureBoundary = true) noexcept;
     void ApplyFocusOnHookThread(std::shared_ptr<const FocusClassification> cls);
     void RefreshBrowserRouteOnHookThread(bool forceRead, bool notifyCallback);
     [[nodiscard]] bool IsEffectiveTsf() const noexcept;

@@ -3,6 +3,7 @@
 
 /* Container - Fixed size, blur-friendly */
 .container {
+    flow: vertical;
     width: 420px;
     height: auto;
     background: var(--bg-glass);
@@ -17,6 +18,7 @@
     position: relative;
     width: 100%;
     height: 36px;
+    flex-shrink: 0;
     line-height: 36px;
     padding: 0 12px;
     text-align: left;
@@ -27,7 +29,7 @@
 .title-text {
     font-size: 16px;
     font-weight: 700;
-    color: var(--color-primary);
+    color: var(--text-primary);
     letter-spacing: 0.5px;
 }
 
@@ -121,7 +123,10 @@
 
 /* Content Section */
 .content-section {
+    flow: vertical;
     padding: 12px;
+    min-height: 0;
+    overflow-y: auto;
 }
 
 /* Settings Card */
@@ -136,7 +141,7 @@
 .card-title {
     font-size: 12px;
     font-weight: 600;
-    color: var(--color-primary);
+    color: var(--text-secondary);
     margin-bottom: 8px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -314,7 +319,7 @@
 .hotkey-display {
     font-family: "Cascadia Code", "Consolas", monospace;
     font-weight: 600;
-    color: var(--color-primary);
+    color: var(--text-primary);
 }
 
 .record-hint {
@@ -452,6 +457,7 @@
 
 /* Footer */
 .footer-section {
+    flex-shrink: 0;
     padding-top: 8px;
     padding-bottom: 4px;
 }

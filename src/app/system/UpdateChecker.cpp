@@ -17,6 +17,7 @@
 #include <ShlObj.h>
 #include <Shlwapi.h>
 #include <fstream>
+#include <filesystem>
 #include <sstream>
 #include <algorithm>
 #include <exception>
@@ -83,7 +84,7 @@ std::string UpdateChecker::DownloadToString(const std::wstring& url) noexcept {
         }
 
         // Read the temp file
-        std::ifstream file(tempFile, std::ios::binary);
+        std::ifstream file(std::filesystem::path(tempFile), std::ios::binary);
         if (!file.is_open()) {
             DeleteFileW(tempFile.c_str());
             return {};
@@ -206,14 +207,8 @@ UpdateInfo UpdateChecker::CheckForUpdate() noexcept {
         // Find release asset
 #ifdef VKEY_LITE_MODE
         std::string assetUrl = FindAssetUrl(response, "VKeyClassic-x64.zip");
-        if (assetUrl.empty()) {
-            assetUrl = FindAssetUrl(response, "VKeyClassic.zip");
-        }
 #else
         std::string assetUrl = FindAssetUrl(response, "VKey-x64.zip");
-        if (assetUrl.empty()) {
-            assetUrl = FindAssetUrl(response, "VKey.zip");
-        }
 #endif
 
         if (assetUrl.empty()) return info;
@@ -247,7 +242,7 @@ bool UpdateChecker::DownloadFile(const std::wstring& url, const std::wstring& lo
 
 bool UpdateChecker::ShowUpdateDialog(HWND parent, const UpdateInfo& info) {
     // Format the content string with version
-    wchar_t content[256];
+    wchar_t content[1024];
     swprintf_s(content, S(StringId::UPDATE_AVAILABLE_BODY), info.version.c_str());
 
     // Build changelog link text
@@ -297,7 +292,6 @@ bool UpdateChecker::ShowUpdateDialog(HWND parent, const UpdateInfo& info) {
     int button = 0;
     HRESULT hr = TaskDialogIndirect(&tdc, &button, nullptr, nullptr);
     if (FAILED(hr)) return false;
-
     return button == 1001;
 }
 
@@ -346,7 +340,7 @@ bool UpdateChecker::ShowProgressDialog(HWND parent, const wchar_t* message,
     return doneFlag.load(std::memory_order_acquire);
 }
 
-bool UpdateChecker::DownloadWithProgress(HWND parent, const std::wstring& downloadUrl) {
+bool UpdateChecker::DownloadWithProgress(HWND parent, const std::wstring& downloadUrl, std::uint32_t expectedVersion) {
     struct State {
         std::atomic<bool> done{false};
         std::atomic<bool> cancel{false};
@@ -354,10 +348,10 @@ bool UpdateChecker::DownloadWithProgress(HWND parent, const std::wstring& downlo
     };
     auto state = std::make_shared<State>();
 
-    std::thread([state, downloadUrl]() {
+    std::thread([state, downloadUrl, expectedVersion]() {
         try {
             CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-            state->success = DownloadAndLaunchInstaller(downloadUrl, state->cancel);
+            state->success = DownloadAndLaunchInstaller(downloadUrl, state->cancel, expectedVersion);
             CoUninitialize();
         } catch (const std::exception& e) {
             CrashLog(L"UpdateChecker::DownloadWithProgress::thread", e.what());
@@ -413,13 +407,26 @@ bool UpdateChecker::DownloadWithProgress(HWND parent, const std::wstring& downlo
     return true;
 }
 
-bool UpdateChecker::DownloadAndLaunchInstaller(const std::wstring& downloadUrl, std::atomic<bool>& cancelFlag) noexcept {
+bool UpdateChecker::DownloadAndLaunchInstaller(const std::wstring& downloadUrl, std::atomic<bool>& cancelFlag, std::uint32_t expectedVersion) noexcept {
     try {
         if (cancelFlag.load(std::memory_order_relaxed)) return false;
 
         wchar_t tempDir[MAX_PATH] = {};
         GetTempPathW(MAX_PATH, tempDir);
-        std::wstring zipPath = std::wstring(tempDir) + L"VKey_update.zip";
+        wchar_t placeholder[MAX_PATH] = {};
+        if (!GetTempFileNameW(tempDir, L"VKU", 0, placeholder)) return false;
+        std::wstring zipPath = std::wstring(placeholder) + L".zip";
+        DeleteFileW(placeholder);
+        struct StagedPackage {
+            std::wstring path;
+            bool handedOff = false;
+            ~StagedPackage() {
+                if (!handedOff) {
+                    DeleteFileW(path.c_str());
+                    DeleteFileW((path + L".sig").c_str());
+                }
+            }
+        } staged{zipPath};
 
         if (!DownloadFile(downloadUrl, zipPath, cancelFlag)) return false;
 
@@ -438,6 +445,10 @@ bool UpdateChecker::DownloadAndLaunchInstaller(const std::wstring& downloadUrl, 
             DeleteFileW(zipPath.c_str());
             return false;
         }
+
+        if (!DownloadFile(downloadUrl + L".sig", zipPath + L".sig", cancelFlag) ||
+            cancelFlag.load(std::memory_order_acquire) ||
+            !VerifySignedUpdateZip(zipPath, expectedVersion)) return false;
 
         // Launch updater: self --install-update <zip>
         wchar_t exePath[MAX_PATH] = {};
@@ -466,6 +477,7 @@ bool UpdateChecker::DownloadAndLaunchInstaller(const std::wstring& downloadUrl, 
         }
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
+        staged.handedOff = true;
         return true;
     } catch (...) {
         return false;

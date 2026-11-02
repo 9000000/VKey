@@ -36,6 +36,10 @@ bool HeartbeatPublisher::Start() {
         return false;
     }
 
+    // The watchdog keeps this named event alive across publisher restarts.
+    // CreateEvent's initial state is ignored when the object already exists.
+    ResetEvent(gracefulShutdownEvent_);
+
     // Unnamed (kernel-internal) manual-reset event. Stays signaled once Stop()
     // fires it so any in-flight wait — or a wait that begins after Stop() —
     // returns immediately. Manual-reset rather than auto-reset because we
@@ -83,6 +87,14 @@ void HeartbeatPublisher::Stop() {
 void HeartbeatPublisher::SignalGracefulShutdown() {
     if (gracefulShutdownEvent_) {
         SetEvent(gracefulShutdownEvent_);
+    } else {
+        // A supervisor from a previous installation may still be running even
+        // when this installation has watchdog disabled. Honour tray quit there.
+        HANDLE graceful = OpenEventW(EVENT_MODIFY_STATE, FALSE, GRACEFUL_SHUTDOWN_EVENT_NAME);
+        if (graceful) {
+            SetEvent(graceful);
+            CloseHandle(graceful);
+        }
     }
 }
 
