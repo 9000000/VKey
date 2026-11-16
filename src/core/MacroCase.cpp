@@ -172,6 +172,20 @@ MacroPlan Plan(const PlanInputs& in, const CaseMapper& mapper) {
     return plan;
 }
 
+std::wstring_view ReplacementDocumentText(
+    const MacroPlan& plan, std::wstring_view previousComposition,
+    bool macroCrossCommit, wchar_t triggerChar) noexcept {
+    if (!macroCrossCommit && !previousComposition.empty()) {
+        return previousComposition;
+    }
+    std::wstring_view text = plan.shortcut;
+    if (plan.isPartOfMacro && triggerChar > L' ' &&
+        !text.empty() && text.back() == triggerChar) {
+        text.remove_suffix(1);
+    }
+    return text;
+}
+
 std::wstring ExpandEscapesForClipboard(std::wstring_view expansion) {
     std::wstring out;
     out.reserve(expansion.size());
@@ -242,6 +256,10 @@ bool IsCommitTrigger(uint32_t vkCode) noexcept {
 bool IsTextProducingTrigger(uint32_t vkCode, wchar_t triggerChar) noexcept {
     return IsCommitTrigger(vkCode)
         && (vkCode == 0x20 || triggerChar > L' ');
+}
+
+std::wstring RawBufferForRevive(std::wstring_view raw, std::wstring_view word) {
+    return std::wstring(raw.ends_with(word) ? raw : word);
 }
 
 bool CanUndoWithBackspaces(std::wstring_view expansion) noexcept {

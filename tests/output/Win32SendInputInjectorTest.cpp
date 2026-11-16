@@ -9,10 +9,14 @@
 
 namespace NextKey::Output::Test {
 
+namespace {
+void* s_rollbackTestCapture = nullptr;
+}
+
 class Win32SendInputInjectorTest : public InjectorTestBase {};
 
 TEST_F(Win32SendInputInjectorTest, ReplaceEmptyTextSendsBackspacesOnly) {
-    Win32SendInputInjector inj(/*needsBaitCharPrefix=*/false);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::None);
     EXPECT_TRUE(inj.Replace(3, L""));
     ASSERT_EQ(capturedInputs.size(), 6u);  // 3 BS × (down + up)
     for (size_t i = 0; i < 6; ++i) {
@@ -24,7 +28,7 @@ TEST_F(Win32SendInputInjectorTest, ReplaceEmptyTextSendsBackspacesOnly) {
 }
 
 TEST_F(Win32SendInputInjectorTest, ReplaceWithCharsSendsBatch) {
-    Win32SendInputInjector inj(/*needsBaitCharPrefix=*/false);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::None);
     EXPECT_TRUE(inj.Replace(2, L"vi"));
     // Expected: 2 BS down/up (4 events) + 2 chars down/up (4 events) = 8 events
     ASSERT_EQ(capturedInputs.size(), 8u);
@@ -37,27 +41,22 @@ TEST_F(Win32SendInputInjectorTest, ReplaceWithCharsSendsBatch) {
     EXPECT_EQ(capturedInputs[6].ki.wScan, L'i');
 }
 
-TEST_F(Win32SendInputInjectorTest, BaitCharFiresOnPureBackspaceByDefault) {
-    // Default (suggestKeepChars=false): pure-BS still emits bait so a
-    // Chromium suggestion popup can't swallow the BS as a dismiss-only
-    // gesture — engine state stays in sync at the cost of a brief flicker.
-    Win32SendInputInjector inj(/*needsBaitCharPrefix=*/true);
+TEST_F(Win32SendInputInjectorTest, BaitCharSkippedOnPureBackspaceByDefault) {
+    // Pure-BS (text.empty()) ALWAYS skips bait — never injects U+202F so
+    // HTML email, number, and validated web inputs do not delete 2 chars (fixes #280 & #108).
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::UnicodeBait);
     EXPECT_TRUE(inj.Replace(2, L""));
-    // Expected: bait (down+up=2) + (2+1)=3 BS × down+up = 8 events
-    // (1 extra BS deletes the bait).
-    ASSERT_EQ(capturedInputs.size(), 8u);
-    EXPECT_NE(capturedInputs[0].ki.dwFlags & KEYEVENTF_UNICODE, 0u);
-    EXPECT_EQ(capturedInputs[0].ki.wScan, 0x202F);
-    for (size_t i = 2; i < 8; ++i) {
+    // Expected: 2 BS × (down + up) = 4 events. No bait, no extra BS.
+    ASSERT_EQ(capturedInputs.size(), 4u);
+    for (size_t i = 0; i < 4; ++i) {
         EXPECT_EQ(capturedInputs[i].ki.wVk, VK_BACK)
             << "event[" << i << "].wVk should be VK_BACK";
     }
 }
 
 TEST_F(Win32SendInputInjectorTest, BaitCharSkippedOnPureBackspaceWhenSuggestKeepCharsOn) {
-    // Opt-in setting: BS only dismisses the popup, preserves typed chars
-    // ("face" + BS → "face"). Trade-off documented on the toggle.
-    Win32SendInputInjector inj(/*needsBaitCharPrefix=*/true);
+    // suggestKeepChars=true also skips bait on pure-BS.
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::UnicodeBait);
     inj.SetSuggestKeepChars(true);
     EXPECT_TRUE(inj.Replace(2, L""));
     // Expected: 2 BS × (down + up) = 4 events. No bait, no extra BS.
@@ -73,7 +72,7 @@ TEST_F(Win32SendInputInjectorTest, BaitCharFiresOnReplaceWithText) {
     // transform replaces the trailing chars and must dismiss any
     // pending Chromium suggest first so subsequent chars land into
     // the field, not into a stale suggestion frame.
-    Win32SendInputInjector inj(/*needsBaitCharPrefix=*/true);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::UnicodeBait);
     EXPECT_TRUE(inj.Replace(1, L"x"));
     // Expected: bait (down+up = 2) + 2 BS down/up (= 4: 1 orig + 1 extra
     // to delete the bait) + 1 char down/up (= 2) = 8 events.
@@ -86,6 +85,20 @@ TEST_F(Win32SendInputInjectorTest, BaitCharFiresOnReplaceWithText) {
     EXPECT_EQ(capturedInputs[6].ki.wScan, L'x');
 }
 
+TEST_F(Win32SendInputInjectorTest, BaitCharSkippedOnReplaceWithTextWhenSuggestKeepCharsOn) {
+    // Opt-in setting (suggestKeepChars=true): skips bait even on transforms,
+    // protecting Auto-Restore and tone escape in strict email/number inputs.
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::UnicodeBait);
+    inj.SetSuggestKeepChars(true);
+    EXPECT_TRUE(inj.Replace(1, L"x"));
+    // Expected: 1 BS down/up (= 2) + 1 char down/up (= 2) = 4 events. No bait, no extra BS.
+    ASSERT_EQ(capturedInputs.size(), 4u);
+    EXPECT_EQ(capturedInputs[0].ki.wVk, VK_BACK);
+    EXPECT_EQ(capturedInputs[1].ki.wVk, VK_BACK);
+    EXPECT_NE(capturedInputs[2].ki.dwFlags & KEYEVENTF_UNICODE, 0u);
+    EXPECT_EQ(capturedInputs[2].ki.wScan, L'x');
+}
+
 TEST_F(Win32SendInputInjectorTest, HeldShiftIsReleasedAroundBackspaceReplacement) {
     // Issue #225: Edge Excel Web interprets a synthetic Backspace while the
     // user holds Shift for Telex Shift+dd -> Đ as a destructive editor
@@ -95,7 +108,7 @@ TEST_F(Win32SendInputInjectorTest, HeldShiftIsReleasedAroundBackspaceReplacement
         return (vk == VK_RSHIFT || vk == VK_SHIFT) ? static_cast<SHORT>(-32768) : 0;
     };
 
-    Win32SendInputInjector inj(/*needsBaitCharPrefix=*/true);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::UnicodeBait);
     EXPECT_TRUE(inj.Replace(1, L"Đ"));
 
     // Shift-up, bait, two Backspaces (bait + original D), Đ, Shift-down.
@@ -122,7 +135,7 @@ TEST_F(Win32SendInputInjectorTest, BothShiftKeysRetainTheirIdentity) {
             : 0;
     };
 
-    Win32SendInputInjector inj(/*needsBaitCharPrefix=*/false);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::None);
     EXPECT_TRUE(inj.Replace(1, L""));
 
     ASSERT_EQ(capturedInputs.size(), 6u);
@@ -142,7 +155,7 @@ TEST_F(Win32SendInputInjectorTest, HeldControlIsReleasedAroundBackspaceReplaceme
         return (vk == VK_LCONTROL || vk == VK_CONTROL) ? static_cast<SHORT>(-32768) : 0;
     };
 
-    Win32SendInputInjector inj(/*needsBaitCharPrefix=*/false);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::None);
     EXPECT_TRUE(inj.Replace(1, L"a"));
 
     // LControl-up, Backspace (down+up), 'a' (down+up), LControl-down.
@@ -167,7 +180,7 @@ TEST_F(Win32SendInputInjectorTest, BothControlKeysRetainTheirIdentity) {
             : 0;
     };
 
-    Win32SendInputInjector inj(/*needsBaitCharPrefix=*/false);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::None);
     EXPECT_TRUE(inj.Replace(1, L""));
 
     ASSERT_EQ(capturedInputs.size(), 6u);
@@ -186,7 +199,7 @@ TEST_F(Win32SendInputInjectorTest, HeldControlAndShiftAreBothReleased) {
             : 0;
     };
 
-    Win32SendInputInjector inj(/*needsBaitCharPrefix=*/false);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::None);
     EXPECT_TRUE(inj.Replace(1, L""));
 
     ASSERT_EQ(capturedInputs.size(), 6u);
@@ -203,7 +216,7 @@ TEST_F(Win32SendInputInjectorTest, HeldAltIsReleasedAroundBackspaceReplacement) 
         return (vk == VK_LMENU || vk == VK_MENU) ? static_cast<SHORT>(-32768) : 0;
     };
 
-    Win32SendInputInjector inj(/*needsBaitCharPrefix=*/false);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::None);
     EXPECT_TRUE(inj.Replace(1, L"a"));
 
     ASSERT_EQ(capturedInputs.size(), 6u);
@@ -221,7 +234,7 @@ TEST_F(Win32SendInputInjectorTest, BaitCharSkippedWhenBsCountZero) {
     // Pure-typing (no deletions) on the Chromium variant: no bait,
     // no extra BS — just the chars. Autocomplete-dismiss isn't needed
     // when nothing is being removed.
-    Win32SendInputInjector inj(/*needsBaitCharPrefix=*/true);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::UnicodeBait);
     EXPECT_TRUE(inj.Replace(0, L"y"));
     ASSERT_EQ(capturedInputs.size(), 2u);  // 1 char × down+up
     EXPECT_NE(capturedInputs[0].ki.dwFlags & KEYEVENTF_UNICODE, 0u);
@@ -229,7 +242,7 @@ TEST_F(Win32SendInputInjectorTest, BaitCharSkippedWhenBsCountZero) {
 }
 
 TEST_F(Win32SendInputInjectorTest, ReplaceReturnsFalseOnPartialSend) {
-    Win32SendInputInjector inj(/*needsBaitCharPrefix=*/false);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::None);
     sendInputReturnOverride = 2;  // simulate partial: 2 events delivered out of 6
     EXPECT_FALSE(inj.Replace(3, L""));
 }
@@ -240,7 +253,7 @@ TEST_F(Win32SendInputInjectorTest, PartialSendAfterShiftUpAttemptsShiftRestore) 
     };
     sendInputReturnOverride = 1;  // only the leading Shift-up was delivered
 
-    Win32SendInputInjector inj(/*needsBaitCharPrefix=*/false);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::None);
     EXPECT_FALSE(inj.Replace(1, L"x"));
 
     // Initial six-event batch plus a one-event best-effort Shift-down recovery.
@@ -254,7 +267,7 @@ TEST_F(Win32SendInputInjectorTest, PartialSendAfterShiftUpAttemptsShiftRestore) 
 }
 
 TEST_F(Win32SendInputInjectorTest, SendKeyEmitsDownAndUpWithMarker) {
-    Win32SendInputInjector inj(/*needsBaitCharPrefix=*/false);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::None);
     inj.SendKey(VK_BACK);
     ASSERT_EQ(capturedInputs.size(), 2u);
     EXPECT_EQ(capturedInputs[0].ki.wVk, VK_BACK);
@@ -269,7 +282,7 @@ TEST_F(Win32SendInputInjectorTest, ReplaceNotifiesSynthCounterByEventCount) {
     // stays balanced against the per-event decrements in
     // LowLevelKeyboardProc. Replace(2, "vi") = 2 BS down/up + 2 chars
     // down/up = 8 events delivered in a single batch — one positive delta.
-    Win32SendInputInjector inj(/*needsBaitCharPrefix=*/false);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::None);
     EXPECT_TRUE(inj.Replace(2, L"vi"));
     ASSERT_EQ(synthCounterDeltas.size(), 1u);
     EXPECT_EQ(synthCounterDeltas[0], 8);
@@ -280,7 +293,7 @@ TEST_F(Win32SendInputInjectorTest, ReplaceWithBaitCountsBaitEventsToo) {
     // top of the caller's bsCount. The callback must reflect the actual
     // dispatched count so HookEngine doesn't undercount and release the
     // synth-guard early.
-    Win32SendInputInjector inj(/*needsBaitCharPrefix=*/true);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::UnicodeBait);
     EXPECT_TRUE(inj.Replace(1, L"x"));
     // Expected: 8 events — bait char (2) + 2 BS×(down+up)=4 + 1 char×(down+up)=2.
     ASSERT_EQ(synthCounterDeltas.size(), 1u);
@@ -292,12 +305,39 @@ TEST_F(Win32SendInputInjectorTest, PartialSendEmitsCompensatingNegativeDelta) {
     // twice — first +6 (pre-dispatch), then -4 (recovery so the counter
     // ends up at +2, matching the 2 events that will round-trip through
     // the LL hook decrement path).
-    Win32SendInputInjector inj(/*needsBaitCharPrefix=*/false);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::None);
     sendInputReturnOverride = 2;  // 6 expected, only 2 delivered
     EXPECT_FALSE(inj.Replace(3, L""));
     ASSERT_EQ(synthCounterDeltas.size(), 2u);
     EXPECT_EQ(synthCounterDeltas[0], 6);
     EXPECT_EQ(synthCounterDeltas[1], -4);
+}
+
+TEST_F(Win32SendInputInjectorTest, PartialSendTriggersRollbackCallback) {
+    // Issue 4: When SendInput delivers only 2 of 6 events, the 4 unsent events
+    // must trigger g_synthEventsRollbackCallback so HookEngine removes them from echoBuffer_.
+    std::vector<DWORD> rolledBackVks;
+    Internal::g_synthEventsRollbackCallback = [](const INPUT* events, UINT count) noexcept {
+        // Collect pointers/values to verify exact slice delivered
+        auto* vec = static_cast<std::vector<DWORD>*>(s_rollbackTestCapture);
+        if (vec) {
+            for (UINT i = 0; i < count; ++i) {
+                vec->push_back(events[i].ki.wVk);
+            }
+        }
+    };
+    s_rollbackTestCapture = &rolledBackVks;
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::None);
+    sendInputReturnOverride = 2;  // 6 expected, only 2 delivered
+    EXPECT_FALSE(inj.Replace(3, L""));
+    s_rollbackTestCapture = nullptr;
+    Internal::g_synthEventsRollbackCallback = nullptr;
+
+    // 6 events planned: 3 x (BS down + BS up). 2 delivered, 4 unsent rolled back.
+    ASSERT_EQ(rolledBackVks.size(), 4u);
+    for (DWORD vk : rolledBackVks) {
+        EXPECT_EQ(vk, static_cast<DWORD>(VK_BACK));
+    }
 }
 
 // ── Game-compat re-inject atomicity ──────────────────────────────────
@@ -308,7 +348,7 @@ TEST_F(Win32SendInputInjectorTest, PartialSendEmitsCompensatingNegativeDelta) {
 // char while the engine believes it was replaced ("khoong" for "không").
 
 TEST_F(Win32SendInputInjectorTest, ReinjectVkRidesTheSameSendInputBatch) {
-    Win32SendInputInjector inj(/*needsBaitCharPrefix=*/false);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::None);
     EXPECT_TRUE(inj.Replace(2, L"ô", /*reinjectVk=*/'O'));
 
     // 1 re-inject down + 2 BS × (down+up) + 1 char × (down+up) = 7 events.
@@ -328,7 +368,7 @@ TEST_F(Win32SendInputInjectorTest, ReinjectVkRidesTheSameSendInputBatch) {
 TEST_F(Win32SendInputInjectorTest, ReinjectVkEmitsNoKeyUp) {
     // Key-down only: a sustained hold keeps feeding downs to the game, and
     // the physical key-up passes through the hook when the user releases.
-    Win32SendInputInjector inj(/*needsBaitCharPrefix=*/false);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::None);
     EXPECT_TRUE(inj.Replace(1, L"â", /*reinjectVk=*/'A'));
     for (const auto& ev : capturedInputs) {
         if (ev.ki.wVk == 'A') {
@@ -346,7 +386,7 @@ TEST_F(Win32SendInputInjectorTest, ReinjectVkKeepsHeldShiftRestoreIndexHonest) {
     };
     sendInputReturnOverride = 2;
 
-    Win32SendInputInjector inj(false);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::None);
     EXPECT_FALSE(inj.Replace(2, L"ô", 'O'));
     ASSERT_EQ(capturedInputs.size(), 10u);
     EXPECT_EQ(capturedInputs[0].ki.wVk, 'O');
@@ -360,7 +400,7 @@ TEST_F(Win32SendInputInjectorTest, TextOnlyReleasesRightAltAndRestoresIt) {
     Internal::g_getAsyncKeyState = [](int vk) -> SHORT {
         return (vk == VK_RMENU || vk == VK_MENU) ? static_cast<SHORT>(-32768) : 0;
     };
-    Win32SendInputInjector inj(false);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::None);
     ASSERT_TRUE(inj.Replace(0, L"x"));
     ASSERT_EQ(capturedInputs.size(), 4u);
     EXPECT_EQ(capturedInputs[0].ki.wVk, VK_RMENU);
@@ -376,7 +416,7 @@ TEST_F(Win32SendInputInjectorTest, PartialSendRestoresOnlyModifiersActuallyRelea
         return (vk == VK_LCONTROL || vk == VK_RCONTROL || vk == VK_CONTROL) ? static_cast<SHORT>(-32768) : 0;
     };
     sendInputReturnOverride = 1;
-    Win32SendInputInjector inj(false);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::None);
     EXPECT_FALSE(inj.Replace(1, L"x"));
     ASSERT_EQ(capturedInputs.size(), 9u);
     EXPECT_EQ(capturedInputs.back().ki.wVk, VK_LCONTROL);
@@ -387,7 +427,7 @@ TEST_F(Win32SendInputInjectorTest, GameReinjectKeepsHeldModifiersIntact) {
     Internal::g_getAsyncKeyState = [](int vk) -> SHORT {
         return (vk == VK_LCONTROL || vk == VK_CONTROL) ? static_cast<SHORT>(-32768) : 0;
     };
-    Win32SendInputInjector inj(false);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::None);
     ASSERT_TRUE(inj.Replace(1, L"a", 'A'));
     ASSERT_GE(capturedInputs.size(), 3u);
     EXPECT_EQ(capturedInputs[0].ki.wVk, 'A');
@@ -401,7 +441,7 @@ TEST_F(Win32SendInputInjectorTest, HeldShiftIsIntactOnGameReinjectKey) {
     Internal::g_getAsyncKeyState = [](int vk) -> SHORT {
         return (vk == VK_LSHIFT || vk == VK_SHIFT) ? static_cast<SHORT>(-32768) : 0;
     };
-    Win32SendInputInjector inj(false);
+    Win32SendInputInjector inj(SuggestionDismissalPolicy::None);
     ASSERT_TRUE(inj.Replace(1, L"w", 'W'));
     ASSERT_GE(capturedInputs.size(), 3u);
     EXPECT_EQ(capturedInputs[0].ki.wVk, 'W');
@@ -409,6 +449,87 @@ TEST_F(Win32SendInputInjectorTest, HeldShiftIsIntactOnGameReinjectKey) {
     EXPECT_EQ(capturedInputs[1].ki.wVk, VK_LSHIFT);
     EXPECT_NE(capturedInputs[1].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
     EXPECT_EQ(capturedInputs[2].ki.wVk, VK_BACK);
+}
+
+TEST_F(Win32SendInputInjectorTest, ActiveEchoCoversLongAtomicBatchAndExpiresOnReturn) {
+    std::vector<INPUT> events;
+    for (unsigned i = 0; i < 4096; ++i) {
+        events.push_back(Internal::MakeUnicodeEvent(static_cast<WCHAR>(0x400 + i), false));
+        events.push_back(Internal::MakeUnicodeEvent(static_cast<WCHAR>(0x400 + i), true));
+    }
+    Internal::g_sendInput = [](UINT size, LPINPUT batch, int) -> UINT {
+        for (UINT i = 0; i < size; ++i) {
+            EXPECT_TRUE(Internal::ConsumeActiveSynthEvent(
+                VK_PACKET, batch[i].ki.wScan, (batch[i].ki.dwFlags & KEYEVENTF_KEYUP) != 0));
+        }
+        return size;
+    };
+    ASSERT_TRUE(Internal::TrackedSendInput(events.data(), static_cast<UINT>(events.size())));
+    EXPECT_FALSE(Internal::ConsumeActiveSynthEvent(VK_PACKET, 0x400, false));
+}
+
+TEST_F(Win32SendInputInjectorTest, ActiveEchoDoesNotConsumeALaterKeyOutOfOrder) {
+    INPUT events[] = {Internal::MakeKeyEvent('A', false), Internal::MakeKeyEvent('B', false)};
+    Internal::g_sendInput = [](UINT size, LPINPUT batch, int) -> UINT {
+        EXPECT_FALSE(Internal::ConsumeActiveSynthEvent('B', batch[1].ki.wScan, false));
+        EXPECT_TRUE(Internal::ConsumeActiveSynthEvent('A', batch[0].ki.wScan, false));
+        EXPECT_TRUE(Internal::ConsumeActiveSynthEvent('B', batch[1].ki.wScan, false));
+        return size;
+    };
+    EXPECT_TRUE(Internal::TrackedSendInput(events, 2));
+}
+
+TEST_F(Win32SendInputInjectorTest, NestedDispatchRestoresTheOuterEchoCursor) {
+    static bool nested;
+    nested = false;
+    Internal::g_sendInput = [](UINT size, LPINPUT batch, int) -> UINT {
+        EXPECT_TRUE(Internal::ConsumeActiveSynthEvent(batch[0].ki.wVk, batch[0].ki.wScan, false));
+        if (!nested) {
+            nested = true;
+            INPUT inner[] = {Internal::MakeKeyEvent('B', false), Internal::MakeKeyEvent('B', true)};
+            EXPECT_TRUE(Internal::TrackedSendInput(inner, 2));
+        }
+        EXPECT_TRUE(Internal::ConsumeActiveSynthEvent(batch[1].ki.wVk, batch[1].ki.wScan, true));
+        return size;
+    };
+    INPUT outer[] = {Internal::MakeKeyEvent('A', false), Internal::MakeKeyEvent('A', true)};
+    EXPECT_TRUE(Internal::TrackedSendInput(outer, 2));
+    EXPECT_FALSE(Internal::ConsumeActiveSynthEvent('A', outer[0].ki.wScan, false));
+}
+
+TEST_F(Win32SendInputInjectorTest, PartialReplayRestoresMixedModifierChangesWithoutOwningMainKeyUp) {
+    // Ctrl was held and is temporarily released; right Alt was up and is
+    // temporarily pressed. Recovery must restore both original physical states.
+    const std::array<INPUT, 5> batch = {
+        Internal::MakeKeyEvent(VK_LCONTROL, true),
+        Internal::MakeKeyEvent(VK_RMENU, false),
+        Internal::MakeKeyEvent('C', false),
+        Internal::MakeKeyEvent(VK_LCONTROL, false),
+        Internal::MakeKeyEvent(VK_RMENU, true),
+    };
+    constexpr std::array<size_t, 6> recoveryCounts{0, 1, 2, 2, 1, 0};
+    for (UINT sent = 0; sent <= batch.size(); ++sent) {
+        SCOPED_TRACE(sent);
+        capturedInputs.clear();
+        std::array<bool, 256> down{};
+        down[VK_LCONTROL] = true;
+        auto apply = [&](const INPUT& event) {
+            down[event.ki.wVk] = (event.ki.dwFlags & KEYEVENTF_KEYUP) == 0;
+        };
+        for (UINT i = 0; i < sent; ++i) apply(batch[i]);
+        Internal::RecoverReplayModifiersAfterPartialSend(batch, sent, 2);
+        EXPECT_EQ(capturedInputs.size(), recoveryCounts[sent]);
+        for (const auto& event : capturedInputs) {
+            EXPECT_NE(event.ki.wVk, 'C');
+            if (event.ki.wVk == VK_RMENU) {
+                EXPECT_NE(event.ki.dwFlags & KEYEVENTF_EXTENDEDKEY, 0u);
+            }
+            apply(event);
+        }
+        EXPECT_TRUE(down[VK_LCONTROL]);
+        EXPECT_FALSE(down[VK_RMENU]);
+        EXPECT_EQ(down['C'], sent >= 3);
+    }
 }
 
 }  // namespace NextKey::Output::Test

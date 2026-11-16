@@ -326,7 +326,9 @@ HRESULT KeyEventSink::OnTestKeyDownImpl(ITfContext* pContext, WPARAM wParam, LPA
     // OnKeyDown pair never fired (rare TSF anomaly).
     lastTranslatedChar_ = 0;
     lastEnglishMacroObservedVk_ = 0;
+    lastPassthroughBsObservedVk_ = 0;
     lastMacroHandledVk_ = 0;
+    lastMacroTestedNoMatchVk_ = 0;
 
     if (vk != pendingClaimedSpaceVk_) {
         pendingClaimedSpaceVk_ = 0;
@@ -575,6 +577,11 @@ HRESULT KeyEventSink::OnTestKeyDownImpl(ITfContext* pContext, WPARAM wParam, LPA
     if (!wantKey && wParam == VK_BACK && !pEngineController_->HasEngineBuffer()) {
         if (pEngineController_->PrepareBackspaceRevive(pContext)) {
             wantKey = true;
+        } else if (vk != lastEnglishMacroObservedVk_) {
+            // OnKeyDown never fires for a key the test phase leaves uneaten,
+            // so the passthrough BS must be tracked here.
+            pEngineController_->TrackMacroBackspace();
+            lastPassthroughBsObservedVk_ = vk;
         }
     }
 
@@ -585,7 +592,7 @@ HRESULT KeyEventSink::OnTestKeyDownImpl(ITfContext* pContext, WPARAM wParam, LPA
     // Enter, Tab, and navigation keys pass through, so expand before the
     // generic commit-and-pass branch when a composed macro is pending.
     if (!wantKey && !pEngineController_->IsEnglishMacroTrackingActive()
-        && pEngineController_->HasMacroCandidate()
+        && (pEngineController_->HasMacroCandidate() || pEngineController_->HasMacroContextCandidate())
         && pEngineController_->IsMacroCommitTrigger(vk)) {
         const auto macroResult = pEngineController_->HandleMacroTrigger(
             pContext, vk, VkToChar(vk, lParam));
@@ -593,8 +600,11 @@ HRESULT KeyEventSink::OnTestKeyDownImpl(ITfContext* pContext, WPARAM wParam, LPA
             lastMacroHandledVk_ = vk;
             lastMacroHandledEat_ =
                 macroResult == EngineController::MacroResult::ExpandedEatTrigger;
+            lastMacroTestedNoMatchVk_ = 0;
             *pfEaten = lastMacroHandledEat_ ? TRUE : FALSE;
             return S_OK;
+        } else {
+            lastMacroTestedNoMatchVk_ = vk;
         }
     }
 
@@ -736,6 +746,7 @@ HRESULT KeyEventSink::OnKeyDownImpl(ITfContext* pContext, WPARAM wParam, LPARAM 
         lastMacroHandledVk_ = 0;
         lastMacroHandledEat_ = false;
         lastEnglishMacroObservedVk_ = 0;
+        lastPassthroughBsObservedVk_ = 0;
         if (eat) RememberClaimedSpaceKeyDown(vk, lParam);
         *pfEaten = eat ? TRUE : FALSE;
         return S_OK;
@@ -745,6 +756,7 @@ HRESULT KeyEventSink::OnKeyDownImpl(ITfContext* pContext, WPARAM wParam, LPARAM 
         lastTestedVk_ = 0;
         lastTranslatedChar_ = 0;
         lastEnglishMacroObservedVk_ = 0;
+        lastPassthroughBsObservedVk_ = 0;
         // Known benign mismatch (maintainer accepted 2026-11-01): when UndoMacro
         // fails in OnKeyDown it returns pfEaten=FALSE although OnTestKeyDown
         // already reported eaten.
@@ -837,22 +849,27 @@ HRESULT KeyEventSink::OnKeyDownImpl(ITfContext* pContext, WPARAM wParam, LPARAM 
 
     // Space and printable punctuation are eaten by the TIP, so expand them
     // here and include any pass-through character in the committed text.
-    if (pEngineController_->HasMacroCandidate()
+    if ((pEngineController_->HasMacroCandidate() || pEngineController_->HasMacroContextCandidate())
         && pEngineController_->IsMacroCommitTrigger(vk)
         && !pEngineController_->IsEngineDigitKey(vk)
         && !pEngineController_->IsEngineBracketKey(vk)) {
-        const wchar_t triggerChar =
-            (vk == lastTestedVk_ && lastTranslatedChar_ != 0)
-                ? lastTranslatedChar_
-                : VkToChar(vk, lParam);
-        const auto macroResult = pEngineController_->HandleMacroTrigger(
-            pContext, vk, triggerChar);
-        if (macroResult != EngineController::MacroResult::NoMatch) {
-            const bool eat =
-                macroResult == EngineController::MacroResult::ExpandedEatTrigger;
-            if (eat) RememberClaimedSpaceKeyDown(vk, lParam);
-            *pfEaten = eat ? TRUE : FALSE;
-            return S_OK;
+        if (lastMacroTestedNoMatchVk_ == vk) {
+            // Already probed in OnTestKeyDown and returned NoMatch — skip redundant document read
+            lastMacroTestedNoMatchVk_ = 0;
+        } else {
+            const wchar_t triggerChar =
+                (vk == lastTestedVk_ && lastTranslatedChar_ != 0)
+                    ? lastTranslatedChar_
+                    : VkToChar(vk, lParam);
+            const auto macroResult = pEngineController_->HandleMacroTrigger(
+                pContext, vk, triggerChar);
+            if (macroResult != EngineController::MacroResult::NoMatch) {
+                const bool eat =
+                    macroResult == EngineController::MacroResult::ExpandedEatTrigger;
+                if (eat) RememberClaimedSpaceKeyDown(vk, lParam);
+                *pfEaten = eat ? TRUE : FALSE;
+                return S_OK;
+            }
         }
     }
 
@@ -951,6 +968,10 @@ HRESULT KeyEventSink::OnKeyDownImpl(ITfContext* pContext, WPARAM wParam, LPARAM 
     }
 
     if (!wantKey) {
+        if (vk == VK_BACK && vk != lastPassthroughBsObservedVk_) {
+            pEngineController_->TrackMacroBackspace();
+        }
+        lastPassthroughBsObservedVk_ = 0;
         if (IsCaretNavigationKey(vk)) {
             pEngineController_->ClearContext();
         }
@@ -1004,7 +1025,9 @@ void KeyEventSink::ClearInactiveKeyState() noexcept {
     lastWantKeyResult_ = false;
     lastTranslatedChar_ = 0;
     lastEnglishMacroObservedVk_ = 0;
+    lastPassthroughBsObservedVk_ = 0;
     lastMacroHandledVk_ = 0;
+    lastMacroTestedNoMatchVk_ = 0;
     lastMacroHandledEat_ = false;
     pEngineController_->ClearMacroTracking();
 }

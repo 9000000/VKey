@@ -74,8 +74,10 @@ private:
     // English-mode macros pass ordinary keys through to the host. These caches
     // keep a TestKeyDown/KeyDown pair from processing the same key twice.
     UINT lastEnglishMacroObservedVk_ = 0;
+    UINT lastPassthroughBsObservedVk_ = 0;
     UINT lastMacroHandledVk_ = 0;
     bool lastMacroHandledEat_ = false;
+    UINT lastMacroTestedNoMatchVk_ = 0;
 
     // A Space committed into the composition is owned by the TIP until its
     // key-up. Some legacy hosts can repeat the initial keydown callback.

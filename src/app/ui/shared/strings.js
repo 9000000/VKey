@@ -55,7 +55,7 @@ var STRINGS = {
         "s.allow_english_bypass": "Allow English bypass (e.g. yes \u2192 \u00FDe)",
         "s.allow_english_bypass_tooltip": "Allow applying Vietnamese tone marks on English words or exceptions",
         "s.suggest_keep_chars": "BS keeps chars on suggest",
-        "s.suggest_keep_chars_tooltip": "When dismissing a browser suggestion via Backspace, preserve typed chars. Warning: tone placement may be wrong if you keep typing right after BS.",
+        "s.suggest_keep_chars_tooltip": "Skip injecting the Unicode bait character (U+202F) during tone transforms and auto-restore in browsers. Enable this if characters are skipped in strict email, number, or OTP fields under Hook mode.",
         "s.spell_exclusions": "Lexicon & Exclusions",
         "s.spell_exclusions_tooltip": "Manage personal dictionary (protect words) and abbreviation exclusions (bypass spell check).",
         "s.app_encoding": "Per-app / Clipboard",
@@ -119,6 +119,7 @@ var STRINGS = {
         // Tab 4: About
         "s.tagline": "Modern Vietnamese Input Method",
         "s.version_label": "Version:",
+        "s.sciter_label": "Sciter version:",
         "s.dev_label": "Author:",
         "s.license": "VKey is open-source, free, and non-profit software.",
         "s.auto_update": "Auto-check for updates",

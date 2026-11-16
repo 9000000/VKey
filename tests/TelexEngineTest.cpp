@@ -12,6 +12,264 @@ namespace {
 
 using Testing::TypeString;
 
+TEST(TelexDelayedModifierRegression, EnglishAutoRestoreRetainsPhysicalToneKeys) {
+    for (const auto method : {InputMethod::Telex, InputMethod::SimpleTelex,
+                              InputMethod::Combined, InputMethod::UserDefined}) {
+        TypingConfig config;
+        config.inputMethod = method;
+        config.spellCheckEnabled = true;
+        if (method == InputMethod::UserDefined) {
+            for (wchar_t key : std::wstring(L"adefjorswxz")) {
+                config.customKeyMap[static_cast<size_t>(key)] = ClassifyKey(key, true, false);
+            }
+        }
+        for (const auto* word : {L"pursuits", L"pursues", L"pursuers", L"buuss",
+                                  L"yeses", L"YESES", L"yesterday"}) {
+            SCOPED_TRACE(::testing::Message() << word << " method=" << static_cast<int>(method));
+            TypingEngine engine(config);
+            TypeString(engine, word);
+            EXPECT_EQ(engine.PeekRaw(), word);
+            EXPECT_EQ(engine.Commit(), word);
+        }
+    }
+}
+
+TEST(TelexDelayedModifierRegression, RepeatedToneDisprovesOpenProvisionalYe) {
+    for (const bool spell : {false, true}) {
+        TypingConfig config;
+        config.spellCheckEnabled = spell;
+        for (const auto* word : {L"yeses", L"yefef", L"yerer", L"yexex", L"yejej"}) {
+            SCOPED_TRACE(::testing::Message() << word << " spell=" << spell);
+            TypingEngine engine(config);
+            TypeString(engine, word);
+            EXPECT_EQ(engine.Peek(), word);
+            EXPECT_EQ(engine.Commit(), word);
+        }
+        config.inputMethod = InputMethod::UserDefined;
+        config.customKeyMap[L'q'] = TypingAction::ToneAcute;
+        config.customKeyMap[L'e'] = TypingAction::CircumflexE;
+        TypingEngine engine(config);
+        for (wchar_t key : std::wstring(L"yeqeq")) engine.PushKey(key, true);
+        EXPECT_EQ(engine.Peek(), L"YEQEQ");
+        EXPECT_EQ(engine.Commit(), L"YEQEQ");
+    }
+}
+
+TEST(TelexDelayedModifierRegression, ToneBeforeVowelModifier) {
+    for (bool spell : {false, true}) {
+        for (bool modern : {false, true}) {
+            for (const auto& [input, expected] : {
+                     std::pair{L"luujw", L"lựu"}, std::pair{L"cuusw", L"cứu"},
+                     std::pair{L"luujsw", L"lứu"}, std::pair{L"cuusjw", L"cựu"},
+                     std::pair{L"luuwj", L"lựu"}, std::pair{L"cuuws", L"cứu"},
+                     std::pair{L"yense", L"yến"}, std::pair{L"yengre", L"yểng"},
+                     std::pair{L"yeset", L"yết"}, std::pair{L"yetse", L"yết"},
+                     std::pair{L"yereu", L"yểu"}, std::pair{L"yeure", L"yểu"},
+                     std::pair{L"khuaysa", L"khuấy"}, std::pair{L"khuasay", L"khuấy"},
+                     std::pair{L"chuaran", L"chuẩn"}, std::pair{L"churaan", L"chuẩn"},
+                     std::pair{L"buofom", L"buồm"}, std::pair{L"bufoom", L"buồm"},
+                     std::pair{L"tuorwng", L"tưởng"}, std::pair{L"turowng", L"tưởng"},
+                     std::pair{L"diexem", L"diễm"}, std::pair{L"dixeem", L"diễm"},
+                     std::pair{L"YENSE", L"YẾN"}, std::pair{L"yeens", L"yến"},
+                     std::pair{L"yeengr", L"yểng"}, std::pair{L"yellow", L"yellow"},
+                     std::pair{L"thoawn", L"thoăn"}, std::pair{L"thoawts", L"thoắt"},
+                     std::pair{L"thoawngs", L"thoắng"},
+                     std::pair{L"LUUJW", L"LỰU"}, std::pair{L"yes", L"yes"},
+                     std::pair{L"year", L"year"}, std::pair{L"yens", L"yens"}}) {
+                SCOPED_TRACE(::testing::Message() << input << " spell=" << spell << " modern=" << modern);
+                TypingConfig config;
+                config.inputMethod = InputMethod::Telex;
+                config.spellCheckEnabled = spell;
+                config.modernOrtho = modern;
+                config.optimizeLevel = 0;
+                TypingEngine engine(config);
+                TypeString(engine, input);
+                EXPECT_EQ(engine.Peek(), expected);
+                EXPECT_EQ(engine.Commit(), expected);
+            }
+        }
+    }
+}
+
+TEST(TelexDelayedModifierRegression, PendingYeNeedsExplicitQualityAndValidCoda) {
+    for (bool spell : {false, true}) {
+        for (auto method : {InputMethod::Telex, InputMethod::SimpleTelex, InputMethod::Combined,
+                            InputMethod::UserDefined}) {
+            TypingConfig config;
+            config.inputMethod = method;
+            config.spellCheckEnabled = spell;
+            config.optimizeLevel = 0;
+            if (method == InputMethod::UserDefined) {
+                for (wchar_t key : std::wstring(L"adefjorswxz")) {
+                    config.customKeyMap[static_cast<size_t>(key)] = ClassifyKey(key, true, false);
+                }
+            }
+            for (const auto& [input, expected] : {
+                     std::pair{L"yense", L"yến"}, std::pair{L"yengre", L"yểng"},
+                     std::pair{L"yenfe", L"yền"}, std::pair{L"yenje", L"yện"},
+                     std::pair{L"yens", L"yens"}, std::pair{L"year", L"year"},
+                     std::pair{L"yensse", spell ? L"yensse" : L"yếns"},
+                     std::pair{L"yetre", spell ? L"yetre" : L"yêtr"},
+                     std::pair{L"yerdse", L"yerdse"}}) {
+                SCOPED_TRACE(::testing::Message() << input << " spell=" << spell << " method=" << static_cast<int>(method));
+                TypingEngine engine(config);
+                TypeString(engine, input);
+                EXPECT_EQ(engine.Peek(), expected);
+                EXPECT_EQ(engine.Commit(), expected);
+            }
+        }
+    }
+}
+
+TEST(TelexDelayedModifierRegression, CompletedRhymesEditLikeCanonicalInput) {
+    TypingConfig config;
+    config.inputMethod = InputMethod::Telex;
+    for (const auto& [delayed, canonical] : {
+             std::pair{L"yense", L"yeens"}, std::pair{L"yengre", L"yeengr"},
+             std::pair{L"chuaran", L"chuaanr"}, std::pair{L"churaan", L"chuaanr"},
+             std::pair{L"khuaysa", L"khuaays"}, std::pair{L"khuasay", L"khuaays"}}) {
+        TypingEngine actual(config), reference(config);
+        TypeString(actual, delayed);
+        TypeString(reference, canonical);
+        EXPECT_EQ(actual.Peek(), reference.Peek());
+        const wchar_t removed = actual.Peek().back();
+        actual.Backspace();
+        reference.Backspace();
+        EXPECT_EQ(actual.Peek(), reference.Peek());
+        actual.PushChar(removed);
+        reference.PushChar(removed);
+        EXPECT_EQ(actual.Peek(), reference.Peek());
+        EXPECT_EQ(actual.Commit(), reference.Commit());
+    }
+}
+
+TEST(TelexDelayedModifierRegression, MarkOrdersAcrossRhymeFamilies) {
+    struct RhymeCase {
+        const wchar_t* base;
+        wchar_t modifier;
+        wchar_t tone;
+        size_t modifierAfter;
+        size_t toneAfter;
+        const wchar_t* expected;
+    };
+    for (bool spell : {false, true}) {
+        for (bool modern : {false, true}) {
+            for (const auto& word : {
+                     RhymeCase{L"chuan", L'a', L'r', 4, 3, L"chuẩn"},
+                     RhymeCase{L"luat", L'a', L'j', 3, 2, L"luật"},
+                     RhymeCase{L"khuay", L'a', L's', 4, 3, L"khuấy"},
+                     RhymeCase{L"yet", L'e', L's', 2, 2, L"yết"},
+                     RhymeCase{L"yeu", L'e', L'r', 2, 2, L"yểu"},
+                     RhymeCase{L"yen", L'e', L's', 2, 2, L"yến"},
+                     RhymeCase{L"yeng", L'e', L'r', 2, 2, L"yểng"}}) {
+                const std::wstring base(word.base);
+                for (size_t quality = word.modifierAfter; quality <= base.size(); ++quality) {
+                    std::wstring marked = base;
+                    marked.insert(quality, 1, word.modifier);
+                    for (size_t tone = word.toneAfter; tone <= marked.size(); ++tone) {
+                        std::wstring input = marked;
+                        input.insert(tone, 1, word.tone);
+                        SCOPED_TRACE(::testing::Message() << input << " spell=" << spell << " modern=" << modern);
+                        TypingConfig config;
+                        config.inputMethod = InputMethod::Telex;
+                        config.spellCheckEnabled = spell;
+                        config.modernOrtho = modern;
+                        config.optimizeLevel = 0;
+                        TypingEngine engine(config);
+                        TypeString(engine, input);
+                        EXPECT_EQ(engine.Peek(), word.expected);
+                        EXPECT_EQ(engine.Commit(), word.expected);
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST(TelexDelayedModifierRegression, EnglishContinuationDisprovesRecoveredYe) {
+    for (bool spell : {false, true}) {
+        for (auto method : {InputMethod::Telex, InputMethod::SimpleTelex, InputMethod::Combined,
+                            InputMethod::UserDefined}) {
+            TypingConfig config;
+            config.inputMethod = method;
+            config.spellCheckEnabled = spell;
+            config.optimizeLevel = 0;
+            if (method == InputMethod::UserDefined) {
+                for (wchar_t key : std::wstring(L"adefjorswxz")) {
+                    config.customKeyMap[static_cast<size_t>(key)] = ClassifyKey(key, true, false);
+                }
+            }
+            for (const auto* word : {L"yesterday", L"yesteryear", L"yester", L"Yesterday", L"YESTERDAY"}) {
+                SCOPED_TRACE(::testing::Message() << word << " spell=" << spell << " method=" << static_cast<int>(method));
+                TypingEngine engine(config);
+                TypeString(engine, word);
+                EXPECT_EQ(engine.Peek(), word);
+                EXPECT_EQ(engine.PeekRaw(), word);
+                EXPECT_EQ(engine.Commit(), word);
+            }
+            TypingEngine engine(config);
+            TypeString(engine, L"yeste");
+            EXPECT_EQ(engine.Peek(), L"yết");
+            engine.PushChar(L'r');
+            EXPECT_EQ(engine.Peek(), L"yester");
+            engine.Backspace();
+            EXPECT_EQ(engine.Peek(), L"yeste");
+            TypeString(engine, L"rday");
+            EXPECT_EQ(engine.Commit(), L"yesterday");
+            TypeString(engine, L"yense");
+            EXPECT_EQ(engine.Commit(), L"yến");
+        }
+    }
+}
+
+TEST(TelexDelayedModifierRegression, ProvisionalYePreservesExplicitEditsAndCaseIntent) {
+    for (bool spell : {false, true}) {
+        TypingConfig config;
+        config.inputMethod = InputMethod::Telex;
+        config.spellCheckEnabled = spell;
+        for (const auto* suffix : {L"z", L"s", L"zz", L"e", L"zb", L"sb"}) {
+            SCOPED_TRACE(::testing::Message() << suffix << " spell=" << spell);
+            TypingEngine actual(config), canonical(config);
+            TypeString(actual, L"yense");
+            TypeString(canonical, L"yeens");
+            TypeString(actual, suffix);
+            TypeString(canonical, suffix);
+            EXPECT_EQ(actual.Peek(), canonical.Peek());
+        }
+        TypingEngine engine(config);
+        TypeString(engine, L"yeste");
+        engine.Reset();
+        TypeString(engine, L"year");
+        EXPECT_EQ(engine.Commit(), L"year");
+        TypeString(engine, L"yeste");
+        ASSERT_TRUE(engine.SeedFromText(L"hello"));
+        engine.PushChar(L'r');
+        EXPECT_EQ(engine.Peek(), L"hellor");
+    }
+    TypingConfig config;
+    config.inputMethod = InputMethod::Telex;
+    config.spellCheckEnabled = false;
+    TypingEngine engine(config);
+    for (wchar_t key : std::wstring(L"yesterday")) engine.PushKey(key, true);
+    EXPECT_EQ(engine.Peek(), L"YESTERDAY");
+    EXPECT_EQ(engine.PeekRaw(), L"yesterday");
+    EXPECT_EQ(engine.Commit(), L"YESTERDAY");
+}
+
+TEST(TelexDelayedModifierRegression, ProvisionalYeUsesCustomPhysicalKeys) {
+    TypingConfig config;
+    config.inputMethod = InputMethod::UserDefined;
+    config.customKeyMap[L'q'] = TypingAction::ToneAcute;
+    config.customKeyMap[L'e'] = TypingAction::CircumflexE;
+    TypingEngine engine(config);
+    TypeString(engine, L"yeqte");
+    EXPECT_EQ(engine.Peek(), L"yết");
+    engine.PushChar(L'r');
+    EXPECT_EQ(engine.Peek(), L"yeqter");
+    EXPECT_EQ(engine.PeekRaw(), L"yeqter");
+    EXPECT_EQ(engine.Commit(), L"yeqter");
+}
+
 class TelexEngineTest : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -584,31 +842,37 @@ TEST_F(TelexEngineTest, Triphthong_UYU_ExtraU_NotExpandedToUO) {
     EXPECT_EQ(engine_->Peek(), L"khuyuu");
 }
 
-TEST_F(TelexEngineTest, Word_Ngoeoof_Produces_Ngoèo) {
+TEST_F(TelexEngineTest, Word_Ngoeoof_PreservesExtraO) {
     // oeo triphthong: 4th 'o' should NOT apply circumflex to 3rd 'o'
-    // ngoeo + o → ngoeoo (literal), then f → ngoèo
+    // ngoeo + o → ngoeoo (literal), then f → ngoèoo
     TypeString(*engine_, L"ngoeoof");
-    EXPECT_EQ(engine_->Peek(), L"ngoèo");
+    EXPECT_EQ(engine_->Peek(), L"ngoèoo");
 }
 
-TEST_F(TelexEngineTest, Triphthong_OEO_ExtraO_Consumed) {
-    // ngoeo + o: triphthong oeo complete, extra 'o' consumed (no-op)
+TEST_F(TelexEngineTest, Triphthong_OEO_ExtraO_IsLiteral) {
+    // The completed triphthong blocks circumflex, but preserves the extra key.
     TypeString(*engine_, L"ngoeo");
     EXPECT_EQ(engine_->Peek(), L"ngoeo");
     EXPECT_EQ(engine_->Count(), 5);
     engine_->PushChar(L'o');
-    EXPECT_EQ(engine_->Count(), 5);  // No new state added
-    EXPECT_EQ(engine_->Peek(), L"ngoeo");
+    EXPECT_EQ(engine_->Count(), 6);
+    EXPECT_EQ(engine_->Peek(), L"ngoeoo");
 }
 
-TEST_F(TelexEngineTest, Triphthong_OAO_ExtraO_Consumed) {
-    // ngoao + o: triphthong oao complete, extra 'o' consumed (no-op)
+TEST_F(TelexEngineTest, Triphthong_OAO_ExtraO_IsLiteral) {
     TypeString(*engine_, L"ngoao");
     EXPECT_EQ(engine_->Peek(), L"ngoao");
     EXPECT_EQ(engine_->Count(), 5);
     engine_->PushChar(L'o');
-    EXPECT_EQ(engine_->Count(), 5);  // No new state added
-    EXPECT_EQ(engine_->Peek(), L"ngoao");
+    EXPECT_EQ(engine_->Count(), 6);
+    EXPECT_EQ(engine_->Peek(), L"ngoaoo");
+}
+
+TEST_F(TelexEngineTest, Triphthong_UYA_ExtraA_IsLiteral) {
+    TypeString(*engine_, L"khuyaa");
+    EXPECT_EQ(engine_->Count(), 6);
+    EXPECT_EQ(engine_->Peek(), L"khuyaa");
+    EXPECT_EQ(engine_->Commit(), L"khuyaa");
 }
 
 TEST_F(TelexEngineTest, Word_Quo) {
@@ -4808,6 +5072,58 @@ TEST_F(EnglishProtectionTest, RepeatedO_NoCircumflex) {
 TEST_F(EnglishProtectionTest, RepeatedA_NoCircumflex) {
     TypeString(*engine_, L"aaaaaa");
     EXPECT_EQ(engine_->Peek(), L"aaaaa");
+}
+
+TEST_F(EnglishProtectionTest, CompletedTriphthongPreservesRepeatedVowel) {
+    for (const auto* word : {L"khuya", L"KHUYA", L"ngoeo", L"ngoao"}) {
+        SCOPED_TRACE(::testing::Message() << word);
+        TypingEngine engine(config_);
+        const std::wstring prefix(word);
+        TypeString(engine, prefix);
+        std::wstring expected = prefix;
+        for (int i = 0; i < 5; ++i) {
+            engine.PushChar(prefix.back());
+            expected.push_back(prefix.back());
+            EXPECT_EQ(engine.Peek(), expected);
+            EXPECT_EQ(engine.Count(), expected.size());
+        }
+        EXPECT_EQ(engine.PeekRaw(), expected);
+        engine.Backspace();
+        expected.pop_back();
+        EXPECT_EQ(engine.Peek(), expected);
+        EXPECT_EQ(engine.Commit(), expected);
+    }
+}
+
+TEST_F(EnglishProtectionTest, ThoangBreveTonesSurviveCommitInAnyKeyOrder) {
+    // #278 used a UserDefined map with the Telex actions and modern spelling.
+    for (const auto method : {InputMethod::Telex, InputMethod::SimpleTelex,
+                              InputMethod::Combined, InputMethod::UserDefined}) {
+        for (const bool modern : {false, true}) {
+            config_.inputMethod = method;
+            config_.modernOrtho = modern;
+            if (method == InputMethod::UserDefined) {
+                for (const wchar_t key : std::wstring(L"adefjorswxz")) {
+                    config_.customKeyMap[static_cast<size_t>(key)] =
+                        ClassifyKey(key, true, false);
+                }
+            }
+            for (const wchar_t toneKey : {L's', L'r'}) {
+                for (const auto* sequence : {L"thoangw_", L"thoawng_", L"thoaw_ng",
+                                             L"thoang_w", L"thoa_wng", L"tho_awng"}) {
+                    std::wstring input(sequence);
+                    input[input.find(L'_')] = toneKey;
+                    SCOPED_TRACE(::testing::Message() << input << " method="
+                        << static_cast<int>(method) << " modern=" << modern);
+                    TypingEngine engine(config_);
+                    TypeString(engine, input);
+                    const auto* expected = toneKey == L's' ? L"thoắng" : L"thoẳng";
+                    EXPECT_EQ(engine.Peek(), expected);
+                    EXPECT_EQ(engine.Commit(), expected);
+                }
+            }
+        }
+    }
 }
 
 TEST_F(EnglishProtectionTest, RepeatedE_NoCircumflex) {

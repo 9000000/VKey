@@ -54,6 +54,12 @@ struct MacroPlan {
 /// Decide what (if anything) to expand. Pure function: no I/O, no globals.
 [[nodiscard]] MacroPlan Plan(const PlanInputs& in, const CaseMapper& mapper);
 
+/// Unicode text already at the caret, excluding a not-yet-inserted trigger.
+/// Keep plan.shortcut intact: undo needs the complete matched spelling.
+[[nodiscard]] std::wstring_view ReplacementDocumentText(
+    const MacroPlan& plan, std::wstring_view previousComposition,
+    bool macroCrossCommit, wchar_t triggerChar) noexcept;
+
 /// Convert \n escapes into \r\n for clipboard paste. No other escapes processed.
 [[nodiscard]] std::wstring ExpandEscapesForClipboard(std::wstring_view expansion);
 
@@ -74,6 +80,12 @@ struct Segment {
 /// this to defer printable macro expansion from OnTestKeyDown to OnKeyDown.
 [[nodiscard]] bool IsTextProducingTrigger(uint32_t vkCode,
                                           wchar_t triggerChar) noexcept;
+
+/// Raw buffer to keep tracking from when a committed word is revived back into
+/// the composition. Plan() matches the raw buffer before the composition but
+/// sizes the replacement by the composition, so a buffer holding only the keys
+/// typed after the revive would let "xin" + "ko" expand macro "ko" over "xinko".
+[[nodiscard]] std::wstring RawBufferForRevive(std::wstring_view raw, std::wstring_view word);
 
 /// Backspace counts are reliable only for single-line, precomposed BMP text.
 [[nodiscard]] bool CanUndoWithBackspaces(std::wstring_view expansion) noexcept;

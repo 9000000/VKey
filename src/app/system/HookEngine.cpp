@@ -137,7 +137,7 @@ void HookEngine::ApplyConfig(const TypingConfig& config) {
     autoCaps_.store(config.autoCaps, std::memory_order_release);
     macroEnabled_.store(config.macroEnabled, std::memory_order_release);
     macroInEnglish_.store(config.macroInEnglish, std::memory_order_release);
-    // Push the suggestKeepChars flag to the live injector so ShouldEmitBait
+    // Push the suggestKeepChars flag to the live injector so PlanSuggestionDismissal
     // sees the latest user choice without needing a focus change to swap
     // injectors. Focus-change paths re-apply this from the config snapshot.
     if (auto inj = dispatcher_.GetInjector(); inj) {
@@ -215,6 +215,20 @@ bool HookEngine::Start(HINSTANCE hInstance, const TypingConfig& config,
     // thread already racing wouldn't see a half-initialized dispatcher
     // (we're still on main here; hook thread starts further down).
     dispatcher_.Install();
+    NextKey::Output::Internal::g_synthEventsDispatchedCallback =
+        [](const INPUT* events, UINT count) noexcept {
+            HookEngine* self = s_instance.load(std::memory_order_relaxed);
+            if (self) {
+                self->RecordDispatchedEvents(events, count);
+            }
+        };
+    NextKey::Output::Internal::g_synthEventsRollbackCallback =
+        [](const INPUT* events, UINT count) noexcept {
+            HookEngine* self = s_instance.load(std::memory_order_relaxed);
+            if (self) {
+                self->RollbackDispatchedEvents(events, count);
+            }
+        };
     currentMethod_.store(config.inputMethod, std::memory_order_release);
     config_.store(std::make_shared<const TypingConfig>(config), std::memory_order_release);
     // Wave 2 (2026-05-23): ApplyConfig is now lock-free (all writes are atomic
@@ -449,6 +463,8 @@ void HookEngine::Stop() {
 
     // Sprint 1 D10: focusPollTimer_ retired — owner stops its
     // MainThreadWorker (which owns the 200 ms tick) before us.
+    NextKey::Output::Internal::g_synthEventsDispatchedCallback = nullptr;
+    NextKey::Output::Internal::g_synthEventsRollbackCallback = nullptr;
     if (s_instance == this) {
         s_instance = nullptr;
     }
@@ -943,20 +959,42 @@ LRESULT HookEngine::LowLevelKeyboardProcImpl(int nCode, WPARAM wParam, LPARAM lP
     try {
         auto* pKey = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
 
+        const bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+        const bool isUp = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
+
         // Always track our own synthetic events regardless of nCode.
         // When nCode < 0, Windows tells us to pass the message along — but the event
         // still represents a delivered synthetic that was counted when sent.
         // Without this, synthEventsPending_ leaks on every nCode < 0 delivery.
         if (self && pKey->dwExtraInfo == VKEY_EXTRA_INFO) {
-            HOOK_LOG(L"  PASSTHRU (dwExtraInfo=NK): vk=0x%02X scan=0x%04X flags=0x%08X nCode=%d",
-                     pKey->vkCode, pKey->scanCode, pKey->flags, nCode);
+            HOOK_LOG(L"  PASSTHRU (dwExtraInfo=NK): vk=0x%02X scan=0x%04X flags=0x%08X nCode=%d isUp=%d",
+                     pKey->vkCode, pKey->scanCode, pKey->flags, nCode, isUp ? 1 : 0);
             self->dispatcher_.DecrementSynthEvents();
+            self->ConsumeEchoEvent(pKey->vkCode, pKey->scanCode, isUp);
+            if (!self->dispatcher_.IsSending() && (!self->inputQueue_.Empty() || self->inputQueue_.HasOverflowed() || self->emergencyCount_ > 0)) {
+                self->DrainInputQueue();
+            }
             return CallNextHookEx(nullptr, nCode, wParam, lParam);
         }
 
+        // Echo-Matching (Task 3.3 & Issue 5): if dwExtraInfo was stripped by RDP/anticheat but matches echo buffer
+        if (self && (pKey->flags & kInjectedMask) != 0 && self->dispatcher_.SynthEventsPending() > 0) {
+            if (self->MatchAndConsumeEcho(pKey->vkCode, pKey->scanCode, isUp)) {
+                HOOK_LOG(L"  PASSTHRU (echo matched without dwExtraInfo): vk=0x%02X scan=0x%04X isUp=%d",
+                         pKey->vkCode, pKey->scanCode, isUp ? 1 : 0);
+                self->dispatcher_.DecrementSynthEvents();
+                if (!self->dispatcher_.IsSending() && (!self->inputQueue_.Empty() || self->inputQueue_.HasOverflowed() || self->emergencyCount_ > 0)) {
+                    self->DrainInputQueue();
+                }
+                return CallNextHookEx(nullptr, nCode, wParam, lParam);
+            }
+        }
+        // Keep this alive through CallNextHookEx too: a later hook can inject
+        // another event before this DOWN reaches Windows' asynchronous state.
+        const Output::Internal::CurrentKeyDownScope currentKey{
+            nCode == HC_ACTION && self && isDown ? static_cast<WORD>(pKey->vkCode) : WORD{0}};
+
         if (nCode == HC_ACTION && self) {
-            const bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
-            const bool isUp = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
 
             // Issue #274 & #275: Handle synthetic/injected events from other software.
             // External snippet expanders (PhraseExpress, AHK hotstrings) send injected
@@ -1054,31 +1092,81 @@ LRESULT HookEngine::LowLevelKeyboardProcImpl(int nCode, WPARAM wParam, LPARAM lP
                 if (result.consume) return 1;
             }
 
-            // Skip events while we're sending (safety backup).
+            // Snapshot modifiers BEFORE DrainHookCommands() and before sending_ queue check:
+            // draining a pending focus-changed command can synchronously reach
+            // ApplyFocusOnHookThread -> GetFocusedChildHwnd, whose
+            // cross-thread path uses AttachThreadInput — Microsoft's docs
+            // for AttachThreadInput say it resets the state GetKeyState/
+            // GetKeyboardState report for the calling (this hook) thread.
+            const bool preDrainLShift   = isDown && (GetKeyState(VK_LSHIFT) & 0x8000) != 0;
+            const bool preDrainRShift   = isDown && (GetKeyState(VK_RSHIFT) & 0x8000) != 0;
+            const bool preDrainCapsLock = isDown && (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
+            const bool preDrainLCtrl    = isDown && (GetKeyState(VK_LCONTROL) & 0x8000) != 0;
+            const bool preDrainRCtrl    = isDown && (GetKeyState(VK_RCONTROL) & 0x8000) != 0;
+            const bool preDrainLAlt     = isDown && (GetKeyState(VK_LMENU) & 0x8000) != 0;
+            const bool preDrainRAlt     = isDown && (GetKeyState(VK_RMENU) & 0x8000) != 0;
+            const bool preDrainLWin     = isDown && (GetKeyState(VK_LWIN) & 0x8000) != 0;
+            const bool preDrainRWin     = isDown && (GetKeyState(VK_RWIN) & 0x8000) != 0;
+
+            // Skip events while we're sending (safety backup + defer-and-replay queue).
             if (self->dispatcher_.IsSending()) {
-                // Issue #206: on a multi-process renderer (Electron/WebView2/RDP)
-                // a physical key that leaked into this injection window —
-                // the in-flight key's own auto-repeat key-down or its key-up —
-                // would otherwise pass through raw and interleave between our
-                // synthetic backspaces/VK_PACKET chars, which the renderer's
-                // async pipeline then reorders ("nhảy loạn"). Eat only the
-                // in-flight key's own no-intent events; any other vk (the
-                // genuinely-typed next key, a modifier release) still passes
-                // through untouched — no dropped keystroke. See
-                // LeakedKeyDuringSendDecision.h for the full rationale.
                 auto inj = self->dispatcher_.GetInjector();
-                const LeakedKeyDuringSendInputs leak{
-                    .isSending = true,
-                    .hasMultiProcessRenderer = inj && inj->HasMultiProcessRenderer(),
-                    .eventVk = pKey->vkCode,
-                    .sendingForVk = self->sendingForVk_.load(std::memory_order_relaxed),
-                };
-                if (DecideEatLeakedKeyDuringSend(leak)) {
+                const bool hasMultiProcess = inj && inj->HasMultiProcessRenderer();
+                const bool isBareModifier = (pKey->vkCode == VK_LCONTROL || pKey->vkCode == VK_RCONTROL ||
+                                             pKey->vkCode == VK_LSHIFT || pKey->vkCode == VK_RSHIFT ||
+                                             pKey->vkCode == VK_LMENU || pKey->vkCode == VK_RMENU ||
+                                             pKey->vkCode == VK_LWIN || pKey->vkCode == VK_RWIN ||
+                                             pKey->vkCode == VK_CONTROL || pKey->vkCode == VK_SHIFT ||
+                                             pKey->vkCode == VK_MENU);
+                const bool isGameMovement = self->dispatcher_.WantsGameReinject() &&
+                    self->engine_->Count() == 0 &&
+                    (pKey->vkCode == 'W' || pKey->vkCode == 'A' || pKey->vkCode == 'S' || pKey->vkCode == 'D' ||
+                     (pKey->vkCode >= VK_LEFT && pKey->vkCode <= VK_DOWN));
+                const bool queueFull = self->inputQueue_.Size() >= PhysicalInputQueue::kNormalCapacity;
+
+                const InputQueueAction queueAction = DecideInputQueueActionDuringSend(
+                    /*isSending=*/true,
+                    pKey->vkCode,
+                    self->sendingForVk_.load(std::memory_order_relaxed),
+                    hasMultiProcess,
+                    isGameMovement,
+                    isBareModifier,
+                    queueFull);
+
+                if (queueAction == InputQueueAction::EatNoIntent) {
                     HOOK_LOG(L"  EAT (sending_ leak, multi-proc): vk=0x%02X scan=0x%04X flags=0x%08X",
                              pKey->vkCode, pKey->scanCode, pKey->flags);
                     return 1;  // suppress — do not interleave into the synth stream
                 }
-                HOOK_LOG(L"  PASSTHRU (sending_): vk=0x%02X scan=0x%04X flags=0x%08X",
+                if (queueAction == InputQueueAction::Enqueue) {
+                    if (self->EnqueuePhysicalKey(pKey->vkCode, pKey->scanCode, pKey->flags, isDown,
+                                                 preDrainLShift, preDrainRShift, preDrainCapsLock,
+                                                 preDrainLCtrl, preDrainRCtrl,
+                                                 preDrainLAlt, preDrainRAlt,
+                                                 preDrainLWin, preDrainRWin)) {
+                        HOOK_LOG(L"  QUEUED (sending_ in-flight): vk=0x%02X isDown=%d (qlen=%zu)",
+                                 pKey->vkCode, isDown ? 1 : 0, self->inputQueue_.Size());
+                        return 1;  // EAT so the physical key does NOT race into the app ahead of synthetics!
+                    }
+
+                    // Enqueue failed (severe memory pressure). NEVER pass through to host while sending_ is true!
+                    // Calling CallNextHookEx() would let the key jump ahead of previously queued keys
+                    // and interleave into the in-flight synthetic injection stream (e.g. between Backspace
+                    // and replacement text).
+                    if (!isDown) {
+                        // Key-up (release): MUST NOT be dropped/lost, or host application will have a stuck key!
+                        // Retain the release in the zero-allocation emergency fallback table so it can be
+                        // dispatched to host immediately after the active send completes (in DrainInputQueue).
+                        self->RecordEmergencyRelease(pKey->vkCode, pKey->scanCode, pKey->flags);
+                        HOOK_LOG(L"  EMERGENCY RELEASE RECORDED: vk=0x%02X", pKey->vkCode);
+                    } else {
+                        HOOK_LOG(L"  EAT (enqueue failed during sending): vk=0x%02X isDown=1", pKey->vkCode);
+                    }
+                    return 1;  // Suppress so the failed key does NOT race or interleave into synth stream!
+                }
+
+                HOOK_LOG(L"  PASSTHRU (sending_ %ls): vk=0x%02X scan=0x%04X flags=0x%08X",
+                         isBareModifier ? L"modifier" : L"game",
                          pKey->vkCode, pKey->scanCode, pKey->flags);
                 return CallNextHookEx(nullptr, nCode, wParam, lParam);
             }
@@ -1089,25 +1177,6 @@ LRESULT HookEngine::LowLevelKeyboardProcImpl(int nCode, WPARAM wParam, LPARAM lP
             // active transition fires one workerSignalFn_ call. See plan
             // docs/plans/2026-05-27-adaptive-tick-idle-backoff.md §2.5.
             self->MarkActivity();
-
-            // Snapshot modifiers BEFORE DrainHookCommands(): draining a
-            // pending focus-changed command can synchronously reach
-            // ApplyFocusOnHookThread -> GetFocusedChildHwnd, whose
-            // cross-thread path uses AttachThreadInput — Microsoft's docs
-            // for AttachThreadInput say it resets the state GetKeyState/
-            // GetKeyboardState report for the calling (this hook) thread.
-            // ProcessKeyDown used to read Ctrl/Alt/Win/Shift via GetKeyState
-            // AFTER the drain; if a focus result happened to be pending
-            // right as the user pressed e.g. Ctrl+Tab, the held Ctrl could
-            // read as up for THIS keystroke, letting the shortcut fall
-            // through into IME/composition handling instead of the
-            // modifier-held passthrough guard (DispatchKeyAction step 5).
-            const bool preDrainShift    = isDown && (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-            const bool preDrainCapsLock = isDown && (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
-            const bool preDrainCtrl     = isDown && (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-            const bool preDrainAlt      = isDown && (GetKeyState(VK_MENU) & 0x8000) != 0;
-            const bool preDrainWin      = isDown && ((GetKeyState(VK_LWIN) & 0x8000) != 0 ||
-                                                      (GetKeyState(VK_RWIN) & 0x8000) != 0);
 
             // Rule 11.4 step 5 — drain cross-thread commands BEFORE the
             // English-mode / modifier-key dispatch chain so state mutations
@@ -1157,27 +1226,45 @@ LRESULT HookEngine::LowLevelKeyboardProcImpl(int nCode, WPARAM wParam, LPARAM lP
                 // `sending_` branch (above) can recognise this key's own leaked
                 // auto-repeat / key-up during the injection it is about to start.
                 self->sendingForVk_.store(pKey->vkCode, std::memory_order_relaxed);
-                if (self->ProcessKeyDown(pKey->vkCode, pKey->scanCode, pKey->flags,
-                                         preDrainShift, preDrainCapsLock, preDrainCtrl,
-                                         preDrainAlt, preDrainWin)) {
+                const bool shift = preDrainLShift || preDrainRShift;
+                const bool ctrl  = preDrainLCtrl  || preDrainRCtrl;
+                const bool alt   = preDrainLAlt   || preDrainRAlt;
+                const bool win   = preDrainLWin   || preDrainRWin;
+                const bool eaten = self->ProcessKeyDown(pKey->vkCode, pKey->scanCode, pKey->flags,
+                                                        shift, preDrainCapsLock, ctrl,
+                                                        alt, win);
+                // Clear sendingForVk_ immediately: transform injection is complete if eaten,
+                // or key was not consumed by IME (passthrough) so key-up must not be swallowed (Issue 3).
+                self->sendingForVk_.store(0, std::memory_order_relaxed);
+                if (eaten) {
                     HOOK_LOG(L"  → EATEN (key-down vk=0x%02X)", pKey->vkCode);
+                    if (!self->dispatcher_.IsSending() && (!self->inputQueue_.Empty() || self->inputQueue_.HasOverflowed() || self->emergencyCount_ > 0)) {
+                        self->DrainInputQueue();
+                    }
                     return 1;  // Eat the keystroke
                 }
             } else if (isUp) {
+                self->sendingForVk_.store(0, std::memory_order_relaxed);
                 if (self->ProcessKeyUp(pKey->vkCode, pKey->flags)) {
                     return 1;  // Eat the keystroke
                 }
             }
         }
+        if (self && !self->dispatcher_.IsSending() && (!self->inputQueue_.Empty() || self->inputQueue_.HasOverflowed() || self->emergencyCount_ > 0)) {
+            self->DrainInputQueue();
+        }
+        return CallNextHookEx(nullptr, nCode, wParam, lParam);
     } catch (const std::exception& e) {
         CrashLog(L"HookEngine::LowLevelKeyboardProc", e.what());
         // Rule 11.5 safety net: an exception escaping ProcessKey* leaves the
         // engine + previousComposition + per-word flags in an undefined state.
         // ResetComposition clears them so the next keystroke starts fresh
         // instead of compounding the corruption.
+        if (self) self->sendingForVk_.store(0, std::memory_order_relaxed);
         if (self) self->ResetComposition();
     } catch (...) {
         CrashLog(L"HookEngine::LowLevelKeyboardProc", "(non-std exception)");
+        if (self) self->sendingForVk_.store(0, std::memory_order_relaxed);
         if (self) self->ResetComposition();
     }
     return CallNextHookEx(nullptr, nCode, wParam, lParam);
@@ -1200,9 +1287,17 @@ LRESULT CALLBACK HookEngine::LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM 
 
 LRESULT HookEngine::LowLevelMouseProcImpl(int nCode, WPARAM wParam, LPARAM lParam) {
     try {
-        if (nCode == HC_ACTION && wParam == WM_LBUTTONDOWN) {
+        if (nCode == HC_ACTION && (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN ||
+                                   wParam == WM_MBUTTONDOWN || wParam == WM_XBUTTONDOWN)) {
             HookEngine* self = s_instance.load(std::memory_order_relaxed);
             if (self) {
+                // Contaminate active modifier chord / single-tap sequence so mouse clicks
+                // with modifiers held (e.g. Ctrl+Click, Ctrl+Shift+Click) never trigger
+                // ToggleEnabled or modifier-alone hotkeys on subsequent key-up.
+                self->otherKeyPressed_ = true;
+                for (int i = 0; i < kModCount; ++i) self->modTapCount_[i] = 0;
+                self->modComboSeen_ = false;
+
                 // REGRESSION TRAP — DO NOT UNCOMMENT (see LowLevelKeyboardProc
                 // above for the full rationale). Mouse path includes a writer
                 // (ResetComposition); torn-read risk pre-Phase-B was higher
@@ -1212,8 +1307,8 @@ LRESULT HookEngine::LowLevelMouseProcImpl(int nCode, WPARAM wParam, LPARAM lPara
                 // 1 in docs/TODO.md (still-open audit). Audit Check 1
                 // enforces this line stays commented.
                 // std::lock_guard<std::recursive_mutex> _lock(self->stateMutex_);
-                HOOK_LOG(L"MOUSE click — resetting composition (engine count=%zu, prev='%s')",
-                         self->engine_->Count(), self->previousComposition_.c_str());
+                HOOK_LOG(L"MOUSE click (0x%X) — resetting composition (engine count=%zu, prev='%s')",
+                         static_cast<UINT>(wParam), self->engine_->Count(), self->previousComposition_.c_str());
                 // Always reset, even when engine is idle: commitUndoState_ and commitStack_
                 // may hold a previously committed word. If not cleared here, a click elsewhere
                 // followed by Backspace triggers ReplayCommittedChars() at the new cursor
@@ -1320,6 +1415,14 @@ bool HookEngine::ProcessKeyDown(DWORD vkCode, DWORD /*scanCode*/, DWORD /*flags*
     // pending double-tap chain on Ctrl/Shift/Alt/Win is now contaminated)
     otherKeyPressed_ = true;
     for (int i = 0; i < kModCount; ++i) modTapCount_[i] = 0;
+
+    // Track autorepeat for Backspace: fires when consecutive key-downs arrive without key-up (<80ms)
+    const DWORD nowDown = GetTickCount();
+    isAutorepeatBs_ = (vkCode == VK_BACK && lastDownVk_ == VK_BACK && (nowDown - lastBackspaceTs_) < 80);
+    if (vkCode == VK_BACK) {
+        lastBackspaceTs_ = nowDown;
+    }
+    lastDownVk_ = vkCode;
 
     // Watchdog: reset synthEventsPending_ if stuck > 500ms.
     // Covers event loss in Electron/Console multi-process apps where synthetic
@@ -1854,7 +1957,7 @@ HookEngine::KeyOutcome HookEngine::DispatchKeyAction(DWORD vkCode, bool cachedSh
         // snapshot. Local shared_ptr keeps both alive through the branch.
         auto cfgSnap = configSnapshot_.load(std::memory_order_acquire);
         if (macroOn && cfgSnap && !cfgSnap->macroTable.empty()
-            && !tempMacroOff_ && !rawMacroBuffer_.empty()) {
+            && !tempMacroOff_ && !macroUndoSuppressed_ && !rawMacroBuffer_.empty()) {
             wchar_t ch = VkToMacroChar(vkCode);
             if (ch > L' ') {
                 savedMacroBuffer = rawMacroBuffer_;
@@ -1900,7 +2003,7 @@ HookEngine::KeyOutcome HookEngine::DispatchKeyAction(DWORD vkCode, bool cachedSh
                         break;
                     }
                     SetCommitUndoReady();
-                    commitState_.SetGapEndsInGlyph(vkCode != VK_SPACE);
+                    commitState_.SetGapGlyph(VkToMacroChar(vkCode));
                     break;
                 }
                 case CommitUndoArm::Clear: CancelCommitUndo();   break;
@@ -1970,6 +2073,10 @@ HookEngine::KeyOutcome HookEngine::DispatchKeyAction(DWORD vkCode, bool cachedSh
     // Without this, the physical BS arrives at the app BEFORE those synthetics and deletes
     // the wrong character, permanently desynchronising previousComposition_.
     if (vkCode == VK_BACK && dispatcher_.SynthEventsPending() > 0) {
+        if (isAutorepeatBs_) {
+            HOOK_LOG(L"  autorepeat BS with synth pending — passthrough");
+            return KeyOutcome::Pass;
+        }
         HOOK_LOG(L"  re-inject BS (engine empty, synthPending=%d)", dispatcher_.SynthEventsPending());
         InjectKey(VK_BACK);
         return KeyOutcome::Eat;
@@ -2131,6 +2238,10 @@ bool HookEngine::ProcessKeyUp(DWORD vkCode, DWORD /*flags*/) {
         }
 
         TrackModifier(vkCode, false);
+    }
+
+    if (vkCode == lastDownVk_) {
+        lastDownVk_ = 0;
     }
 
     return false;  // Never eat key-up
@@ -2455,6 +2566,7 @@ void HookEngine::ResetComposition() {
     // Mouse click, Ctrl/Alt shortcut (step 5), exception handler — all funnel here.
     // Each is a "sentence-context broke" event, so drop any pending sentence arm.
     autoCapState_ = AutoCapState::Idle;
+    inputQueue_.ClearOverflow();
     dispatcher_.ResetSynthEvents();  // Pending synthetics from old context are irrelevant after reset
     dispatcher_.ResetLastRealSynthTime();
 }
@@ -2476,6 +2588,7 @@ void HookEngine::ClearMacroBuffer() noexcept {
     rawMacroBuffer_.clear();
     wasFirstCharAutoCapped_ = false;
     macroCrossCommit_ = false;
+    macroUndoSuppressed_ = false;
 }
 
 void HookEngine::ClearMacroUndo() noexcept {
@@ -3267,7 +3380,8 @@ NextKey::Pipeline::MacroOutcome HookEngine::HandleMacro(
 
             rawMacroBuffer_ = shortcut;
             macroCrossCommit_ = true;
-            tempMacroOff_ = true;
+            macroUndoSuppressed_ = true;
+            tempMacroOff_ = false;
             HOOK_LOG(L"  macro-undo: reverted expansion to shortcut '%ls'", shortcut.c_str());
             return NextKey::Pipeline::MacroOutcome::Eat;
         } else if (vk != VK_BACK) {
@@ -3285,6 +3399,7 @@ NextKey::Pipeline::MacroOutcome HookEngine::HandleMacro(
         }
         // Track macro keys in English mode.
         if (vk >= 0x41 && vk <= 0x5A) {
+            macroUndoSuppressed_ = false;
             const bool upper = shift != capsLock;  // XOR
             rawMacroBuffer_ += upper ? static_cast<wchar_t>(vk)
                                       : towlower(static_cast<wchar_t>(vk));
@@ -3295,27 +3410,33 @@ NextKey::Pipeline::MacroOutcome HookEngine::HandleMacro(
                    && rawMacroBuffer_.empty()) {
             tempMacroOff_ = true;
             return NextKey::Pipeline::MacroOutcome::Pass;
-        } else if (IsCommitTrigger(vk) && !tempMacroOff_) {
-            const wchar_t triggerChar = VkToMacroChar(vk);
-            if (triggerChar > L' ') rawMacroBuffer_ += triggerChar;
-            if (!rawMacroBuffer_.empty() && IsMacroTrigger(vk)) {
-                auto result = TryExpandMacro(triggerChar);
-                if (result == MacroResult::ExpandedEatTrigger) {
-                    return NextKey::Pipeline::MacroOutcome::Eat;
-                }
-                if (result == MacroResult::ExpandedPassTrigger) {
-                    if (dispatcher_.SynthEventsPending() > 0) {
-                        InjectKey(vk);
-                        return NextKey::Pipeline::MacroOutcome::Eat;
-                    }
-                    return NextKey::Pipeline::MacroOutcome::Pass;
-                }
-            } else if (!IsMacroTrigger(vk)) {
-                // Disabled trigger still marks word boundary — clear buffer.
+        } else if (IsCommitTrigger(vk)) {
+            if (macroUndoSuppressed_) {
                 ClearMacroBuffer();
                 tempMacroOff_ = false;
+            } else if (!tempMacroOff_) {
+                const wchar_t triggerChar = VkToMacroChar(vk);
+                if (triggerChar > L' ') rawMacroBuffer_ += triggerChar;
+                if (!rawMacroBuffer_.empty() && IsMacroTrigger(vk)) {
+                    auto result = TryExpandMacro(triggerChar);
+                    if (result == MacroResult::ExpandedEatTrigger) {
+                        return NextKey::Pipeline::MacroOutcome::Eat;
+                    }
+                    if (result == MacroResult::ExpandedPassTrigger) {
+                        if (dispatcher_.SynthEventsPending() > 0) {
+                            InjectKey(vk);
+                            return NextKey::Pipeline::MacroOutcome::Eat;
+                        }
+                        return NextKey::Pipeline::MacroOutcome::Pass;
+                    }
+                } else if (!IsMacroTrigger(vk)) {
+                    // Disabled trigger still marks word boundary — clear buffer.
+                    ClearMacroBuffer();
+                    tempMacroOff_ = false;
+                }
             }
         } else if (vk == VK_BACK && !rawMacroBuffer_.empty()) {
+            macroUndoSuppressed_ = false;
             rawMacroBuffer_.pop_back();
             if (rawMacroBuffer_.empty()) ClearMacroBuffer();
         } else if (!(vk >= 0x41 && vk <= 0x5A) && !IsCommitTrigger(vk)) {
@@ -3329,6 +3450,7 @@ NextKey::Pipeline::MacroOutcome HookEngine::HandleMacro(
     // VN mode tracking — accumulate alpha + commit-trigger chars when macros loaded.
     if (macroOn && hasMacros) {
         if (vk >= 0x41 && vk <= 0x5A) {
+            macroUndoSuppressed_ = false;
             const bool upper = shift != capsLock;  // XOR
             rawMacroBuffer_ += upper ? static_cast<wchar_t>(vk)
                                       : towlower(static_cast<wchar_t>(vk));
@@ -3350,9 +3472,9 @@ NextKey::Pipeline::MacroOutcome HookEngine::HandleMacro(
         return NextKey::Pipeline::MacroOutcome::Pass;
     }
 
-    // VN macro expansion — runs on commit trigger when buffer non-empty.
-    if (macroOn && hasMacros && !tempMacroOff_
-        && IsMacroTrigger(vk) && !rawMacroBuffer_.empty()) {
+    // VN macro expansion — runs on commit trigger when buffer or re-opened composition is non-empty.
+    if (macroOn && hasMacros && !tempMacroOff_ && !macroUndoSuppressed_
+        && IsMacroTrigger(vk) && (!rawMacroBuffer_.empty() || !previousComposition_.empty())) {
         const wchar_t triggerChar = VkToMacroChar(vk);
         auto result = TryExpandMacro(triggerChar);
         if (result == MacroResult::ExpandedEatTrigger) {
@@ -3370,6 +3492,7 @@ NextKey::Pipeline::MacroOutcome HookEngine::HandleMacro(
     // Clean up macro buffer on word boundaries (commit triggers) and non-word keys in VN mode
     if (macroOn && hasMacros) {
         if (vk == VK_BACK && !rawMacroBuffer_.empty()) {
+            macroUndoSuppressed_ = false;
             rawMacroBuffer_.pop_back();
             if (rawMacroBuffer_.empty()) ClearMacroBuffer();
         } else if (IsCommitTrigger(vk)) {
@@ -3381,16 +3504,18 @@ NextKey::Pipeline::MacroOutcome HookEngine::HandleMacro(
             // (Regressed by 71b673d: this cleanup runs in HandleMacro, earlier in the pipeline
             // than step 8, so an unconditional clear here left step 8 nothing to preserve.)
             bool preserve = false;
-            if (vk == VK_SPACE && cfgSnap) {
-                // Reuse the member buffer's capacity instead of materializing a
-                // temporary `rawMacroBuffer_ + L' '` on every Space (hot path,
-                // Rule 11.2). IsSpaceMacroPrefix is noexcept and read-only, so the
-                // append/pop pair restores the buffer with no per-keystroke alloc.
-                rawMacroBuffer_.push_back(L' ');
-                preserve = IsSpaceMacroPrefix(rawMacroBuffer_, cfgSnap->macroPrefixIndex);
-                rawMacroBuffer_.pop_back();
-            } else if (IsMacroTrigger(vk)) {
-                preserve = VkToMacroChar(vk) > L' ';
+            if (!macroUndoSuppressed_) {
+                if (vk == VK_SPACE && cfgSnap) {
+                    // Reuse the member buffer's capacity instead of materializing a
+                    // temporary `rawMacroBuffer_ + L' '` on every Space (hot path,
+                    // Rule 11.2). IsSpaceMacroPrefix is noexcept and read-only, so the
+                    // append/pop pair restores the buffer with no per-keystroke alloc.
+                    rawMacroBuffer_.push_back(L' ');
+                    preserve = IsSpaceMacroPrefix(rawMacroBuffer_, cfgSnap->macroPrefixIndex);
+                    rawMacroBuffer_.pop_back();
+                } else if (IsMacroTrigger(vk)) {
+                    preserve = VkToMacroChar(vk) > L' ';
+                }
             }
             if (!preserve) {
                 ClearMacroBuffer();
@@ -4186,6 +4311,289 @@ void HookEngine::RefreshBrowserRouteOnHookThread(bool forceRead, bool notifyCall
                          isEffective && !wasEffective);
     }
     NotifyModeChange();
+}
+
+bool HookEngine::EnqueuePhysicalKey(DWORD vkCode, DWORD scanCode, DWORD flags, bool isDown,
+                                    bool lshift, bool rshift, bool capsLock,
+                                    bool lctrl, bool rctrl,
+                                    bool lalt, bool ralt,
+                                    bool lwin, bool rwin) {
+    const QueuedPhysicalKey newKey{
+        vkCode, scanCode, flags, isDown,
+        lshift, rshift, capsLock,
+        lctrl, rctrl,
+        lalt, ralt,
+        lwin, rwin
+    };
+    return inputQueue_.Enqueue(newKey);
+}
+
+void HookEngine::ReplayPhysicalKeyEvent(const QueuedPhysicalKey& key) noexcept {
+    // Deliver a single key down or key up event to the host application,
+    // preserving the physical modifier context that was active when pressed (Issues 1, 2, 3).
+    // Ensure sendingForVk_ is 0 during replay so EatNoIntent does not mistakenly swallow
+    // the user's subsequent physical key-up on Chromium/Electron hosts (Issue 3).
+    sendingForVk_.store(0, std::memory_order_relaxed);
+
+    std::array<INPUT, 24> buf{};
+    UINT cursor = 0;
+
+    struct ModAdjustment {
+        WORD vk;
+        bool press;
+        bool extended;
+    };
+    std::array<ModAdjustment, 8> modAdjustments{};
+    size_t numAdjustments = 0;
+
+    if (key.isDown) {
+        const bool curLShift = (GetKeyState(VK_LSHIFT) & 0x8000) != 0;
+        const bool curRShift = (GetKeyState(VK_RSHIFT) & 0x8000) != 0;
+        const bool curLCtrl  = (GetKeyState(VK_LCONTROL) & 0x8000) != 0;
+        const bool curRCtrl  = (GetKeyState(VK_RCONTROL) & 0x8000) != 0;
+        const bool curLAlt   = (GetKeyState(VK_LMENU) & 0x8000) != 0;
+        const bool curRAlt   = (GetKeyState(VK_RMENU) & 0x8000) != 0;
+        const bool curLWin   = (GetKeyState(VK_LWIN) & 0x8000) != 0;
+        const bool curRWin   = (GetKeyState(VK_RWIN) & 0x8000) != 0;
+
+        auto adjust = [&](bool desired, bool current, WORD vk, bool extended) {
+            if (desired && !current) {
+                modAdjustments[numAdjustments++] = {vk, /*press=*/true, extended};
+            } else if (!desired && current) {
+                modAdjustments[numAdjustments++] = {vk, /*press=*/false, extended};
+            }
+        };
+
+        // Check and adjust each physical modifier side explicitly
+        // to avoid stuck or mismatched shortcuts when holding right-side keys.
+        adjust(key.lctrl,  curLCtrl,  VK_LCONTROL, false);
+        adjust(key.rctrl,  curRCtrl,  VK_RCONTROL, true);
+        adjust(key.lshift, curLShift, VK_LSHIFT,   false);
+        adjust(key.rshift, curRShift, VK_RSHIFT,   false);
+        adjust(key.lalt,   curLAlt,   VK_LMENU,    false);
+        adjust(key.ralt,   curRAlt,   VK_RMENU,    true);
+        adjust(key.lwin,   curLWin,   VK_LWIN,     true);
+        adjust(key.rwin,   curRWin,   VK_RWIN,     true);
+
+        // Synthesize modifiers to match queued snapshot
+        for (size_t m = 0; m < numAdjustments; ++m) {
+            INPUT in = Output::Internal::MakeKeyEvent(
+                modAdjustments[m].vk, /*keyup=*/!modAdjustments[m].press);
+            if (modAdjustments[m].extended) {
+                in.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+            }
+            buf[cursor++] = in;
+        }
+    }
+
+    // Main key event (down or up, exactly matching key.isDown)
+    INPUT mainEvent = Output::Internal::MakeKeyEvent(
+        static_cast<WORD>(key.vkCode),
+        /*keyup=*/!key.isDown,
+        static_cast<WORD>(key.scanCode));
+    if ((key.flags & LLKHF_EXTENDED) != 0) {
+        mainEvent.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+    }
+    buf[cursor++] = mainEvent;
+
+    // Restore modifiers back to current physical state
+    if (key.isDown) {
+        for (size_t m = 0; m < numAdjustments; ++m) {
+            INPUT in = Output::Internal::MakeKeyEvent(
+                modAdjustments[m].vk, /*keyup=*/modAdjustments[m].press);
+            if (modAdjustments[m].extended) {
+                in.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+            }
+            buf[cursor++] = in;
+        }
+    }
+
+    if (cursor > 0) {
+        // Wrap replay in sending scope so IsSending() is true during dispatch,
+        // preventing re-entering physical keys from jumping ahead of pending queued keys.
+        OutputDispatcher::ScopedSending sendingScope(dispatcher_);
+        UINT sent = 0;
+        if (!Output::Internal::TrackedSendInput(buf.data(), cursor, &sent) && key.isDown) {
+            Output::Internal::RecoverReplayModifiersAfterPartialSend(
+                {buf.data(), cursor}, sent, numAdjustments);
+        }
+    }
+}
+
+void HookEngine::ProcessQueuedKey(const QueuedPhysicalKey& key) {
+    if (key.isDown) {
+        sendingForVk_.store(key.vkCode, std::memory_order_relaxed);
+        struct SendingVkScope {
+            std::atomic<DWORD>& vk;
+            ~SendingVkScope() noexcept { vk.store(0, std::memory_order_relaxed); }
+        } vkScope(sendingForVk_);
+
+        const bool shift = key.lshift || key.rshift;
+        const bool ctrl  = key.lctrl  || key.rctrl;
+        const bool alt   = key.lalt   || key.ralt;
+        const bool win   = key.lwin   || key.rwin;
+        const bool eaten = ProcessKeyDown(
+            key.vkCode, key.scanCode, key.flags,
+            shift, key.capsLock, ctrl, alt, win);
+        // Clear sendingForVk_ immediately after ProcessKeyDown: transform is done or key is passthrough (Issue 3).
+        sendingForVk_.store(0, std::memory_order_relaxed);
+        if (!eaten) {
+            // Not consumed by IME: deliver single KEY-DOWN to host app with preserved modifier state (Issues 1, 2, 3)
+            ReplayPhysicalKeyEvent(key);
+        }
+    } else {
+        sendingForVk_.store(0, std::memory_order_relaxed);
+        const bool eaten = ProcessKeyUp(key.vkCode, key.flags);
+        if (!eaten) {
+            // Not consumed by IME: deliver single KEY-UP to host app to prevent stuck keys (Issue 1)
+            ReplayPhysicalKeyEvent(key);
+        }
+    }
+}
+
+void HookEngine::DrainInputQueue() {
+    VKEY_ASSERT_HOOK_THREAD();
+    if (isDrainingQueue_ || dispatcher_.IsSending()) {
+        return;
+    }
+    if (inputQueue_.Empty() && !inputQueue_.HasOverflowed() && emergencyCount_ == 0) {
+        return;
+    }
+
+    // RAII guard ensures isDrainingQueue_ is reset if an exception unwinds from ProcessQueuedKey (Issue 2).
+    struct DrainScope {
+        bool& flag;
+        explicit DrainScope(bool& f) noexcept : flag(f) { flag = true; }
+        ~DrainScope() noexcept { flag = false; }
+    } drainScope(isDrainingQueue_);
+
+    // Recover from overflow before processing entries (Issue 2)
+    if (inputQueue_.HasOverflowed()) {
+        inputQueue_.ClearOverflow();
+        ResetComposition();
+    }
+
+    QueuedPhysicalKey key{};
+    while (!dispatcher_.IsSending() && inputQueue_.Pop(key)) {
+        ProcessQueuedKey(key);
+
+        // Check and handle overflow after each transaction, before next entry (Issue 2)
+        if (inputQueue_.HasOverflowed()) {
+            inputQueue_.ClearOverflow();
+            ResetComposition();
+        }
+    }
+
+    // Safety net: replay any emergency releases that could not be enqueued during memory exhaustion
+    if (!dispatcher_.IsSending() && emergencyCount_ > 0) {
+        DrainEmergencyReleases();
+    }
+}
+
+void HookEngine::RecordEmergencyRelease(DWORD vkCode, DWORD scanCode, DWORD flags) noexcept {
+    // With PhysicalInputQueue's pending-mask/count invariant intact, UP enqueue
+    // succeeds and this outer fallback is dormant. Keep the safety net for
+    // future queue policies; its VK-ordered drain is not a chronological FIFO.
+    const size_t vk = static_cast<size_t>(vkCode & 0xFF);
+    if (!emergencyPending_.test(vk)) {
+        emergencyPending_.set(vk);
+        ++emergencyCount_;
+    }
+    emergencyReleases_[vk] = QueuedPhysicalKey{
+        .vkCode = vkCode,
+        .scanCode = scanCode,
+        .flags = flags,
+        .isDown = false
+    };
+}
+
+void HookEngine::DrainEmergencyReleases() noexcept {
+    for (size_t vk = 0; vk < emergencyReleases_.size(); ++vk) {
+        if (emergencyPending_.test(vk)) {
+            emergencyPending_.reset(vk);
+            --emergencyCount_;
+            ReplayPhysicalKeyEvent(emergencyReleases_[vk]);
+        }
+    }
+    emergencyCount_ = 0;
+}
+
+void HookEngine::RecordEchoEvent(DWORD vkCode, DWORD scanCode, bool isUp) noexcept {
+    const DWORD now = GetTickCount();
+    if (echoCount_ < kMaxEchoEntries) {
+        echoBuffer_[echoCount_++] = {vkCode, scanCode, isUp, now};
+    } else {
+        for (size_t i = 1; i < kMaxEchoEntries; ++i) {
+            echoBuffer_[i - 1] = echoBuffer_[i];
+        }
+        echoBuffer_[kMaxEchoEntries - 1] = {vkCode, scanCode, isUp, now};
+    }
+}
+
+void HookEngine::RecordDispatchedEvents(const INPUT* events, UINT count) noexcept {
+    if (!events || count == 0) return;
+    for (UINT k = 0; k < count; ++k) {
+        if (events[k].type != INPUT_KEYBOARD) continue;
+        const auto& ki = events[k].ki;
+        DWORD vk = ki.wVk;
+        DWORD scan = ki.wScan;
+        const bool isUp = (ki.dwFlags & KEYEVENTF_KEYUP) != 0;
+        if ((ki.dwFlags & KEYEVENTF_UNICODE) != 0) {
+            vk = 0xE7; // VK_PACKET
+        }
+        RecordEchoEvent(vk, scan, isUp);
+    }
+}
+
+void HookEngine::RollbackDispatchedEvents(const INPUT* unsentEvents, UINT unsentCount) noexcept {
+    // Issue 4: When SendInput partially fails, remove the unsent entries from the tail
+    // of echoBuffer_ so they do not falsely match external injected events.
+    if (!unsentEvents || unsentCount == 0 || echoCount_ == 0) return;
+    for (UINT k = 0; k < unsentCount; ++k) {
+        if (unsentEvents[k].type != INPUT_KEYBOARD) continue;
+        const auto& ki = unsentEvents[k].ki;
+        DWORD vk = ki.wVk;
+        DWORD scan = ki.wScan;
+        const bool isUp = (ki.dwFlags & KEYEVENTF_KEYUP) != 0;
+        if ((ki.dwFlags & KEYEVENTF_UNICODE) != 0) {
+            vk = 0xE7; // VK_PACKET
+        }
+        for (size_t i = echoCount_; i > 0; --i) {
+            size_t idx = i - 1;
+            if (echoBuffer_[idx].vkCode == vk &&
+                echoBuffer_[idx].isUp == isUp &&
+                (echoBuffer_[idx].scanCode == 0 || scan == 0 || echoBuffer_[idx].scanCode == scan)) {
+                for (size_t j = idx + 1; j < echoCount_; ++j) {
+                    echoBuffer_[j - 1] = echoBuffer_[j];
+                }
+                echoCount_--;
+                break;
+            }
+        }
+    }
+}
+
+bool HookEngine::ConsumeEchoEvent(DWORD vkCode, DWORD scanCode, bool isUp) noexcept {
+    const bool activeMatch = Output::Internal::ConsumeActiveSynthEvent(vkCode, scanCode, isUp);
+    if (echoCount_ == 0) return activeMatch;
+    const DWORD now = GetTickCount();
+    for (size_t i = 0; i < echoCount_; ++i) {
+        if (echoBuffer_[i].vkCode == vkCode &&
+            echoBuffer_[i].isUp == isUp &&
+            (echoBuffer_[i].scanCode == 0 || scanCode == 0 || echoBuffer_[i].scanCode == scanCode) &&
+            (now - echoBuffer_[i].timestamp) < 500) {
+            for (size_t j = i + 1; j < echoCount_; ++j) {
+                echoBuffer_[j - 1] = echoBuffer_[j];
+            }
+            echoCount_--;
+            return true;
+        }
+    }
+    return activeMatch;
+}
+
+bool HookEngine::MatchAndConsumeEcho(DWORD vkCode, DWORD scanCode, bool isUp) noexcept {
+    return ConsumeEchoEvent(vkCode, scanCode, isUp);
 }
 
 }  // namespace NextKey

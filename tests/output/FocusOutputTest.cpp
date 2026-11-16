@@ -29,7 +29,8 @@ protected:
         cls.pid = 10;
         cls.requestSerial = 7;
         cls.inputEpochAtRequest = 12;
-        cls.localNeedBait = browser;
+        cls.localSuggestionDismissal = browser ? SuggestionDismissalPolicy::UnicodeBait
+                                             : SuggestionDismissalPolicy::None;
         cls.localGameReinject = game;
         OutputDispatcher::PrepareFocusOutput(cls);
         return cls;
@@ -47,8 +48,8 @@ protected:
 
     // Model only inline selection: the first edit removes the suggested
     // suffix; a Backspace against that selection leaves the typed prefix.
-    static std::wstring ReplayInlineSuggestion(std::wstring prefix) {
-        bool hasSuggestedSuffix = true;
+    static std::wstring ReplayInlineSuggestion(std::wstring prefix,
+                                               bool hasSuggestedSuffix = true) {
         for (const auto& input : capturedInputs) {
             if (input.ki.dwFlags & KEYEVENTF_KEYUP) continue;
             if (input.ki.dwFlags & KEYEVENTF_UNICODE) {
@@ -130,9 +131,13 @@ TEST_F(FocusOutputTest, DelayedOutputKeepsLiveSettingsAndSyntheticWordState) {
     EXPECT_TRUE(dispatcher_.HadSynthInWord());
     EXPECT_TRUE(dispatcher_.GetInjector()->GetSuggestKeepChars());
 
-    // The user's pure-Backspace preference must never suppress transform bait.
+    // The strict-field opt-out deliberately omits suggestion dismissal.
+    // Verify replacement in a field without an inline suggested suffix.
     ASSERT_TRUE(dispatcher_.GetInjector()->Replace(1, L"đ"));
-    EXPECT_EQ(ReplayInlineSuggestion(L"d"), L"đ");
+    ASSERT_EQ(capturedInputs.size(), 4u);
+    EXPECT_EQ(capturedInputs[0].ki.wVk, VK_BACK);
+    EXPECT_EQ(capturedInputs[2].ki.wScan, L'đ');
+    EXPECT_EQ(ReplayInlineSuggestion(L"d", false), L"đ");
 }
 
 TEST_F(FocusOutputTest, UnpreparedResultLeavesCurrentOutputUntouched) {
@@ -141,6 +146,26 @@ TEST_F(FocusOutputTest, UnpreparedResultLeavesCurrentOutputUntouched) {
     EXPECT_FALSE(dispatcher_.ApplyFocusOutput(
         unprepared, FocusApplyDisposition::ApplyNow, true));
     EXPECT_EQ(dispatcher_.GetInjector(), originalInjector);
+}
+
+TEST_F(FocusOutputTest, NativePolicySurvivesDispatcherAndFactoryForBothChannels) {
+    for (int splitSleep : {0, 6}) {
+        capturedInputs.clear();
+        FocusClassification cls{};
+        cls.localSuggestionDismissal = SuggestionDismissalPolicy::NativePrintablePrefix;
+        cls.localForcedSplitSleepMs = splitSleep;
+        OutputDispatcher::PrepareFocusOutput(cls);
+        ASSERT_TRUE(dispatcher_.ApplyFocusOutput(
+            cls, FocusApplyDisposition::ApplyNow, true));
+        EXPECT_FALSE(dispatcher_.WantsGameReinject());
+        ASSERT_TRUE(dispatcher_.GetInjector()->Replace(1, L"đ"));
+        ASSERT_EQ(capturedInputs.size(), 8u);
+        EXPECT_EQ(capturedInputs[0].ki.wVk, kNativePrintablePrefixVk);
+        EXPECT_EQ(capturedInputs[0].ki.dwFlags & KEYEVENTF_UNICODE, 0u);
+        EXPECT_EQ(capturedInputs[2].ki.wVk, VK_BACK);
+        EXPECT_EQ(capturedInputs[4].ki.wVk, VK_BACK);
+        EXPECT_EQ(capturedInputs[6].ki.wScan, L'đ');
+    }
 }
 
 }  // namespace

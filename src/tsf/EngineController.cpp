@@ -185,9 +185,9 @@ bool EngineController::PrepareBackspaceRevive(ITfContext* pContext) {
     if (!engineEnabled_ || !tsfActive_ || !vietnameseMode_) return false;
     if (contextBlocked_) return false;
     if (engine_->Count() > 0) return false;
-    // Scintilla (Notepad++) doesn't support ITfRange backward scan — skip to avoid
-    // a guaranteed-to-fail sync edit session per BS.
-    if (isScintillaApp_) return false;
+    // Scintilla (Notepad++) doesn't support ITfRange backward scan.
+    // Chromium/Electron (Chrome_WidgetWin) duplicates committed words on range composition (#245).
+    if (isScintillaApp_ || isChromiumApp_) return false;
 
     // Step 1: READ preceding word via sync edit session.
     auto* pSession = new ReadPrecedingWordEditSession(pContext);
@@ -565,7 +565,8 @@ bool EngineController::HandleKey(ITfContext* pContext, UINT vkCode) {
             // "test" + "er" → "testẻ" instead of "tester". The BS path keeps its
             // gate: reviving there is followed by Backspace(), which re-renders a
             // raw replay as Vietnamese ("tester" → "tết").
-            if (!word.empty() && wordRange) {
+            // Chromium/Electron duplicates committed words on range composition (#245).
+            if (!isChromiumApp_ && !word.empty() && wordRange) {
                 auto tempEngine = EngineFactory::Create(activeConfig_);
                 if (tempEngine && tempEngine->SeedFromText(word)) {
                     // Raw replay over glyph-seeding: SeedFromText loses which key
@@ -584,6 +585,14 @@ bool EngineController::HandleKey(ITfContext* pContext, UINT vkCode) {
                     const bool revived = pRevive->Revived();
                     pRevive->Release();
                     if (revived) {
+                        if (IsMacroTrackingEnabled()) {
+                            std::wstring seeded = Macro::RawBufferForRevive(rawMacroBuffer_, word);
+                            if (seeded != rawMacroBuffer_) {
+                                rawMacroBuffer_ = std::move(seeded);
+                                wasFirstCharAutoCapped_ = false;
+                            }
+                            TrackMacroCharacter(rawCh);
+                        }
                         TSF_LOG(L"HandleKey: revive '%ls' + '%lc'", word.c_str(), ch);
                         return true;
                     }
@@ -820,9 +829,13 @@ bool EngineController::HasMacroCandidate() const noexcept {
         && (!rawMacroBuffer_.empty() || (engine_ && engine_->Count() > 0));
 }
 
+bool EngineController::HasMacroContextCandidate() const noexcept {
+    return IsMacroTrackingEnabled() && !macroTable_.empty() && !macroUndoSuppressed_;
+}
+
 void EngineController::ClearMacroTracking() noexcept {
     ResetMacroUndo();
-    tempMacroOff_ = false;
+    macroUndoSuppressed_ = false;
     rawMacroBuffer_.clear();
     wasFirstCharAutoCapped_ = false;
     macroCrossCommit_ = false;
@@ -835,6 +848,7 @@ void EngineController::ClearMacroTrackingAfterCommit() noexcept {
 void EngineController::TrackMacroCharacter(wchar_t ch) {
     if (!IsMacroTrackingEnabled() || ch == 0) return;
 
+    macroUndoSuppressed_ = false;
     rawMacroBuffer_ += ch;
     if (rawMacroBuffer_.size() > kMaxRawMacroBuffer) ClearMacroTracking();
 }
@@ -842,6 +856,7 @@ void EngineController::TrackMacroCharacter(wchar_t ch) {
 void EngineController::TrackMacroBackspace() noexcept {
     if (!IsMacroTrackingEnabled() || rawMacroBuffer_.empty()) return;
 
+    macroUndoSuppressed_ = false;
     rawMacroBuffer_.pop_back();
     if (rawMacroBuffer_.empty()) ClearMacroTracking();
 }
@@ -849,7 +864,7 @@ void EngineController::TrackMacroBackspace() noexcept {
 bool EngineController::ReplacePrecedingText(ITfContext* pContext,
                                              std::size_t characterCount,
                                              const std::wstring& replacement,
-                                             const std::wstring& expected) {
+                                             std::wstring_view expected) {
     if (pContext == nullptr || characterCount == 0) return false;
 
     bool replaced = false;
@@ -934,7 +949,7 @@ Macro::MacroPlan EngineController::EvaluateMacroPlan(const std::wstring& rawBuff
 bool EngineController::WouldExpandMacroTrigger(ITfContext* pContext,
                                                 UINT vkCode,
                                                 wchar_t triggerChar) const {
-    if (tempMacroOff_) return false;
+    if (macroUndoSuppressed_) return false;
     if (!Macro::IsCommitTrigger(vkCode) || !IsMacroTrackingEnabled()) return false;
     if (!Macro::ShouldTrigger(vkCode, activeConfig_.macroTriggerSpace, activeConfig_.macroTriggerEnter,
                               activeConfig_.macroTriggerTab, activeConfig_.macroTriggerDir)) {
@@ -954,7 +969,7 @@ bool EngineController::WouldExpandMacroTrigger(ITfContext* pContext,
 EngineController::MacroResult EngineController::HandleMacroTrigger(
     ITfContext* pContext, UINT vkCode, wchar_t triggerChar) {
     if (!Macro::IsCommitTrigger(vkCode)) return MacroResult::NoMatch;
-    if (tempMacroOff_) {
+    if (macroUndoSuppressed_) {
         ClearMacroTracking();
         return MacroResult::NoMatch;
     }
@@ -1030,6 +1045,8 @@ EngineController::MacroResult EngineController::HandleMacroTrigger(
     }
 
     const std::wstring previousComposition = engine_ ? engine_->Peek() : std::wstring{};
+    const auto expected = Macro::ReplacementDocumentText(
+        plan, previousComposition, macroCrossCommit_, triggerChar);
     std::wstring replacement = Macro::ExpandEscapesForClipboard(plan.expansion);
     bool eatTrigger = plan.isPartOfMacro;
     if (!eatTrigger && (vkCode == VK_SPACE || triggerChar > L' ')) {
@@ -1046,7 +1063,7 @@ EngineController::MacroResult EngineController::HandleMacroTrigger(
             engine_->Reset();
             digitLedWord_ = false;
         }
-        replaced = ReplacePrecedingText(pContext, plan.bsCount, replacement);
+        replaced = ReplacePrecedingText(pContext, plan.bsCount, replacement, expected);
     } else {
         auto* pSession = new CommitEditSession(pContext, &compositionMgr_, replacement);
         RequestEditSession(pContext, pSession);
@@ -1094,33 +1111,44 @@ bool EngineController::UndoMacro(ITfContext* pContext) {
     }
     rawMacroBuffer_ = shortcut;
     macroCrossCommit_ = true;
-    tempMacroOff_ = true;
+    macroUndoSuppressed_ = true;
     TSF_LOG(L"UndoMacro: restored shortcut '%ls'", shortcut.c_str());
     return true;
 }
 
 void EngineController::DetectScintillaApp() {
-    // Cache Scintilla detection — called on context change, not per-keystroke.
+    // Cache Scintilla & Chromium detection — called on context change, not per-keystroke.
+    isScintillaApp_ = false;
+    isChromiumApp_ = false;
+
     HWND hwnd = GetForegroundWindow();
-    if (hwnd == nullptr) { isScintillaApp_ = false; return; }
+    if (hwnd == nullptr) return;
 
     wchar_t className[256] = {0};
     if (GetClassNameW(hwnd, className, 256) > 0) {
         if (wcsstr(className, L"Notepad++") != nullptr) {
-            isScintillaApp_ = true; return;
+            isScintillaApp_ = true;
+            return;
+        }
+        if (wcsstr(className, L"Chrome_WidgetWin") != nullptr) {
+            isChromiumApp_ = true;
+            return;
         }
     }
 
     HWND hwndFocus = GetFocus();
-    if (hwndFocus != nullptr) {
+    if (hwndFocus != nullptr && hwndFocus != hwnd) {
         if (GetClassNameW(hwndFocus, className, 256) > 0) {
             if (wcsstr(className, L"Scintilla") != nullptr) {
-                isScintillaApp_ = true; return;
+                isScintillaApp_ = true;
+                return;
+            }
+            if (wcsstr(className, L"Chrome_WidgetWin") != nullptr) {
+                isChromiumApp_ = true;
+                return;
             }
         }
     }
-
-    isScintillaApp_ = false;
 }
 
 bool EngineController::CheckConfigEvent(bool allowMacroDiskRead) {

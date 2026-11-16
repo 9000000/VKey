@@ -29,8 +29,12 @@
 #include "core/pipeline/IMacroExecutor.h"
 #include "core/pipeline/Coordinator.h"
 #include "core/pipeline/OutputChannel.h"
+#include "core/InputQueueDecision.h"
+#include "core/PhysicalInputQueue.h"
 #include <Windows.h>
+#include <array>
 #include <atomic>
+#include <bitset>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -758,6 +762,7 @@ private:
     std::atomic<bool> macroEnabled_{false};
     std::atomic<bool> macroInEnglish_{false};
     bool tempMacroOff_ = false;       // Runtime: macro disabled for current word; same-thread (hook) only
+    bool macroUndoSuppressed_ = false;  // Restored shortcut after macro undo: next trigger must not re-expand it until edited
     bool macroCrossCommit_ = false;   // rawMacroBuffer_ spans multiple engine commits; same-thread (hook) only
     bool wasFirstCharAutoCapped_ = false;  // First char of current word was auto-capitalized by AutoCaps
     // (macroTable_ + spaceMacroKeys_ removed — Phase 3d. Live in
@@ -875,6 +880,9 @@ private:
     bool modAltDown_ = false;
     bool modWinDown_ = false;
     bool otherKeyPressed_ = false;
+    bool isAutorepeatBs_ = false;        // True when VK_BACK is rapidly repeating (<80ms without KeyUp)
+    DWORD lastDownVk_ = 0;               // Last key-down VK code for autorepeat detection
+    DWORD lastBackspaceTs_ = 0;          // Timestamp of previous VK_BACK down
     // Latched true the moment a *second* modifier joins an existing modifier
     // hold (e.g. Shift pressed while Ctrl is down), cleared when every modifier
     // is released. Distinguishes the trailing release of a multi-modifier combo
@@ -883,6 +891,46 @@ private:
     // mode-toggle left the trailing Ctrl release toggling tempEngineOff_ (the
     // default single-Ctrl toggle-enabled binding), mangling the next word.
     bool modComboSeen_ = false;
+
+    // Centralized Non-blocking Input Queue (Task 3.1 & 3.2):
+    // Queues physical keys arriving while dispatcher_ is sending synthetic events.
+    // Encapsulated in PhysicalInputQueue for portable testing, bounded memory, and release preservation.
+    PhysicalInputQueue inputQueue_{};
+    bool isDrainingQueue_ = false;
+
+    bool EnqueuePhysicalKey(DWORD vkCode, DWORD scanCode, DWORD flags, bool isDown,
+                            bool lshift, bool rshift, bool capsLock,
+                            bool lctrl, bool rctrl,
+                            bool lalt, bool ralt,
+                            bool lwin, bool rwin);
+    void DrainInputQueue();
+    void ProcessQueuedKey(const QueuedPhysicalKey& key);
+    void ReplayPhysicalKeyEvent(const QueuedPhysicalKey& key) noexcept;
+    void RecordEmergencyRelease(DWORD vkCode, DWORD scanCode, DWORD flags) noexcept;
+    void DrainEmergencyReleases() noexcept;
+
+    std::array<QueuedPhysicalKey, 256> emergencyReleases_{};
+    std::bitset<256> emergencyPending_{};
+    size_t emergencyCount_ = 0;
+
+    // Echo-Matching Buffer (Task 3.3 & Issues 4, 5):
+    // Tracks recently dispatched synthetic keys to match and consume echo events
+    // when third-party software (RDP, anticheat) strips dwExtraInfo.
+    struct EchoEntry {
+        DWORD vkCode = 0;
+        DWORD scanCode = 0;
+        bool isUp = false;
+        DWORD timestamp = 0;
+    };
+    static constexpr size_t kMaxEchoEntries = 64;
+    std::array<EchoEntry, kMaxEchoEntries> echoBuffer_{};
+    size_t echoCount_ = 0;
+
+    void RecordEchoEvent(DWORD vkCode, DWORD scanCode, bool isUp) noexcept;
+    void RecordDispatchedEvents(const INPUT* events, UINT count) noexcept;
+    void RollbackDispatchedEvents(const INPUT* unsentEvents, UINT count) noexcept;
+    bool ConsumeEchoEvent(DWORD vkCode, DWORD scanCode, bool isUp) noexcept;
+    bool MatchAndConsumeEcho(DWORD vkCode, DWORD scanCode, bool isUp) noexcept;
 
     // Wave 3 PR 3.2 — CJK layout state (layoutSuppressed_/modeBeforeCjk_/
     // cachedIsCompatLayout_) and focused-child cache (cachedFocusedHwnd_/

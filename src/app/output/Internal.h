@@ -15,7 +15,10 @@
 
 #include <array>
 #include <cstddef>
+#include <span>
 #include <string_view>
+
+#include "core/SuggestionDismissalDecision.h"
 
 namespace NextKey::Output::Internal {
 
@@ -25,6 +28,8 @@ using SendMessageWFn       = LRESULT (WINAPI*)(HWND, UINT, WPARAM, LPARAM);
 using SendMessageTimeoutWFn = LRESULT (WINAPI*)(HWND, UINT, WPARAM, LPARAM,
                                                 UINT, UINT, PDWORD_PTR);
 using SleepFn              = void (WINAPI*)(DWORD);
+using NativePrefixLayoutFn = HKL (*)() noexcept;
+using ToUnicodeExFn        = decltype(&::ToUnicodeEx);
 // Sprint 2 D5: synth-counter callback. Fires from TrackedSendInput
 // pre-SendInput (positive delta = events about to dispatch) and on
 // partial-send (negative delta = compensate for events that didn't
@@ -33,6 +38,12 @@ using SleepFn              = void (WINAPI*)(DWORD);
 // Function pointer (not std::function) keeps the layer decoupled — no
 // HookEngine dependency leaking into src/app/output/.
 using SynthCounterFn       = void (*)(int delta) noexcept;
+// Issue 5: callback fired before SendInput so HookEngine can record the exact
+// dispatched synthetic events for precise echo-matching (down/up, vk, scan).
+using SynthEventsDispatchedFn = void (*)(const INPUT* events, UINT count) noexcept;
+// Issue 4: callback fired when SendInput partially fails (sent < count) to rollback
+// unsent entries from the echo buffer so they don't linger and match external events.
+using SynthEventsRollbackFn   = void (*)(const INPUT* unsentEvents, UINT count) noexcept;
 
 // Test seams. Production initializes to the real Win32 APIs.
 extern SendInputFn           g_sendInput;
@@ -41,6 +52,47 @@ extern SendMessageWFn        g_sendMessageW;
 extern SendMessageTimeoutWFn g_sendMessageTimeoutW;
 extern SleepFn               g_sleep;
 extern SynthCounterFn        g_synthCounterCallback;  // null = disabled
+extern SynthEventsDispatchedFn g_synthEventsDispatchedCallback;  // null = disabled
+extern SynthEventsRollbackFn   g_synthEventsRollbackCallback;    // null = disabled
+extern NativePrefixLayoutFn  g_nativePrefixLayout;
+extern ToUnicodeExFn         g_toUnicodeEx;
+
+// GetAsyncKeyState still reports the preceding state inside an LL callback.
+// Keep the current DOWN in scope too, without publishing it across threads or
+// letting nested own-synthetic callbacks replace the physical context.
+extern thread_local std::uint8_t g_inFlightPrefixKeys;
+
+[[nodiscard]] constexpr std::uint8_t NativePrefixKeyMask(WORD vk) noexcept {
+    return vk >= 'A' && vk <= 'C'
+        ? static_cast<std::uint8_t>(1u << (vk - 'A')) : std::uint8_t{0};
+}
+
+[[nodiscard]] inline bool IsInFlightKeyDown(WORD vk) noexcept {
+    const auto mask = NativePrefixKeyMask(vk);
+    return mask != 0 && (g_inFlightPrefixKeys & mask) != 0;
+}
+
+class CurrentKeyDownScope final {
+public:
+    explicit CurrentKeyDownScope(WORD vk) noexcept
+        : mask_(NativePrefixKeyMask(vk)),
+          wasDown_(mask_ != 0 && (g_inFlightPrefixKeys & mask_) != 0) {
+        if (mask_ != 0) g_inFlightPrefixKeys |= mask_;
+    }
+    ~CurrentKeyDownScope() noexcept {
+        if (mask_ != 0 && !wasDown_) g_inFlightPrefixKeys &= static_cast<std::uint8_t>(~mask_);
+    }
+    CurrentKeyDownScope(const CurrentKeyDownScope&) = delete;
+    CurrentKeyDownScope& operator=(const CurrentKeyDownScope&) = delete;
+
+private:
+    std::uint8_t mask_;
+    bool wasDown_;
+};
+
+[[nodiscard]] SuggestionDismissalPlan PrepareSuggestionDismissal(
+    SuggestionDismissalPolicy policy, std::size_t bsCount,
+    std::wstring_view text, bool suggestKeepChars) noexcept;
 
 // Wrapper around g_sendInput with partial-send detection. Returns true
 // iff all events delivered; false on partial (renderer drop case —
@@ -51,33 +103,16 @@ extern SynthCounterFn        g_synthCounterCallback;  // null = disabled
 [[nodiscard]] bool TrackedSendInput(INPUT* events, UINT count,
                                     UINT* sentCount = nullptr) noexcept;
 
+// Match the next keyboard event of a SendInput batch active on this thread.
+// Batch storage is borrowed only until TrackedSendInput returns; nested sends
+// retain their own cursor. The hook's recent-event cache covers later callbacks.
+[[nodiscard]] bool ConsumeActiveSynthEvent(DWORD vk, DWORD scan, bool isUp) noexcept;
+
 // Marker dwExtraInfo so own synth events skip our own hook (Rule #11.4
 // early-return). MUST match HookEngine::VKEY_EXTRA_INFO ("NK"). If
 // these diverge, own synth events are not recognized as own → infinite
 // re-entry loop. The integration test (chaos corpus) catches this.
 constexpr ULONG_PTR kVKeyExtraInfo = 0x4E4BULL;
-
-// Chromium suggest-dismiss bait predicate, shared by Win32 + Split
-// injectors. The `suggestKeepChars` user setting (default false) carves
-// out pure-BS to behave like EVKey for the issue #108 "face → fac"
-// complaint: when ON and text is empty, skip the bait so Edge/Chrome
-// inline autocomplete (a SELECTION inside the input) gets dismissed
-// without losing a user char. Trade-off when ON: engine state can
-// desync after a popup-dismiss-BS in active VN composition ("nex" + BS
-// + 'x' → "neẽ"), so default OFF keeps engine sync (bait always fires;
-// "face" + BS visually flickers to "fac" but VN typing stays correct).
-// Replace operations (text non-empty) ALWAYS keep the bait regardless
-// of the setting — a transform's chars must dismiss any stale suggest
-// frame before landing.
-[[nodiscard]] constexpr bool
-ShouldEmitBait(bool needsBaitCharPrefix,
-               std::size_t bsCount,
-               std::wstring_view text,
-               bool suggestKeepChars) noexcept {
-    if (!needsBaitCharPrefix || bsCount == 0) return false;
-    if (suggestKeepChars && text.empty()) return false;
-    return true;
-}
 
 // Held modifier detection for modifier-neutral synthetic injection.
 // Backspace (VK_BACK) sent while Shift/Ctrl/Alt/Win is held combines with
@@ -101,11 +136,12 @@ struct HeldModifiers {
     return vk == VK_RCONTROL || vk == VK_RMENU || vk == VK_LWIN || vk == VK_RWIN;
 }
 
-[[nodiscard]] inline INPUT MakeModifierEvent(WORD vk, bool keyup) noexcept {
+[[nodiscard]] inline INPUT MakeKeyEvent(WORD vk, bool keyup, WORD scan = 0) noexcept {
     INPUT input{};
     input.type = INPUT_KEYBOARD;
     input.ki.wVk = vk;
-    input.ki.wScan = static_cast<WORD>(::MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
+    input.ki.wScan = scan != 0 ? scan
+        : static_cast<WORD>(::MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
     input.ki.dwFlags = keyup ? KEYEVENTF_KEYUP : 0u;
     if (IsExtendedKey(vk)) {
         input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
@@ -114,14 +150,80 @@ struct HeldModifiers {
     return input;
 }
 
-inline void RestoreModifiersAfterPartialSend(const HeldModifiers& held, UINT sent,
-                                              std::size_t releaseStart,
-                                              std::size_t restoreStart) noexcept {
-    std::array<INPUT, 8> restore{};
+[[nodiscard]] inline INPUT MakeUnicodeEvent(WCHAR ch, bool keyup) noexcept {
+    INPUT input{};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wScan = static_cast<WORD>(ch);
+    input.ki.dwFlags = KEYEVENTF_UNICODE | (keyup ? KEYEVENTF_KEYUP : 0u);
+    input.ki.dwExtraInfo = kVKeyExtraInfo;
+    return input;
+}
+
+// Each caller preflights the complete batch before appending any event.
+inline void AppendKeyPair(INPUT* buffer, std::size_t& cursor, WORD vk,
+                          WORD scan = 0) noexcept {
+    const auto down = MakeKeyEvent(vk, false, scan);
+    buffer[cursor++] = down;
+    auto up = down;
+    up.ki.dwFlags |= KEYEVENTF_KEYUP;
+    buffer[cursor++] = up;
+}
+
+inline void AppendUnicodePair(INPUT* buffer, std::size_t& cursor, WCHAR ch) noexcept {
+    const auto down = MakeUnicodeEvent(ch, false);
+    buffer[cursor++] = down;
+    auto up = down;
+    up.ki.dwFlags |= KEYEVENTF_KEYUP;
+    buffer[cursor++] = up;
+}
+
+inline void AppendSuggestionPrefix(INPUT* buffer, std::size_t& cursor,
+                                    const SuggestionDismissalPlan& plan) noexcept {
+    if (!plan.emitPrefix) return;
+    if (plan.prefixVk != 0) {
+        AppendKeyPair(buffer, cursor, plan.prefixVk, plan.prefixScan);
+    } else {
+        AppendUnicodePair(buffer, cursor, plan.prefixChar);
+    }
+}
+
+inline void RecoverAfterPartialSend(std::span<const INPUT> batch, UINT sent,
+                                     const HeldModifiers& held,
+                                     std::size_t releaseStart,
+                                     std::size_t restoreStart) noexcept {
+    std::array<INPUT, 9> restore{};
     UINT count = 0;
+    if (sent > 0 && sent < batch.size()) {
+        const auto& down = batch[sent - 1].ki;
+        const auto& up = batch[sent].ki;
+        // Only complete an owned pair. A game re-inject has no paired UP;
+        // its eventual physical release must retain ownership of that key.
+        if ((down.dwFlags & KEYEVENTF_KEYUP) == 0 &&
+            up.dwFlags == (down.dwFlags | KEYEVENTF_KEYUP) &&
+            down.wVk == up.wVk && down.wScan == up.wScan) {
+            restore[count++] = batch[sent];
+        }
+    }
     for (std::size_t k = 0; k < held.count; ++k) {
         if (sent > releaseStart + k && sent <= restoreStart + k) {
-            restore[count++] = MakeModifierEvent(held.vks[k], false);
+            restore[count++] = MakeKeyEvent(held.vks[k], false);
+        }
+    }
+    if (count > 0) (void)TrackedSendInput(restore.data(), count);
+}
+
+// Replay owns temporary modifier changes, while the physical key owns its UP.
+// Complete only missing inverse modifiers; never resend the main key or add UP.
+inline void RecoverReplayModifiersAfterPartialSend(
+        std::span<const INPUT> batch, UINT sent, std::size_t modifierCount) noexcept {
+    if (sent == 0 || sent >= batch.size() || modifierCount > 8 ||
+        batch.size() != modifierCount * 2 + 1) return;
+    std::array<INPUT, 8> restore{};
+    UINT count = 0;
+    const auto restoreStart = modifierCount + 1;
+    for (std::size_t k = 0; k < modifierCount; ++k) {
+        if (sent > k && sent <= restoreStart + k) {
+            restore[count++] = batch[restoreStart + k];
         }
     }
     if (count > 0) (void)TrackedSendInput(restore.data(), count);
